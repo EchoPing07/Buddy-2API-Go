@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buddy2API 管理后台</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js" defer></script>
+<style>
+:root{
+  --bg:#f5f6f8;--card:#fff;--side:#1c2333;--side2:#262f45;--txt:#26303f;
+  --muted:#8a94a6;--line:#e6e9f0;--pri:#3b82f6;--ok:#10b981;--warn:#f59e0b;--err:#ef4444;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--txt);font-size:14px}
+a{color:var(--pri);text-decoration:none}
+/* 登录页 */
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1c2333,#2b3a5c)}
+.login-card{background:#fff;border-radius:12px;padding:36px 40px;width:360px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.login-card h1{font-size:20px;margin-bottom:6px}
+.login-card p{color:var(--muted);font-size:12px;margin-bottom:22px}
+/* 布局 */
+.layout{display:flex;min-height:100vh}
+aside{width:200px;background:var(--side);color:#cdd5e3;flex-shrink:0;display:flex;flex-direction:column}
+aside .logo{padding:20px 18px;font-size:16px;font-weight:600;color:#fff;border-bottom:1px solid rgba(255,255,255,.08)}
+aside .logo small{display:block;font-size:10px;font-weight:400;color:var(--muted);margin-top:3px}
+nav{padding:10px 0;flex:1}
+nav a{display:block;padding:11px 20px;color:#cdd5e3;cursor:pointer;font-size:13.5px;border-left:3px solid transparent}
+nav a:hover{background:var(--side2);color:#fff}
+nav a.active{background:var(--side2);color:#fff;border-left-color:var(--pri)}
+aside .foot{padding:14px 18px;font-size:11px;color:var(--muted);border-top:1px solid rgba(255,255,255,.08)}
+main{flex:1;padding:24px 28px;max-width:1160px;overflow-x:auto}
+h2{font-size:18px;margin-bottom:18px;font-weight:600}
+h3{font-size:14px;margin-bottom:12px;font-weight:600}
+/* 组件 */
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+.grid{display:grid;gap:14px}
+.grid.c4{grid-template-columns:repeat(4,1fr)}
+.grid.c3{grid-template-columns:repeat(3,1fr)}
+.grid.c2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:900px){.grid.c4,.grid.c3,.grid.c2{grid-template-columns:1fr 1fr}}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.stat .num{font-size:24px;font-weight:700;margin-top:4px}
+.stat .lbl{color:var(--muted);font-size:12px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:13px;vertical-align:middle}
+th{color:var(--muted);font-weight:500;white-space:nowrap}
+td{word-break:break-all}
+tr:hover td{background:#fafbfd}
+code{background:#f1f3f7;border-radius:4px;padding:2px 6px;font-size:12px;font-family:Consolas,monospace}
+button,.btn{background:var(--pri);border:none;color:#fff;border-radius:7px;padding:8px 16px;font-size:13px;cursor:pointer;transition:.15s}
+button:hover{opacity:.88}
+button.ghost{background:#fff;color:var(--txt);border:1px solid var(--line)}
+button.danger{background:var(--err)}
+button.ok{background:var(--ok)}
+button:disabled{opacity:.5;cursor:not-allowed}
+input,select{border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-size:13px;background:#fff;color:var(--txt);outline:none;width:100%}
+input:focus,select:focus{border-color:var(--pri)}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
+.form-row{margin-bottom:13px}
+.badge{display:inline-block;border-radius:20px;padding:2px 10px;font-size:11px}
+.badge.ok{background:#e7f8f2;color:var(--ok)}
+.badge.warn{background:#fef4e6;color:var(--warn)}
+.badge.err{background:#fdeaea;color:var(--err)}
+.badge.gray{background:#eef0f4;color:var(--muted)}
+.muted{color:var(--muted);font-size:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+.bar{height:8px;background:#eef0f4;border-radius:4px;overflow:hidden;margin:6px 0}
+.bar>div{height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:4px}
+.toast-wrap{position:fixed;top:18px;right:18px;z-index:99;display:flex;flex-direction:column;gap:8px}
+.toast{background:#26303f;color:#fff;border-radius:8px;padding:10px 18px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.25);animation:fadein .2s}
+.toast.ok{background:var(--ok)}.toast.err{background:var(--err)}
+@keyframes fadein{from{opacity:0;transform:translateY(-6px)}to{opacity:1}}
+.oauth-box{border:2px dashed var(--line);border-radius:10px;padding:22px;text-align:center}
+.oauth-box .url{word-break:break-all;background:#f6f8fb;border-radius:8px;padding:10px;margin:12px 0;font-size:12px}
+.kv{display:flex;font-size:13px;padding:5px 0}
+.kv .k{width:110px;color:var(--muted);flex-shrink:0}
+.kv .v{word-break:break-all}
+.pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:12px}
+#chartDaily,#chartModel{width:100%;height:260px}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:r 0.8s linear infinite;vertical-align:-2px}
+@keyframes r{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div x-data="app()" x-init="init()">
+
+<div class="toast-wrap">
+  <template x-for="(t,i) in toasts" :key="i">
+    <div class="toast" :class="t.type" x-text="t.msg"></div>
+  </template>
+</div>
+
+<!-- 登录 -->
+<template x-if="!ready || !loggedIn">
+  <div class="login-wrap">
+    <div class="login-card">
+      <h1>Buddy2API</h1>
+      <p>CodeBuddy → OpenAI 兼容代理 · 管理后台</p>
+      <form @submit.prevent="doLogin()">
+        <div class="form-row">
+          <label>管理密码</label>
+          <input type="password" x-model="password" placeholder="请输入管理密码" autofocus>
+        </div>
+        <button style="width:100%" :disabled="loading">
+          <span x-show="loading" class="spin"></span> 登录
+        </button>
+      </form>
+    </div>
+  </div>
+</template>
+
+<!-- 主界面 -->
+<template x-if="ready && loggedIn">
+<div class="layout">
+  <aside>
+    <div class="logo">Buddy2API<small x-text="health.region==='cn'?'中国端点':'国际端点'"></small></div>
+    <nav>
+      <a :class="{active:view==='dashboard'}" @click="go('dashboard')">📊 仪表盘</a>
+      <a :class="{active:view==='account'}" @click="go('account')">👤 账号</a>
+      <a :class="{active:view==='keys'}" @click="go('keys')">🔑 API Keys</a>
+      <a :class="{active:view==='resources'}" @click="go('resources')">💰 余额</a>
+      <a :class="{active:view==='checkin'}" @click="go('checkin')">📅 签到</a>
+      <a :class="{active:view==='logs'}" @click="go('logs')">📜 日志</a>
+      <a :class="{active:view==='settings'}" @click="go('settings')">⚙️ 设置</a>
+    </nav>
+    <div class="foot">
+      <div>v<span x-text="health.version||'dev'"></span></div>
+      <div x-show="health.has_token" style="margin-top:4px">
+        <span class="badge" :class="health.expired?'err':'ok'" x-text="health.expired?'凭证已过期':'凭证正常'"></span>
+      </div>
+    </div>
+  </aside>
+  <main>
+
+  <!-- 仪表盘 -->
+  <section x-show="view==='dashboard'" x-cloak>
+    <h2>仪表盘</h2>
+    <div class="grid c4" style="margin-bottom:18px">
+      <div class="stat"><div class="lbl">总请求</div><div class="num" x-text="stats.total_requests||0"></div></div>
+      <div class="stat"><div class="lbl">总 Tokens</div><div class="num" x-text="fmt(stats.total_tokens||0)"></div></div>
+      <div class="stat"><div class="lbl">今日请求</div><div class="num" x-text="stats.today_requests||0"></div></div>
+      <div class="stat"><div class="lbl">错误数</div><div class="num" x-text="stats.error_count||0"></div></div>
+    </div>
+    <div class="grid c2">
+      <div class="card"><h3>近 14 天请求 / Tokens</h3><div id="chartDaily"></div></div>
+      <div class="card"><h3>模型用量 Top10</h3><div id="chartModel"></div></div>
+    </div>
+    <div class="card">
+      <h3>近期错误</h3>
+      <table x-show="(stats.recent_errors||[]).length">
+        <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>状态</th><th>错误</th></tr></thead>
+        <tbody>
+          <template x-for="l in (stats.recent_errors||[])" :key="l.id">
+            <tr>
+              <td x-text="ts(l.created_at)"></td>
+              <td x-text="l.model"></td>
+              <td x-text="l.api_key_name"></td>
+              <td><span class="badge err" x-text="l.status_code"></span></td>
+              <td class="muted" x-text="l.error_msg"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+      <div class="muted" x-show="!(stats.recent_errors||[]).length" style="padding:10px 0">暂无错误 ✨</div>
+    </div>
+  </section>
+
+  <!-- 账号 -->
+  <section x-show="view==='account'" x-cloak>
+    <h2>账号</h2>
+
+    <template x-if="account.logged_in">
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <h3 style="margin:0">OAuth 凭证</h3>
+          <span class="badge" :class="account.expired?'err':'ok'" x-text="account.expired?'已过期':'正常'"></span>
+          <span class="badge" :class="account.region_match?'ok':'warn'"
+                x-text="account.region_match?'与当前端点匹配':'凭证属于另一端点'"></span>
+          <div class="spacer"></div>
+          <button class="ghost" @click="refreshToken()" :disabled="loading">刷新 Token</button>
+          <button class="ghost" @click="testAccount()" :disabled="loading">测试连通</button>
+          <button class="danger" @click="deleteAccount()">退出登录</button>
+        </div>
+        <div class="grid c2">
+          <div>
+            <div class="kv"><div class="k">昵称</div><div class="v" x-text="account.nickname||'—'"></div></div>
+            <div class="kv"><div class="k">UID</div><div class="v" x-text="account.uid||'—'"></div></div>
+            <div class="kv"><div class="k">enterprise_id</div><div class="v" x-text="account.enterprise_id||'（个人账号）'"></div></div>
+          </div>
+          <div>
+            <div class="kv"><div class="k">domain</div><div class="v" x-text="account.domain||'—'"></div></div>
+            <div class="kv"><div class="k">access_token</div><div class="v"><code x-text="account.access_token"></code></div></div>
+            <div class="kv"><div class="k">过期时间</div><div class="v" x-text="account.expires_human+'（'+ts(account.expires_at)+'）'"></div></div>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <div class="card">
+      <h3 x-text="account.logged_in?'重新扫码登录':'扫码登录'"></h3>
+      <template x-if="!oauth.state">
+        <div>
+          <p class="muted" style="margin-bottom:14px">OAuth 设备流：点击开始后，在打开的浏览器页面中完成授权（支持 GitHub 登录）。</p>
+          <button @click="oauthStart()" :disabled="loading">开始扫码登录</button>
+        </div>
+      </template>
+      <template x-if="oauth.state">
+        <div class="oauth-box">
+          <p>请在浏览器中打开以下链接完成授权：</p>
+          <div class="url"><a :href="oauth.auth_url" target="_blank" x-text="oauth.auth_url"></a></div>
+          <div class="row" style="justify-content:center">
+            <a :href="oauth.auth_url" target="_blank"><button>打开授权页面</button></a>
+            <span class="muted" x-text="oauth.poll_msg"></span>
+            <button class="ghost" @click="oauthCancel()">取消</button>
+          </div>
+        </div>
+      </template>
+    </div>
+  </section>
+
+  <!-- API Keys -->
+  <section x-show="view==='keys'" x-cloak>
+    <h2>API Keys</h2>
+    <div class="card">
+      <h3>创建 Key</h3>
+      <div class="grid c4">
+        <div><label>备注</label><input x-model="keyForm.name" placeholder="例如：我的 Cherry Studio"></div>
+        <div><label>自定义 Key（留空随机生成）</label><input x-model="keyForm.custom_key" placeholder="sk-..."></div>
+        <div><label>允许模型（逗号分隔，留空不限）</label><input x-model="keyForm.allowed_models" placeholder="auto, glm-5.3"></div>
+        <div><label>每日限额（0 不限）</label><input type="number" x-model.number="keyForm.daily_limit"></div>
+      </div>
+      <div style="margin-top:12px"><button @click="createKey()" :disabled="loading">创建</button></div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>ID</th><th>Key</th><th>备注</th><th>状态</th><th>今日/限额</th><th>请求数</th><th>Tokens</th><th>操作</th></tr></thead>
+        <tbody>
+          <template x-for="k in keys" :key="k.id">
+            <tr>
+              <td x-text="k.id"></td>
+              <td>
+                <code style="cursor:pointer" title="点击复制完整 Key" @click="copy(k.key_plain)"
+                      x-text="k.key_plain"></code>
+              </td>
+              <td>
+                <input x-model="k.name" style="padding:4px 8px;font-size:12px;width:130px"
+                       @change="updateKey(k,{name:k.name})">
+              </td>
+              <td>
+                <span class="badge" :class="k.status==='active'?'ok':'gray'" style="cursor:pointer"
+                      @click="updateKey(k,{status:k.status==='active'?'disabled':'active'})"
+                      x-text="k.status==='active'?'启用':'停用'"></span>
+              </td>
+              <td><span x-text="k.today_count"></span> / <span x-text="k.daily_limit||'∞'"></span></td>
+              <td x-text="k.total_requests"></td>
+              <td x-text="fmt(k.total_tokens)"></td>
+              <td><button class="danger" style="padding:4px 10px" @click="deleteKey(k)">删除</button></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+      <div class="muted" x-show="!keys.length" style="padding:10px 0">还没有 Key，先创建一个。</div>
+    </div>
+  </section>
+
+  <!-- 余额 -->
+  <section x-show="view==='resources'" x-cloak>
+    <h2>官方余额</h2>
+    <div class="card">
+      <div class="row">
+        <h3 style="margin:0">总额度：<b x-text="resources.total_dosage"></b></h3>
+        <div class="spacer"></div>
+        <span class="muted" x-show="resources.updated_at" x-text="'更新于 '+ts(resources.updated_at)"></span>
+        <button class="ghost" @click="loadResources(true)" :disabled="loading">刷新</button>
+      </div>
+    </div>
+    <div class="grid c2">
+      <template x-for="(a,i) in (resources.accounts||[])" :key="i">
+        <div class="card">
+          <div class="row">
+            <b x-text="a.package_name||'额度包'"></b>
+            <div class="spacer"></div>
+            <span class="badge" :class="a.warn==='expired'?'err':a.warn?'warn':'ok'"
+                  x-text="a.warn==='expired'?'已过期':(a.warn?a.warn+' 内到期':'正常')"></span>
+          </div>
+          <div class="bar"><div :style="'width:'+pct(a)+'%'"></div></div>
+          <div class="row muted">
+            <span x-text="'剩余 '+(a.capacity_remain??0)"></span>
+            <span x-text="'总量 '+(a.capacity_size??0)"></span>
+            <span x-text="'已用 '+(a.capacity_used??0)"></span>
+            <span x-show="a.capacity_unit" x-text="a.capacity_unit"></span>
+          </div>
+          <div class="muted" style="margin-top:6px">
+            到期：<span x-text="a.expire_time||(a.days_left!=null?a.days_left+' 天后':'—')"></span>
+          </div>
+        </div>
+      </template>
+    </div>
+    <div class="card muted" x-show="!(resources.accounts||[]).length && resources.loaded">暂无额度包数据（若持续为空，请检查凭证或刷新）。</div>
+  </section>
+
+  <!-- 签到 -->
+  <section x-show="view==='checkin'" x-cloak>
+    <h2>每日签到</h2>
+    <div class="card">
+      <template x-if="checkin.loaded">
+        <div>
+          <div class="grid c4" style="margin-bottom:14px">
+            <div class="stat"><div class="lbl">活动状态</div><div class="num" style="font-size:18px" x-text="checkin.active?'进行中':'未开启'"></div></div>
+            <div class="stat"><div class="lbl">今日已签</div><div class="num" style="font-size:18px" x-text="checkin.today_checked_in?'是':'否'"></div></div>
+            <div class="stat"><div class="lbl">今日积分</div><div class="num" style="font-size:18px" x-text="checkin.today_credit??'—'"></div></div>
+            <div class="stat"><div class="lbl">连续天数</div><div class="num" style="font-size:18px" x-text="checkin.streak_days??'—'"></div></div>
+          </div>
+          <button class="ok" @click="claimCheckin()" :disabled="loading||checkin.today_checked_in"
+                  x-text="checkin.today_checked_in?'今日已签到':'立即签到'"></button>
+        </div>
+      </template>
+      <div class="muted" x-show="!checkin.loaded">加载中…</div>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section x-show="view==='logs'" x-cloak>
+    <h2>请求日志</h2>
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <input style="width:180px" x-model="logFilter.model" placeholder="模型（模糊）" @change="loadLogs(1)">
+        <select style="width:150px" x-model="logFilter.key_id" @change="loadLogs(1)">
+          <option value="">全部 Key</option>
+          <template x-for="k in keys" :key="k.id"><option :value="k.id" x-text="k.name||('#'+k.id)"></option></template>
+        </select>
+        <select style="width:130px" x-model="logFilter.status" @change="loadLogs(1)">
+          <option value="">全部状态</option>
+          <option value="error">仅错误</option>
+          <option value="200">200</option>
+          <option value="401">401</option>
+          <option value="429">429</option>
+          <option value="503">503</option>
+        </select>
+        <div class="spacer"></div>
+        <span class="muted" x-text="'共 '+logTotal+' 条'"></span>
+      </div>
+      <table>
+        <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>流式</th><th>P/C/T</th><th>积分</th><th>finish</th><th>耗时</th><th>状态</th><th>错误</th></tr></thead>
+        <tbody>
+          <template x-for="l in logs" :key="l.id">
+            <tr>
+              <td class="muted" x-text="ts(l.created_at,true)"></td>
+              <td x-text="l.model"></td>
+              <td x-text="l.api_key_name||'—'"></td>
+              <td x-text="l.stream?'⚡':'JSON'"></td>
+              <td class="muted" x-text="l.prompt_tokens+'/'+l.completion_tokens+'/'+l.total_tokens"></td>
+              <td x-text="l.credit||''"></td>
+              <td class="muted" x-text="l.finish_reason||''"></td>
+              <td class="muted" x-text="l.duration_ms+'ms'"></td>
+              <td><span class="badge" :class="l.status_code>=400?'err':'ok'" x-text="l.status_code"></span></td>
+              <td class="muted" x-text="l.error_msg"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+      <div class="pager">
+        <button class="ghost" @click="loadLogs(logPage-1)" :disabled="logPage<=1">上一页</button>
+        <span class="muted" x-text="logPage+' / '+Math.max(1,Math.ceil(logTotal/logPageSize))+' 页'"></span>
+        <button class="ghost" @click="loadLogs(logPage+1)" :disabled="logPage>=Math.ceil(logTotal/logPageSize)">下一页</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section x-show="view==='settings'" x-cloak>
+    <h2>设置</h2>
+    <div class="card">
+      <h3>基本</h3>
+      <div class="grid c2">
+        <div>
+          <label>端点 region（切换后凭证不互通，需重新登录）</label>
+          <select :value="settings.region" @change="settings.region=$event.target.value">
+            <option value="cn">中国（copilot.tencent.com）</option>
+            <option value="global">国际（www.codebuddy.ai）</option>
+          </select>
+        </div>
+        <div>
+          <label>监听地址（改后需重启）</label>
+          <input :value="settings.listen" disabled>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>签到与缓存</h3>
+      <div class="grid c3">
+        <div>
+          <label>自动签到</label>
+          <select :value="settings.auto_checkin" @change="settings.auto_checkin=$event.target.value==='true'">
+            <option value="false">关闭</option><option value="true">开启</option>
+          </select>
+        </div>
+        <div><label>签到 cron（6 段含秒）</label><input x-model="settings.checkin_cron" placeholder="0 0 9 * * *"></div>
+        <div><label>余额缓存秒数</label><input type="number" x-model.number="settings.resource_cache_seconds"></div>
+      </div>
+      <div style="margin-top:10px"><label>日志保留天数</label><input type="number" style="width:180px" x-model.number="settings.log_retention_days"></div>
+    </div>
+    <div class="card">
+      <h3>模型列表</h3>
+      <div class="row">
+        <span class="muted" x-show="settings.models"
+              x-text="(settings.models.fallback?'内置回退表':'实时列表')+' · '+settings.models.count+' 个模型 · '+ts(settings.models.fetched_at)"></span>
+        <div class="spacer"></div>
+        <button class="ghost" @click="refreshModels()" :disabled="loading">刷新模型列表</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>修改管理密码</h3>
+      <div class="grid c2">
+        <div><label>旧密码</label><input type="password" x-model="pwForm.old_password"></div>
+        <div><label>新密码（≥6 位）</label><input type="password" x-model="pwForm.new_password"></div>
+      </div>
+    </div>
+    <button @click="saveSettings()" :disabled="loading">保存设置</button>
+  </section>
+
+  </main>
+</div>
+</template>
+</div>
+
+<script>
+function app(){
+  return {
+    ready:false, loggedIn:false, loading:false, password:'',
+    view:'dashboard', toasts:[], _toastSeq:0,
+    health:{}, stats:{}, account:{}, keys:[], logs:[], logTotal:0, logPage:1, logPageSize:20,
+    logFilter:{model:'',key_id:'',status:''},
+    keyForm:{name:'',custom_key:'',allowed_models:'',daily_limit:0},
+    resources:{accounts:[],loaded:false}, checkin:{loaded:false},
+    settings:{}, pwForm:{old_password:'',new_password:''},
+    oauth:{state:'',auth_url:'',poll_msg:'等待授权中…',_timer:null,_deadline:0},
+    charts:{},
+
+    async init(){
+      try{
+        const r = await this.api('/admin/session');
+        this.loggedIn = r.logged_in;
+      }catch(e){ this.loggedIn=false; }
+      this.ready = true;
+      if(this.loggedIn) this.afterLogin();
+    },
+    afterLogin(){
+      this.loadHealth(); this.loadKeys();
+      this.go(this.view);
+    },
+    go(v){
+      this.view=v;
+      if(v==='dashboard') this.loadStats();
+      if(v==='account') this.loadAccount();
+      if(v==='keys') this.loadKeys();
+      if(v==='resources') this.loadResources(false);
+      if(v==='checkin') this.loadCheckin();
+      if(v==='logs') this.loadLogs(1);
+      if(v==='settings') this.loadSettings();
+    },
+
+    // ── API 基础 ──
+    async api(path, opts={}){
+      opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
+      const r = await fetch(path, opts);
+      if(r.status===401){ this.loggedIn=false; throw new Error('登录已过期'); }
+      const data = await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(data.error||('HTTP '+r.status));
+      return data;
+    },
+    toast(msg, type=''){
+      const id = ++this._toastSeq;
+      this.toasts.push({id,msg,type});
+      setTimeout(()=>{ this.toasts=this.toasts.filter(t=>t.id!==id); }, 3200);
+    },
+    busy(fn){
+      return async (...a)=>{ this.loading=true; try{ return await fn(...a); }
+        catch(e){ this.toast(e.message,'err'); }
+        finally{ this.loading=false; } };
+    },
+    copy(text){
+      navigator.clipboard.writeText(text).then(()=>this.toast('已复制','ok'));
+    },
+    fmt(n){ return (n||0).toLocaleString(); },
+    ts(unix, withSec){
+      if(!unix) return '—';
+      const d = new Date(unix*1000);
+      const p = n=>String(n).padStart(2,'0');
+      let s = d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+      if(withSec) s += ':'+p(d.getSeconds());
+      return s;
+    },
+    pct(a){
+      if(!a.capacity_size) return 0;
+      return Math.max(0, Math.min(100, a.capacity_remain/a.capacity_size*100));
+    },
+
+    // ── 登录 ──
+    async doLogin(){
+      if(!this.password){ this.toast('请输入密码','err'); return; }
+      this.loading=true;
+      try{
+        await this.api('/admin/login',{method:'POST',body:JSON.stringify({password:this.password})});
+        this.loggedIn=true; this.password='';
+        this.toast('登录成功','ok');
+        this.afterLogin();
+      }catch(e){ this.toast(e.message,'err'); }
+      this.loading=false;
+    },
+
+    // ── health / stats ──
+    async loadHealth(){
+      try{ this.health = await fetch('/health').then(r=>r.json()); }catch(e){}
+    },
+    async loadStats(){
+      try{
+        this.stats = await this.api('/admin/stats');
+        this.$nextTick(()=>this.renderCharts());
+      }catch(e){ this.toast(e.message,'err'); }
+    },
+    renderCharts(){
+      if(typeof echarts==='undefined') return;
+      const d1 = document.getElementById('chartDaily');
+      const d2 = document.getElementById('chartModel');
+      if(!d1||!d2) return;
+      this.charts.daily = this.charts.daily||echarts.init(d1);
+      this.charts.model = this.charts.model||echarts.init(d2);
+      const daily = this.stats.daily||[];
+      this.charts.daily.setOption({
+        tooltip:{trigger:'axis'},
+        legend:{data:['请求','Tokens'],top:0},
+        grid:{left:44,right:16,top:30,bottom:24},
+        xAxis:{type:'category',data:daily.map(d=>d.date.slice(5))},
+        yAxis:[{type:'value'},{type:'value'}],
+        series:[
+          {name:'请求',type:'bar',data:daily.map(d=>d.requests),itemStyle:{color:'#3b82f6'}},
+          {name:'Tokens',type:'line',yAxisIndex:1,data:daily.map(d=>d.tokens),itemStyle:{color:'#10b981'},smooth:true},
+        ],
+      });
+      const bym = this.stats.by_model||[];
+      this.charts.model.setOption({
+        tooltip:{},
+        grid:{left:110,right:24,top:10,bottom:24},
+        xAxis:{type:'value'},
+        yAxis:{type:'category',data:bym.map(m=>m.model).reverse()},
+        series:[{type:'bar',data:bym.map(m=>m.requests).reverse(),itemStyle:{color:'#60a5fa'}}],
+      });
+    },
+
+    // ── 账号 ──
+    async loadAccount(){
+      try{ this.account = await this.api('/admin/account'); }catch(e){ this.toast(e.message,'err'); }
+    },
+    async refreshToken(){
+      this.busy(async()=>{
+        const r = await this.api('/admin/account/refresh',{method:'POST'});
+        this.toast('已刷新，新有效期 '+r.expires_human,'ok');
+        this.loadAccount();
+      })();
+    },
+    async testAccount(){
+      this.busy(async()=>{
+        const r = await this.api('/admin/account/test',{method:'POST'});
+        r.ok ? this.toast('凭证可用 ✅','ok') : this.toast('测试失败：'+r.message,'err');
+      })();
+    },
+    async deleteAccount(){
+      if(!confirm('确定退出登录并删除本地凭证？')) return;
+      this.busy(async()=>{
+        await this.api('/admin/account',{method:'DELETE'});
+        this.toast('已清除凭证','ok'); this.loadAccount(); this.loadHealth();
+      })();
+    },
+
+    // ── OAuth ──
+    async oauthStart(){
+      this.busy(async()=>{
+        const r = await this.api('/admin/account/oauth/start',{method:'POST'});
+        this.oauth.state = r.state;
+        this.oauth.auth_url = r.auth_url;
+        this.oauth.poll_msg = '等待授权中…';
+        this.oauth._deadline = Date.now()+5*60*1000;
+        window.open(r.auth_url, '_blank');
+        this.oauth._timer = setInterval(()=>this.oauthPoll(), 3000);
+        this.oauthPoll();
+      })();
+    },
+    async oauthPoll(){
+      if(!this.oauth.state) return;
+      if(Date.now()>this.oauth._deadline){ this.oauthStop('超时未完成授权'); return; }
+      try{
+        const r = await this.api('/admin/account/oauth/poll?state='+encodeURIComponent(this.oauth.state));
+        if(r.status==='success'){
+          this.oauthStop();
+          this.toast('登录成功：'+(r.account.nickname||r.account.uid),'ok');
+          this.loadAccount(); this.loadHealth(); this.loadSettings();
+        }else if(r.status==='error'){
+          this.oauthStop(r.message);
+        }else{
+          this.oauth.poll_msg = '等待授权中…（'+new Date().toLocaleTimeString()+'）';
+        }
+      }catch(e){ /* 网络抖动忽略，下轮继续 */ }
+    },
+    oauthStop(errMsg){
+      if(this.oauth._timer){ clearInterval(this.oauth._timer); this.oauth._timer=null; }
+      if(errMsg){ this.toast(errMsg,'err'); this.oauth.poll_msg = errMsg; }
+      setTimeout(()=>{ this.oauth.state=''; this.oauth.auth_url=''; }, errMsg?2500:400);
+    },
+    oauthCancel(){ this.oauthStop(); },
+
+    // ── keys ──
+    async loadKeys(){
+      try{ const r = await this.api('/admin/api-keys'); this.keys = r.keys||[]; }catch(e){}
+    },
+    async createKey(){
+      this.busy(async()=>{
+        const f = this.keyForm;
+        let allowed = '';
+        if(f.allowed_models && f.allowed_models.trim()){
+          allowed = JSON.stringify(f.allowed_models.split(/[,，\s]+/).filter(Boolean));
+        }
+        await this.api('/admin/api-keys',{method:'POST',body:JSON.stringify({
+          name:f.name, custom_key:f.custom_key, allowed_models:allowed, daily_limit:+f.daily_limit||0 })});
+        this.toast('已创建','ok');
+        this.keyForm = {name:'',custom_key:'',allowed_models:'',daily_limit:0};
+        this.loadKeys();
+      })();
+    },
+    async updateKey(k, patch){
+      try{
+        const body = {};
+        for(const key in patch) body[key]=patch[key];
+        await this.api('/admin/api-keys/'+k.id,{method:'PUT',body:JSON.stringify(body)});
+        this.toast('已更新','ok'); this.loadKeys();
+      }catch(e){ this.toast(e.message,'err'); }
+    },
+    async deleteKey(k){
+      if(!confirm('确定删除该 Key？')) return;
+      try{
+        await this.api('/admin/api-keys/'+k.id,{method:'DELETE'});
+        this.toast('已删除','ok'); this.loadKeys();
+      }catch(e){ this.toast(e.message,'err'); }
+    },
+
+    // ── 余额 ──
+    async loadResources(force){
+      this.busy(async()=>{
+        const r = await this.api('/admin/resources'+(force?'?force=1':''));
+        this.resources = Object.assign({loaded:true}, r.data||{});
+      })();
+    },
+
+    // ── 签到 ──
+    async loadCheckin(){
+      try{
+        const r = await this.api('/admin/checkin/status');
+        const d = r.data&&r.data.data ? r.data.data : (r.data||{});
+        this.checkin = Object.assign({loaded:true}, d);
+      }catch(e){ this.toast(e.message,'err'); }
+    },
+    async claimCheckin(){
+      this.busy(async()=>{
+        const r = await this.api('/admin/checkin/claim',{method:'POST'});
+        const d = (r.data&&r.data.data)||{};
+        this.toast(d.credit>0?('签到成功，+'+d.credit+' 积分'):'今日已签到或不可领取', d.credit>0?'ok':'');
+        this.loadCheckin();
+      })();
+    },
+
+    // ── 日志 ──
+    async loadLogs(page){
+      if(page<1) page=1;
+      const f = this.logFilter;
+      const qs = new URLSearchParams({page,page_size:this.logPageSize});
+      if(f.model) qs.set('model',f.model);
+      if(f.key_id) qs.set('key_id',f.key_id);
+      if(f.status) qs.set('status',f.status);
+      try{
+        const r = await this.api('/admin/logs?'+qs);
+        this.logs = r.logs||[]; this.logTotal = r.total||0; this.logPage = page;
+      }catch(e){ this.toast(e.message,'err'); }
+    },
+
+    // ── 设置 ──
+    async loadSettings(){
+      try{ this.settings = await this.api('/admin/settings'); }catch(e){}
+    },
+    async refreshModels(){
+      this.busy(async()=>{
+        const r = await this.api('/admin/models/refresh',{method:'POST'});
+        this.toast('已刷新（'+r.ids.length+' 个模型）','ok');
+        this.loadSettings();
+      })();
+    },
+    async saveSettings(){
+      this.busy(async()=>{
+        const s = this.settings, body = {
+          region:s.region, auto_checkin:!!s.auto_checkin,
+          checkin_cron:s.checkin_cron, resource_cache_seconds:+s.resource_cache_seconds,
+          log_retention_days:+s.log_retention_days,
+        };
+        if(this.pwForm.old_password||this.pwForm.new_password){
+          body.old_password=this.pwForm.old_password; body.new_password=this.pwForm.new_password;
+        }
+        this.settings = await this.api('/admin/settings',{method:'PUT',body:JSON.stringify(body)});
+        this.pwForm={old_password:'',new_password:''};
+        this.toast('已保存','ok');
+        this.loadHealth();
+      })();
+    },
+  };
+}
+</script>
+<style>[x-cloak]{display:none!important}</style>
+</body>
+</html>

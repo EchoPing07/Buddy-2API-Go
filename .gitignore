@@ -1,0 +1,33 @@
+# 参考项目（第三方，不上传）
+references/
+
+# 开发文档（本地规划用，不上传）
+docs/
+
+# 上游接口测试程序（含凭证，不上传）
+tests/
+
+# Go 构建产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试二进制
+*.test
+
+# 输出
+*.out
+
+# 日志
+*.log
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 运行时数据（凭证/数据库，不上传）
+data/
