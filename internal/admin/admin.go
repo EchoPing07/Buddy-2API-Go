@@ -39,7 +39,7 @@ func New(cfg *config.Manager, st *store.Store, toks *auth.TokenStore, client *up
 	return &Handler{cfg: cfg, st: st, toks: toks, client: client, models: models, keys: keys, sched: sched, session: session}
 }
 
-// Routes 挂载 /admin 路由（外层已做 session 校验时 includePublic=true 跳过）。
+// Routes 挂载 /admin 路由。
 func (h *Handler) Routes() func(chi.Router) {
 	return func(r chi.Router) {
 		r.Post("/login", h.login)
@@ -54,6 +54,8 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Post("/account/refresh", h.accountRefresh)
 			r.Post("/account/test", h.accountTest)
 			r.Delete("/account", h.accountDelete)
+			r.Get("/account/export", h.accountExport)
+			r.Post("/account/import", h.accountImport)
 
 			r.Get("/resources", h.resources)
 			r.Get("/checkin/status", h.checkinStatus)
@@ -75,7 +77,7 @@ func (h *Handler) Routes() func(chi.Router) {
 	}
 }
 
-// ─────────────────────────── util ───────────────────────────
+// ── util ──
 
 func jsonWrite(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -113,7 +115,7 @@ func (h *Handler) requireSession(next http.Handler) http.Handler {
 	})
 }
 
-// ─────────────────────────── 登录 ───────────────────────────
+// ── 登录 ──
 
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -140,7 +142,7 @@ func (h *Handler) sessionCheck(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"logged_in": h.session.Valid(r)})
 }
 
-// ─────────────────────────── 账号 ───────────────────────────
+// ── 账号 ──
 
 func maskToken(s string) string {
 	if len(s) <= 20 {
@@ -242,9 +244,75 @@ func (h *Handler) accountDelete(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// ─────────────────────────── 余额 ───────────────────────────
+// accountExport 导出当前账号凭证为 token.json（下载附件）。
+func (h *Handler) accountExport(w http.ResponseWriter, r *http.Request) {
+	t := h.toks.Get()
+	if t == nil {
+		jsonErr(w, http.StatusBadRequest, "尚未登录，无凭证可导出")
+		return
+	}
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="token.json"`)
+	w.Write(data)
+}
 
-// resourceAccount 额度包明细（本地加工：临期/过期/排序见 processedResources）。
+// accountImport 导入账号凭证，必须含 access_token（合法 JWT），其余可选。
+func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		TokenType    string `json:"token_type"`
+		ExpiresAt    int64  `json:"expires_at"`
+		Domain       string `json:"domain"`
+		Nickname     string `json:"nickname"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	req.AccessToken = strings.TrimSpace(req.AccessToken)
+	if req.AccessToken == "" {
+		jsonErr(w, http.StatusBadRequest, "access_token 不能为空")
+		return
+	}
+	if _, _, _, _, _, err := auth.ParseJWT(req.AccessToken); err != nil {
+		jsonErr(w, http.StatusBadRequest, "access_token 不是合法 JWT: "+err.Error())
+		return
+	}
+	t := &auth.Token{
+		AccessToken:  req.AccessToken,
+		RefreshToken: strings.TrimSpace(req.RefreshToken),
+		TokenType:    strings.TrimSpace(req.TokenType),
+		ExpiresAt:    req.ExpiresAt,
+		Domain:       strings.TrimSpace(req.Domain),
+		Nickname:     strings.TrimSpace(req.Nickname),
+	}
+	t.EnrichFromJWT()
+	if t.TokenType == "" {
+		t.TokenType = "Bearer"
+	}
+	if t.Domain == "" {
+		t.Domain = config.EndpointOf(h.cfg.Get().Region).Domain
+	}
+	if err := h.toks.Save(t); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"uid":      t.UID,
+		"nickname": t.Nickname,
+		"domain":   t.Domain,
+	})
+}
+
+// ── 余额 ──
+
+// resourceAccount 额度包明细。
 type resourceAccount struct {
 	PackageName    string  `json:"package_name"`
 	ProductName    string  `json:"product_name"`
@@ -289,7 +357,7 @@ func (h *Handler) resources(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "data": processed})
 }
 
-// processResources 解包 data.Response.Data 并本地加工（DEVELOPMENT.md §6.4）。
+// processResources 解包 data.Response.Data 并本地加工。
 func processResources(raw json.RawMessage) map[string]any {
 	var top map[string]any
 	if err := json.Unmarshal(raw, &top); err != nil {
@@ -357,7 +425,7 @@ func processResources(raw json.RawMessage) map[string]any {
 	return out
 }
 
-// ─────────────────────────── 签到 ───────────────────────────
+// ── 签到 ──
 
 func (h *Handler) checkinStatus(w http.ResponseWriter, r *http.Request) {
 	// 优先读缓存（60s），避免高频查询
@@ -389,7 +457,7 @@ func (h *Handler) checkinClaim(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "data": parsed})
 }
 
-// ─────────────────────────── keys ───────────────────────────
+// ── keys ──
 
 func (h *Handler) listKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := h.keys.List()
@@ -397,37 +465,18 @@ func (h *Handler) listKeys(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 附带今日用量
-	type keyRow struct {
-		store.APIKey
-		TodayCount int `json:"today_count"`
-	}
-	rows := make([]keyRow, 0, len(keys))
-	for _, k := range keys {
-		n, _ := h.st.DailyUsageCount(k.ID)
-		rows = append(rows, keyRow{APIKey: k, TodayCount: n})
-	}
-	jsonWrite(w, http.StatusOK, map[string]any{"keys": rows})
+	jsonWrite(w, http.StatusOK, map[string]any{"keys": keys})
 }
 
 func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name          string `json:"name"`
-		CustomKey     string `json:"custom_key"`
-		AllowedModels string `json:"allowed_models"` // JSON 数组字符串
-		DailyLimit    int    `json:"daily_limit"`
+		Name      string `json:"name"`
+		CustomKey string `json:"custom_key"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
-	if req.AllowedModels != "" {
-		var list []string
-		if err := json.Unmarshal([]byte(req.AllowedModels), &list); err != nil {
-			jsonErr(w, http.StatusBadRequest, "allowed_models 需为 JSON 数组字符串")
-			return
-		}
-	}
-	k, err := h.keys.Create(req.Name, req.CustomKey, req.AllowedModels, req.DailyLimit)
+	k, err := h.keys.Create(req.Name, req.CustomKey)
 	if err != nil {
 		jsonErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -442,15 +491,13 @@ func (h *Handler) updateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name          *string `json:"name"`
-		Status        *string `json:"status"`
-		AllowedModels *string `json:"allowed_models"`
-		DailyLimit    *int    `json:"daily_limit"`
+		Name   *string `json:"name"`
+		Status *string `json:"status"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
-	if err := h.keys.Update(id, req.Name, req.Status, req.AllowedModels, req.DailyLimit); err != nil {
+	if err := h.keys.Update(id, req.Name, req.Status); err != nil {
 		jsonErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -471,7 +518,7 @@ func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// ─────────────────────────── 日志 / 统计 ───────────────────────────
+// ── 日志 / 统计 ──
 
 func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -512,7 +559,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, st)
 }
 
-// ─────────────────────────── 设置 ───────────────────────────
+// ── 设置 ──
 
 func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Get()
@@ -523,7 +570,7 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		"checkin_cron":           cfg.CheckinCron,
 		"resource_cache_seconds": cfg.ResourceCacheSeconds,
 		"log_retention_days":     cfg.LogRetentionDays,
-		"models":                 h.models.State(),
+		"log_max_size_mb":        cfg.LogMaxSizeMB,
 	})
 }
 
@@ -531,11 +578,13 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		OldPassword          *string `json:"old_password"`
 		NewPassword          *string `json:"new_password"`
+		Listen               *string `json:"listen"`
 		Region               *string `json:"region"`
 		AutoCheckin          *bool   `json:"auto_checkin"`
 		CheckinCron          *string `json:"checkin_cron"`
 		ResourceCacheSeconds *int    `json:"resource_cache_seconds"`
 		LogRetentionDays     *int    `json:"log_retention_days"`
+		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -559,7 +608,18 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 监听地址格式校验（保存后需用户自行重启生效）
+	if req.Listen != nil {
+		if err := config.ValidateListen(*req.Listen); err != nil {
+			jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
 	err := h.cfg.Update(func(c *config.Config) error {
+		if req.Listen != nil {
+			c.Listen = strings.TrimSpace(*req.Listen)
+		}
 		if req.Region != nil {
 			if *req.Region != "cn" && *req.Region != "global" {
 				return fmt.Errorf("region 仅支持 cn/global")
@@ -584,6 +644,9 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		if req.LogRetentionDays != nil && *req.LogRetentionDays > 0 {
 			c.LogRetentionDays = *req.LogRetentionDays
 		}
+		if req.LogMaxSizeMB != nil && *req.LogMaxSizeMB > 0 {
+			c.LogMaxSizeMB = *req.LogMaxSizeMB
+		}
 		return nil
 	})
 	if err != nil {
@@ -591,7 +654,7 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// region 切换 → 立即重新拉取模型列表（DEVELOPMENT.md §5.2）
+	// region 切换 → 立即重新拉取模型列表
 	if regionChanged {
 		if err := h.models.Refresh(h.client); err != nil {
 			// 失败已回退内置表，不阻断设置保存
@@ -607,7 +670,7 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 	h.getSettings(w, r)
 }
 
-// ─────────────────────────── 模型 ───────────────────────────
+// ── 模型 ──
 
 func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{
@@ -625,7 +688,7 @@ func (h *Handler) refreshModels(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"ids": h.models.List(), "state": h.models.State()})
 }
 
-// ─────────────────────────── util ───────────────────────────
+// ── util ──
 
 func atoiDefault(s string, def int) int {
 	if s == "" {

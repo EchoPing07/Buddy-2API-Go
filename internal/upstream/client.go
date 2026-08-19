@@ -49,7 +49,7 @@ func (c *Client) token() (*auth.Token, error) {
 	return t, nil
 }
 
-// ─────────────────────────── 统一包络 ───────────────────────────
+// ── 统一包络 ──
 
 // envelope 上游统一响应包络 {code,msg,data}。
 type envelope struct {
@@ -76,7 +76,7 @@ func postJSON(client *http.Client, url string, body string, headers http.Header)
 	return resp.StatusCode, raw, nil
 }
 
-// ─────────────────────────── chat ───────────────────────────
+// ── chat ──
 
 // Chat 单次 chat 请求，返回上游 SSE 响应（调用方负责关闭 Body）。
 func (c *Client) Chat(ctx context.Context, body []byte) (*http.Response, error) {
@@ -97,7 +97,7 @@ func (c *Client) chatOnce(ctx context.Context, body []byte, t *auth.Token) (*htt
 	return c.long.Do(req)
 }
 
-// DoChat 完整 chat 流程：ensure_token_valid → 请求 → 401 刷新重试一次。
+// DoChat 完整 chat 流程：确保 token 有效 → 请求 → 401 则刷新重试一次。
 func (c *Client) DoChat(ctx context.Context, body []byte) (*http.Response, error) {
 	if _, err := c.token(); err != nil {
 		return nil, err
@@ -122,7 +122,7 @@ func (c *Client) DoChat(ctx context.Context, body []byte) (*http.Response, error
 	return resp, nil
 }
 
-// Ping 发最小 chat（model=auto、prompt=ping）验证凭证可用（同 wicm test_account_chat）。
+// Ping 发最小 chat 验证凭证可用。
 func (c *Client) Ping() error {
 	body := map[string]any{
 		"model":          "auto",
@@ -151,9 +151,9 @@ func (c *Client) Ping() error {
 	return nil
 }
 
-// ─────────────────────────── token 刷新 ───────────────────────────
+// ── token 刷新 ──
 
-// RefreshFn 供 auth.TokenStore.EnsureValid/ForceRefresh 使用的刷新回调。
+// RefreshFn 刷新回调，供 TokenStore 使用。
 func (c *Client) RefreshFn(t *auth.Token) (*auth.Token, error) {
 	if t.RefreshToken == "" {
 		return nil, fmt.Errorf("缺少 refresh_token，无法刷新，请重新登录")
@@ -222,9 +222,9 @@ func buildToken(d tokenData, old *auth.Token) *auth.Token {
 	return t
 }
 
-// ─────────────────────────── OAuth 设备流 ───────────────────────────
+// ── OAuth 设备流 ──
 
-// OAuthStart 启动设备流，返回 state 与授权链接（host 与 API 端点同 host，按 region）。
+// OAuthStart 启动设备流，返回 state 与授权链接。
 func (c *Client) OAuthStart() (state, authURL string, err error) {
 	nonce := randHex(8)
 	host := c.ep().Upstream
@@ -289,7 +289,7 @@ func (c *Client) OAuthPoll(state string) (*auth.Token, bool, error) {
 	}
 }
 
-// ─────────────────────────── billing / 签到 ───────────────────────────
+// ── billing / 签到 ──
 
 // BillingResult billing 类接口结果：Raw 为上游原始 JSON，Data 为解包后的 data 节点。
 type BillingResult struct {
@@ -342,7 +342,7 @@ func (c *Client) ClaimCheckin() (*BillingResult, error) {
 	return r, err
 }
 
-// ─────────────────────────── /v3/config 模型列表 ───────────────────────────
+// ── /v3/config 模型列表 ──
 
 // ModelInfo 模型详情。
 type ModelInfo struct {
@@ -417,7 +417,7 @@ func (c *Client) FetchConfig() (*ModelsConfig, error) {
 	return mc, nil
 }
 
-// ─────────────────────────── util ───────────────────────────
+// ── util ──
 
 func orDefault(s, def string) string {
 	if strings.TrimSpace(s) == "" {

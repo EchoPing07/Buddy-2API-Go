@@ -3,466 +3,988 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Buddy2API 管理后台</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js" defer></script>
+<title>Buddy-2API · 管理后台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 7 4 4 20 4 20 7'/%3E%3Cline x1='9' x2='15' y1='20' y2='20'/%3E%3Cline x1='12' x2='12' y1='4' y2='20'/%3E%3C/svg%3E">
+<script defer src="/assets/alpine.js"></script>
 <style>
+/* ═══════════════════════════════════════════════════════════════
+   设计令牌（参考 grok2api / shadcn · 极简黑白 · oklch）
+   ═══════════════════════════════════════════════════════════════ */
 :root{
-  --bg:#f5f6f8;--card:#fff;--side:#1c2333;--side2:#262f45;--txt:#26303f;
-  --muted:#8a94a6;--line:#e6e9f0;--pri:#3b82f6;--ok:#10b981;--warn:#f59e0b;--err:#ef4444;
+  --radius:8px;
+  /* 字号阶梯：11 / 12 / 13 / 14 / 16 / 20 / 24 / 28（禁止使用阶梯外尺寸） */
+  --fs-2xs:11px;--fs-xs:12px;--fs-sm:13px;--fs-md:14px;--fs-lg:16px;--fs-xl:20px;--fs-2xl:24px;--fs-3xl:28px;
+  /* 图标阶梯：14 / 16 / 20 */
+  --icon-sm:14px;--icon:16px;--icon-lg:20px;
+  --bg:oklch(.984 0 0);
+  --fg:oklch(.21 0 0);
+  --card:oklch(.997 0 0);
+  --popover:oklch(1 0 0);
+  --secondary:oklch(.962 .003 90);
+  --secondary-fg:oklch(.28 0 0);
+  --muted-fg:oklch(.53 0 0);
+  --accent:oklch(.945 .004 90);
+  --primary:oklch(.22 0 0);
+  --primary-fg:oklch(.985 0 0);
+  --destructive:oklch(.577 .215 27);
+  --border:oklch(.912 0 0);
+  --input:oklch(.9 0 0);
+  --sidebar:oklch(.995 0 0);
+  --sidebar-border:oklch(.932 0 0);
+  --ok-fg:oklch(.55 .12 162);
+  --ok-bg:color-mix(in oklab,oklch(.7 .15 162) 13%,transparent);
+  --warn-fg:oklch(.55 .12 70);
+  --warn-bg:color-mix(in oklab,oklch(.78 .15 75) 18%,transparent);
+  --err-fg:oklch(.55 .19 25);
+  --err-bg:color-mix(in oklab,oklch(.66 .2 25) 11%,transparent);
+  --chart-bar:color-mix(in oklab,oklch(.5 0 0) 22%,transparent);
+  --chart-bar-hl:color-mix(in oklab,oklch(.5 0 0) 42%,transparent);
+  --bar-fill:oklch(.75 .15 75);
+  --chevron:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%238a8a8a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  color-scheme:light;
 }
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--txt);font-size:14px}
-a{color:var(--pri);text-decoration:none}
-/* 登录页 */
-.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1c2333,#2b3a5c)}
-.login-card{background:#fff;border-radius:12px;padding:36px 40px;width:360px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
-.login-card h1{font-size:20px;margin-bottom:6px}
-.login-card p{color:var(--muted);font-size:12px;margin-bottom:22px}
-/* 布局 */
-.layout{display:flex;min-height:100vh}
-aside{width:200px;background:var(--side);color:#cdd5e3;flex-shrink:0;display:flex;flex-direction:column}
-aside .logo{padding:20px 18px;font-size:16px;font-weight:600;color:#fff;border-bottom:1px solid rgba(255,255,255,.08)}
-aside .logo small{display:block;font-size:10px;font-weight:400;color:var(--muted);margin-top:3px}
-nav{padding:10px 0;flex:1}
-nav a{display:block;padding:11px 20px;color:#cdd5e3;cursor:pointer;font-size:13.5px;border-left:3px solid transparent}
-nav a:hover{background:var(--side2);color:#fff}
-nav a.active{background:var(--side2);color:#fff;border-left-color:var(--pri)}
-aside .foot{padding:14px 18px;font-size:11px;color:var(--muted);border-top:1px solid rgba(255,255,255,.08)}
-main{flex:1;padding:24px 28px;max-width:1160px;overflow-x:auto}
-h2{font-size:18px;margin-bottom:18px;font-weight:600}
-h3{font-size:14px;margin-bottom:12px;font-weight:600}
-/* 组件 */
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin-bottom:18px}
-.grid{display:grid;gap:14px}
-.grid.c4{grid-template-columns:repeat(4,1fr)}
-.grid.c3{grid-template-columns:repeat(3,1fr)}
-.grid.c2{grid-template-columns:repeat(2,1fr)}
-@media(max-width:900px){.grid.c4,.grid.c3,.grid.c2{grid-template-columns:1fr 1fr}}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
-.stat .num{font-size:24px;font-weight:700;margin-top:4px}
-.stat .lbl{color:var(--muted);font-size:12px}
-table{width:100%;border-collapse:collapse}
-th,td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:13px;vertical-align:middle}
-th{color:var(--muted);font-weight:500;white-space:nowrap}
-td{word-break:break-all}
-tr:hover td{background:#fafbfd}
-code{background:#f1f3f7;border-radius:4px;padding:2px 6px;font-size:12px;font-family:Consolas,monospace}
-button,.btn{background:var(--pri);border:none;color:#fff;border-radius:7px;padding:8px 16px;font-size:13px;cursor:pointer;transition:.15s}
-button:hover{opacity:.88}
-button.ghost{background:#fff;color:var(--txt);border:1px solid var(--line)}
-button.danger{background:var(--err)}
-button.ok{background:var(--ok)}
-button:disabled{opacity:.5;cursor:not-allowed}
-input,select{border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-size:13px;background:#fff;color:var(--txt);outline:none;width:100%}
-input:focus,select:focus{border-color:var(--pri)}
-label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
-.form-row{margin-bottom:13px}
-.badge{display:inline-block;border-radius:20px;padding:2px 10px;font-size:11px}
-.badge.ok{background:#e7f8f2;color:var(--ok)}
-.badge.warn{background:#fef4e6;color:var(--warn)}
-.badge.err{background:#fdeaea;color:var(--err)}
-.badge.gray{background:#eef0f4;color:var(--muted)}
-.muted{color:var(--muted);font-size:12px}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.dark{
+  --bg:oklch(.135 0 0);
+  --fg:oklch(.955 0 0);
+  --card:oklch(.182 0 0);
+  --popover:oklch(.172 0 0);
+  --secondary:oklch(.215 0 0);
+  --secondary-fg:oklch(.94 0 0);
+  --muted-fg:oklch(.635 0 0);
+  --accent:oklch(.245 0 0);
+  --primary:oklch(.955 0 0);
+  --primary-fg:oklch(.16 0 0);
+  --destructive:oklch(.66 .19 25);
+  --border:oklch(.272 0 0);
+  --input:oklch(.3 0 0);
+  --sidebar:oklch(.148 0 0);
+  --sidebar-border:oklch(.25 0 0);
+  --ok-fg:oklch(.78 .12 162);
+  --ok-bg:color-mix(in oklab,oklch(.7 .15 162) 16%,transparent);
+  --warn-fg:oklch(.8 .12 75);
+  --warn-bg:color-mix(in oklab,oklch(.75 .15 75) 16%,transparent);
+  --err-fg:oklch(.72 .17 25);
+  --err-bg:color-mix(in oklab,oklch(.65 .2 25) 15%,transparent);
+  --chart-bar:color-mix(in oklab,oklch(.75 0 0) 20%,transparent);
+  --chart-bar-hl:color-mix(in oklab,oklch(.75 0 0) 40%,transparent);
+  --bar-fill:oklch(.7 .13 75);
+  --chevron:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  color-scheme:dark;
+}
+
+/* ── 基础 ── */
+*{box-sizing:border-box;margin:0;padding:0;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+*::-webkit-scrollbar{width:5px;height:5px}
+*::-webkit-scrollbar-thumb{border-radius:5px;background:var(--border)}
+*::-webkit-scrollbar-track{background:transparent}
+html,body{min-height:100%}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--fg);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+a{color:inherit;text-decoration:none}
+::selection{background:color-mix(in oklab,var(--primary) 22%,transparent)}
+:focus-visible{outline:2px solid color-mix(in oklab,var(--fg) 55%,transparent);outline-offset:2px}
+[x-cloak]{display:none!important}
+.mono,code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;font-size:var(--fs-xs)}
+.muted{color:var(--muted-fg)}
+.muted-xs{font-size:var(--fs-2xs);color:var(--muted-fg)}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .spacer{flex:1}
-.bar{height:8px;background:#eef0f4;border-radius:4px;overflow:hidden;margin:6px 0}
-.bar>div{height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:4px}
-.toast-wrap{position:fixed;top:18px;right:18px;z-index:99;display:flex;flex-direction:column;gap:8px}
-.toast{background:#26303f;color:#fff;border-radius:8px;padding:10px 18px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.25);animation:fadein .2s}
-.toast.ok{background:var(--ok)}.toast.err{background:var(--err)}
-@keyframes fadein{from{opacity:0;transform:translateY(-6px)}to{opacity:1}}
-.oauth-box{border:2px dashed var(--line);border-radius:10px;padding:22px;text-align:center}
-.oauth-box .url{word-break:break-all;background:#f6f8fb;border-radius:8px;padding:10px;margin:12px 0;font-size:12px}
-.kv{display:flex;font-size:13px;padding:5px 0}
-.kv .k{width:110px;color:var(--muted);flex-shrink:0}
-.kv .v{word-break:break-all}
-.pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:12px}
-#chartDaily,#chartModel{width:100%;height:260px}
-.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:r 0.8s linear infinite;vertical-align:-2px}
-@keyframes r{to{transform:rotate(360deg)}}
+.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wrap{white-space:normal;word-break:break-all}
+
+/* ── 图标 ── */
+.ic{display:inline-flex;flex-shrink:0;line-height:0}
+.ic svg{width:var(--icon);height:var(--icon)}
+.ic-sm svg{width:var(--icon-sm);height:var(--icon-sm)}
+.ic-lg svg{width:var(--icon-lg);height:var(--icon-lg)}
+
+/* ── 按钮 ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 13px;border-radius:var(--radius);border:1px solid transparent;background:var(--primary);color:var(--primary-fg);font-size:var(--fs-sm);font-weight:500;font-family:inherit;cursor:pointer;white-space:nowrap;user-select:none;transition:background .15s,color .15s,opacity .15s}
+.btn:hover{opacity:.86}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn>svg,.btn .ic svg{width:var(--icon-sm);height:var(--icon-sm);flex-shrink:0}
+.btn-secondary{background:var(--secondary);color:var(--secondary-fg)}
+.btn-secondary:hover{background:var(--accent);opacity:1}
+.btn-ghost{background:transparent;color:var(--muted-fg)}
+.btn-ghost:hover{background:var(--secondary);color:var(--fg);opacity:1}
+.btn-outline{background:transparent;border-color:var(--border);color:var(--muted-fg)}
+.btn-outline:hover{background:var(--secondary);color:var(--fg);opacity:1}
+.btn-danger{background:transparent;color:var(--destructive);border-color:color-mix(in oklab,var(--destructive) 32%,transparent)}
+.btn-danger:hover{background:var(--err-bg);opacity:1}
+.btn-sm{height:28px;padding:0 10px;font-size:var(--fs-xs);border-radius:7px}
+.btn-icon{width:32px;padding:0}
+.btn-sm.btn-icon{width:28px}
+
+/* ── 表单 ── */
+.label{display:block;font-size:var(--fs-xs);font-weight:500;color:var(--muted-fg);margin-bottom:6px}
+.input,.select{height:34px;width:100%;border-radius:var(--radius);border:1px solid var(--input);background:var(--bg);color:var(--fg);padding:0 11px;font-size:var(--fs-sm);font-family:inherit;outline:none;transition:border-color .15s,box-shadow .15s}
+.input::placeholder{color:color-mix(in oklab,var(--muted-fg) 60%,transparent)}
+.input:focus,.select:focus{border-color:color-mix(in oklab,var(--fg) 32%,var(--input));box-shadow:0 0 0 3px color-mix(in oklab,var(--input) 28%,transparent)}
+.input:disabled{opacity:.55;cursor:not-allowed}
+.select{appearance:none;background-image:var(--chevron);background-repeat:no-repeat;background-position:right 10px center;padding-right:30px;cursor:pointer}
+.input-sm,.select-sm{height:30px;font-size:var(--fs-xs);border-radius:7px}
+.form-row{margin-bottom:14px}
+.form-grid{display:grid;gap:0 12px}
+@media(min-width:640px){.form-grid.c2{grid-template-columns:1fr 1fr}}
+.field-hint{margin-top:5px;font-size:var(--fs-2xs);color:var(--muted-fg);line-height:1.5}
+.switch{width:36px;height:20px;border-radius:9999px;background:var(--input);position:relative;cursor:pointer;transition:background .2s;border:none;flex-shrink:0}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:9999px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .2s}
+.switch.on{background:var(--primary)}
+.switch.on::after{transform:translateX(16px)}
+.switch-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:2px 0 16px}
+.sw-label{font-size:var(--fs-sm)}
+
+/* ── 徽章 / 状态 ── */
+.badge{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 8px;border-radius:9999px;font-size:var(--fs-2xs);font-weight:500;line-height:1;white-space:nowrap;border:none;font-family:inherit;cursor:default}
+.badge-ok{background:var(--ok-bg);color:var(--ok-fg)}
+.badge-warn{background:var(--warn-bg);color:var(--warn-fg)}
+.badge-err{background:var(--err-bg);color:var(--err-fg)}
+.badge-muted{background:var(--secondary);color:var(--muted-fg)}
+.badge.clickable{cursor:pointer;transition:filter .15s}
+.badge.clickable:hover{filter:brightness(1.06)}
+
+/* ── 卡片 / 页面 ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;box-shadow:0 1px 2px rgb(0 0 0/.03)}
+.card-head{display:flex;align-items:center;gap:10px;margin-bottom:14px;min-height:20px}
+.card-head h3{font-size:var(--fs-md);font-weight:600;letter-spacing:-.01em}
+.space{display:flex;flex-direction:column;gap:20px}
+.page-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+.page-head h1{font-size:var(--fs-xl);font-weight:600;letter-spacing:-.015em}
+.page-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.grid{display:grid;gap:12px}
+.metrics{grid-template-columns:1fr}
+.metrics-4{grid-template-columns:1fr}
+@media(min-width:640px){.metrics,.metrics-4{grid-template-columns:repeat(2,1fr)}}
+@media(min-width:1280px){.metrics{grid-template-columns:repeat(5,1fr)}.metrics-4{grid-template-columns:repeat(4,1fr)}}
+.charts{grid-template-columns:1fr}
+@media(min-width:1024px){.charts{grid-template-columns:minmax(0,3fr) minmax(0,2fr)}}
+.g2{grid-template-columns:1fr}
+@media(min-width:900px){.g2{grid-template-columns:repeat(2,1fr)}}
+.settings-grid{grid-template-columns:1fr}
+.settings-grid>.space{gap:12px}
+@media(min-width:1024px){.settings-grid{grid-template-columns:repeat(2,1fr);align-items:start}}
+.metric{min-height:112px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;box-shadow:0 1px 2px rgb(0 0 0/.03)}
+.metric-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.metric-label{font-size:var(--fs-xs);font-weight:500;color:var(--muted-fg)}
+.metric-head .ic svg{color:var(--muted-fg);opacity:.8}
+.metric-value{margin-top:10px;font-size:var(--fs-2xl);font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:32px}
+.metric-detail{margin-top:4px;font-size:var(--fs-2xs);color:var(--muted-fg);min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.total-num{font-size:var(--fs-3xl);font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.02em;margin-top:6px}
+
+/* ── 表格 ── */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:var(--fs-xs)}
+th{font-weight:500;color:var(--muted-fg);text-align:left;padding:0 10px 9px;white-space:nowrap;border-bottom:1px solid var(--border);font-size:var(--fs-2xs);letter-spacing:.01em}
+td{padding:10px;border-bottom:1px solid color-mix(in oklab,var(--border) 55%,transparent);vertical-align:middle;white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
+.cell-edit{height:26px;border:1px solid transparent;background:transparent;color:var(--fg);font-size:var(--fs-xs);font-family:inherit;border-radius:6px;padding:0 7px;width:130px;outline:none;transition:border-color .15s,background .15s}
+.cell-edit:hover{border-color:var(--input)}
+.cell-edit:focus{border-color:color-mix(in oklab,var(--fg) 30%,var(--input));background:var(--popover)}
+.key-chip{background:var(--secondary);padding:3px 8px;border-radius:6px;white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis;display:inline-block}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
+.filters .input,.filters .select{width:auto}
+.pager{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:14px;font-size:var(--fs-xs);color:var(--muted-fg)}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:36px 0;color:var(--muted-fg);font-size:var(--fs-sm)}
+.empty .ic svg{opacity:.55}
+.kv-grid{display:grid;grid-template-columns:1fr;gap:2px 36px}
+@media(min-width:700px){.kv-grid{grid-template-columns:1fr 1fr}}
+.kv{display:flex;gap:14px;padding:7px 0;font-size:var(--fs-sm);align-items:baseline}
+.kv .k{width:110px;flex-shrink:0;color:var(--muted-fg);font-size:var(--fs-xs)}
+.kv .v{min-width:0;word-break:break-all}
+
+/* ── 布局：侧边栏 + 内容 ── */
+.shell{min-height:100vh}
+.sidebar{position:fixed;inset:0 auto 0 0;width:260px;background:var(--sidebar);border-right:1px solid var(--sidebar-border);display:flex;flex-direction:column;padding:22px 14px 14px;z-index:50;transition:transform .25s ease}
+.side-backdrop{position:fixed;inset:0;background:rgba(10,12,16,.45);z-index:40;backdrop-filter:blur(1px)}
+@media(max-width:1023px){
+  .sidebar{transform:translateX(-100%)}
+  .sidebar.open{transform:none;box-shadow:0 0 60px rgba(0,0,0,.3)}
+}
+.side-head{display:flex;align-items:center;justify-content:space-between;padding:0 10px;height:28px}
+.logo{display:flex;align-items:center;gap:8px;font-size:var(--fs-lg);font-weight:700;letter-spacing:-.02em;cursor:pointer}
+.sidenav{margin-top:26px;flex:1;overflow-y:auto;padding:0 4px 8px;display:flex;flex-direction:column;gap:2px}
+.nav-link{display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;font-size:var(--fs-sm);color:var(--muted-fg);cursor:pointer;transition:background .12s,color .12s}
+.nav-link:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent);color:var(--fg)}
+.nav-link.active{background:var(--secondary);color:var(--fg);font-weight:500}
+.nav-link .ic{width:20px;justify-content:center}
+.nav-link .ic svg{width:var(--icon);height:var(--icon)}
+.side-foot{flex-shrink:0;padding:12px 8px 2px;border-top:1px solid color-mix(in oklab,var(--sidebar-border) 70%,transparent)}
+.side-actions{display:flex;gap:8px}
+.side-actions .btn{flex:1}
+.topbar{display:flex;align-items:center;justify-content:space-between;height:48px;padding:0 14px;border-bottom:1px solid var(--border);background:var(--bg);position:sticky;top:0;z-index:30}
+@media(min-width:1024px){.topbar{display:none}}
+.content{min-height:100vh;display:flex;flex-direction:column}
+@media(min-width:1024px){.content{padding-left:260px}}
+.main{flex:1;width:100%;max-width:1240px;margin:0 auto;padding:26px 20px 76px}
+@media(min-width:640px){.main{padding:30px 32px 76px}}
+.splash{min-height:100vh;display:flex;align-items:center;justify-content:center;color:var(--muted-fg)}
+
+/* ── 登录页 ── */
+.login-page{min-height:100vh;display:flex;flex-direction:column}
+.login-main{flex:1;display:flex;align-items:center;justify-content:center;width:100%;max-width:960px;margin:0 auto;padding:40px 24px}
+.login-grid{width:100%;max-width:840px;display:grid;gap:40px;align-items:center}
+@media(min-width:1024px){.login-grid{grid-template-columns:minmax(0,1fr) 1px 336px;transform:translateY(-16px)}}
+.login-brand{display:none;min-height:280px;flex-direction:column;justify-content:center}
+@media(min-width:1024px){.login-brand{display:flex}}
+.login-divider{display:none;background:var(--border);height:256px}
+@media(min-width:1024px){.login-divider{display:block}}
+.login-brand-title{font-size:var(--fs-2xl);font-weight:700;letter-spacing:-.02em;margin:0 0 2px}
+.login-sub{margin-top:14px;font-size:var(--fs-sm);line-height:1.7;color:var(--muted-fg);max-width:340px}
+.login-form-col{width:100%;max-width:336px;margin:0 auto}
+.login-h1{font-size:var(--fs-xl);font-weight:600;letter-spacing:-.015em}
+
+/* ── 进度条 / 图表 ── */
+.bar{height:7px;border-radius:9999px;background:color-mix(in oklab,var(--muted-fg) 14%,transparent);overflow:hidden}
+.bar>div{height:100%;border-radius:9999px;background:var(--fg);transition:width .4s ease}
+.bar>div.warn{background:var(--bar-fill)}
+.bar>div.err{background:var(--err-fg)}
+.chart-box{position:relative}
+.chart-box svg{display:block;width:100%}
+.axis-label{fill:var(--muted-fg);font-size:10px;font-family:inherit}
+.grid-line{stroke:color-mix(in oklab,var(--border) 75%,transparent)}
+.bar-c{fill:var(--chart-bar);transition:fill .15s}
+.bar-c.hl{fill:var(--chart-bar-hl)}
+.tok-line{fill:none;stroke:var(--fg);stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round}
+.tok-dot{fill:var(--card);stroke:var(--fg);stroke-width:1.4}
+.tip-bg{fill:var(--popover);stroke:color-mix(in oklab,var(--border) 80%,transparent)}
+.tip-t{fill:var(--fg);font-size:11px;font-weight:600}
+.tip-l{fill:var(--muted-fg);font-size:10px}
+.chart-empty{display:flex;align-items:center;justify-content:center;height:236px;color:var(--muted-fg);font-size:12px}
+.legend{display:flex;align-items:center;gap:12px;font-size:var(--fs-2xs);color:var(--muted-fg)}
+.lg{display:inline-flex;align-items:center;gap:5px}
+.lg i{width:10px;height:10px;border-radius:3px}
+.lg-bar i{background:var(--chart-bar-hl)}
+.lg-line i{height:3px;border-radius:2px;background:var(--fg)}
+.model-row{display:grid;grid-template-columns:minmax(72px,128px) 1fr 52px;align-items:center;gap:10px;padding:7px 0}
+.model-row+.model-row{border-top:1px solid color-mix(in oklab,var(--border) 45%,transparent)}
+.model-name{font-size:var(--fs-xs);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-track{height:6px;border-radius:9999px;background:color-mix(in oklab,var(--muted-fg) 12%,transparent);overflow:hidden}
+.model-fill{height:100%;border-radius:9999px;background:var(--fg);opacity:.82;transition:width .4s}
+.model-count{font-size:var(--fs-2xs);color:var(--muted-fg);text-align:right;font-variant-numeric:tabular-nums}
+.model-chips{display:flex;flex-wrap:wrap;gap:8px;max-height:340px;overflow-y:auto;padding:2px}
+.model-chip{display:inline-flex;align-items:center;gap:6px;background:var(--secondary);border:1px solid color-mix(in oklab,var(--border) 60%,transparent);border-radius:7px;padding:5px 9px;font-size:var(--fs-xs);line-height:1.4;max-width:100%}
+.model-chip .model-chip-name{color:var(--muted-fg);font-size:var(--fs-2xs);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px}
+.file-input{font-size:var(--fs-xs);color:var(--muted-fg);max-width:240px}
+.file-input::file-selector-button{margin-right:10px;padding:5px 10px;border-radius:7px;border:1px solid var(--border);background:var(--secondary);color:var(--secondary-fg);font-size:var(--fs-xs);cursor:pointer}
+textarea.input{height:auto;padding:8px 11px;line-height:1.5}
+
+/* ── OAuth / 其他组件 ── */
+.oauth-desc{font-size:var(--fs-sm);color:var(--muted-fg);line-height:1.7;margin-bottom:16px;max-width:560px}
+.oauth-box{border:1px dashed color-mix(in oklab,var(--muted-fg) 36%,transparent);border-radius:12px;padding:22px;text-align:center}
+.oauth-box>p{font-size:var(--fs-sm);color:var(--muted-fg);margin-bottom:12px}
+.oauth-url{background:var(--secondary);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:var(--fs-xs);word-break:break-all}
+.oauth-url a{color:var(--fg)}
+.oauth-url a:hover{text-decoration:underline}
+.row-center{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}
+.center-card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:34px 20px}
+.checkin-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:640px){.checkin-grid{grid-template-columns:1fr}}
+.checkin-item{display:flex;flex-direction:column;gap:3px}
+.checkin-val{font-size:var(--fs-lg);font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+
+/* ── 弹窗 ── */
+.overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(8,10,14,.4);backdrop-filter:blur(3px)}
+.modal{width:100%;max-width:420px;background:var(--popover);border:1px solid color-mix(in oklab,var(--border) 80%,transparent);border-radius:14px;padding:22px;box-shadow:0 24px 60px rgba(0,0,0,.28);animation:pop .16s ease-out}
+.modal-title{font-size:var(--fs-lg);font-weight:600;margin-bottom:6px}
+.modal-msg{font-size:var(--fs-sm);color:var(--muted-fg);line-height:1.65;margin-bottom:18px}
+.modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+@keyframes pop{from{opacity:0;transform:scale(.97) translateY(6px)}to{opacity:1}}
+
+/* ── 提示 / 动画 ── */
+.toasts{position:fixed;right:16px;bottom:16px;z-index:80;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.toast{display:flex;align-items:flex-start;gap:9px;max-width:360px;background:var(--popover);color:var(--fg);border:1px solid color-mix(in oklab,var(--border) 80%,transparent);border-radius:12px;padding:11px 14px;font-size:var(--fs-sm);box-shadow:0 10px 36px rgba(0,0,0,.14);animation:toastIn .22s cubic-bezier(.21,1.02,.73,1)}
+.toast .ic{margin-top:2px}
+.toast .ic svg{width:var(--icon-sm);height:var(--icon-sm)}
+.toast-ok .ic{color:var(--ok-fg)}
+.toast-err .ic{color:var(--err-fg)}
+@keyframes toastIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1}}
+.spin{display:inline-block;width:14px;height:14px;border-radius:9999px;border:2px solid color-mix(in oklab,currentColor 25%,transparent);border-top-color:currentColor;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+section[x-show]{animation:fadeUp .18s ease-out}
+@keyframes fadeUp{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
 </head>
 <body>
-<div x-data="app()" x-init="init()">
+<div x-data="app()">
 
-<div class="toast-wrap">
-  <template x-for="(t,i) in toasts" :key="i">
-    <div class="toast" :class="t.type" x-text="t.msg"></div>
-  </template>
+<!-- 启动加载 -->
+<template x-if="!ready">
+  <div class="splash" x-cloak><span class="spin" style="width:20px;height:20px"></span></div>
+</template>
+
+<!-- ═══ 登录页 ═══ -->
+<template x-if="ready && !loggedIn">
+<div class="login-page" x-cloak>
+  <main class="login-main">
+    <div class="login-grid">
+      <section class="login-brand">
+        <h1 class="login-brand-title">Buddy-2API</h1>
+        <p class="login-sub">将 CodeBuddy 的 AI 服务封装为标准 OpenAI API 接口。</p>
+      </section>
+      <div class="login-divider" aria-hidden="true"></div>
+      <section class="login-form-col">
+        <h1 class="login-h1">登录</h1>
+        <p class="login-sub" style="margin:8px 0 24px">输入管理密码进入后台</p>
+        <form @submit.prevent="doLogin()">
+          <div class="form-row">
+            <label class="label" for="pw">管理密码</label>
+            <input id="pw" class="input" type="password" x-model="password" placeholder="••••••••" autofocus autocomplete="current-password">
+          </div>
+          <button type="submit" class="btn" style="width:100%;height:36px" :disabled="loading">
+            <span class="spin" x-show="loading"></span>
+            <span x-show="!loading">登 录</span>
+          </button>
+        </form>
+      </section>
+    </div>
+  </main>
 </div>
+</template>
 
-<!-- 登录 -->
-<template x-if="!ready || !loggedIn">
-  <div class="login-wrap">
-    <div class="login-card">
-      <h1>Buddy2API</h1>
-      <p>CodeBuddy → OpenAI 兼容代理 · 管理后台</p>
-      <form @submit.prevent="doLogin()">
-        <div class="form-row">
-          <label>管理密码</label>
-          <input type="password" x-model="password" placeholder="请输入管理密码" autofocus>
-        </div>
-        <button style="width:100%" :disabled="loading">
-          <span x-show="loading" class="spin"></span> 登录
+<!-- ═══ 主界面 ═══ -->
+<template x-if="ready && loggedIn">
+<div class="shell" x-cloak>
+
+  <!-- 移动端顶栏 -->
+  <header class="topbar">
+    <button class="btn btn-ghost btn-icon" @click="mobileNav=true" aria-label="打开导航" x-html="ic('menu')"></button>
+    <span class="logo">Buddy-2API</span>
+    <button class="btn btn-outline btn-sm" @click="cycleTheme()" :title="'点击切换主题（当前：'+themeLabel+'）'">
+      <span class="ic" x-html="ic(theme==='light'?'sun':theme==='dark'?'moon':'monitor')"></span>
+      <span x-text="themeLabel"></span>
+    </button>
+  </header>
+
+  <!-- 侧边栏 -->
+  <div class="side-backdrop" x-show="mobileNav" x-transition.opacity @click="mobileNav=false"></div>
+  <aside class="sidebar" :class="{'open':mobileNav}">
+    <div class="side-head">
+      <a class="logo" @click="go('dashboard')">Buddy-2API</a>
+    </div>
+    <nav class="sidenav" aria-label="主导航">
+      <template x-for="n in nav" :key="n.id">
+        <a class="nav-link" :class="{active:view===n.id}" @click="go(n.id)">
+          <span class="ic" x-html="ic(n.icon)"></span>
+          <span x-text="n.label"></span>
+        </a>
+      </template>
+    </nav>
+    <div class="side-foot">
+      <div class="side-actions">
+        <button class="btn btn-outline btn-sm" @click="cycleTheme()" :title="'点击切换主题（当前：'+themeLabel+'）'">
+          <span class="ic" x-html="ic(theme==='light'?'sun':theme==='dark'?'moon':'monitor')"></span>
+          <span x-text="themeLabel"></span>
         </button>
-      </form>
+        <button class="btn btn-outline btn-sm" @click="logout()"><span class="ic" x-html="ic('logout')"></span>退出</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 内容区 -->
+  <div class="content">
+    <main class="main">
+
+      <!-- ── 仪表盘 ── -->
+      <section x-show="view==='dashboard'" x-cloak class="space">
+        <header class="page-head">
+          <h1>统计</h1>
+          <div class="page-actions">
+            <button class="btn btn-secondary btn-sm" @click="loadStats()" :disabled="loading">
+              <span class="ic" x-html="ic('refresh')"></span>刷新统计
+            </button>
+          </div>
+        </header>
+
+        <div class="grid metrics-4">
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">总请求</span><span class="ic" x-html="ic('activity')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.total_requests)"></div>
+            <p class="metric-detail" x-text="'今日 '+fmt(stats.today_requests)+' · 日均 '+compact(avg14)"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">总 Tokens</span><span class="ic" x-html="ic('type')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.total_tokens)"></div>
+            <p class="metric-detail" x-text="'今日 '+fmt(stats.today_tokens)"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">错误数</span><span class="ic" x-html="ic('alert')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.error_count)"></div>
+            <p class="metric-detail" x-text="successRate!==null ? '成功率 '+successRate+'%' : '—'"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">累计积分</span><span class="ic" x-html="ic('dollar')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.total_credit)"></div>
+            <p class="metric-detail" x-text="keys.length+' 个 Key · '+(stats.by_model||[]).length+' 个模型'"></p>
+          </article>
+        </div>
+
+        <div class="grid charts">
+          <div class="card">
+            <div class="card-head">
+              <h3>近 14 天用量</h3>
+              <div class="spacer"></div>
+              <div class="legend">
+                <span class="lg lg-bar"><i></i>请求</span>
+                <span class="lg lg-line"><i></i>Tokens</span>
+              </div>
+            </div>
+            <div id="chartDaily" class="chart-box"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h3>模型用量 Top 10</h3>
+              <div class="spacer"></div>
+              <span class="muted-xs" x-text="(stats.by_model||[]).length+' 个模型'"></span>
+            </div>
+            <div x-show="topModels.length">
+              <template x-for="m in topModels" :key="m.model">
+                <div class="model-row">
+                  <span class="model-name" :title="m.model" x-text="m.model"></span>
+                  <div class="model-track"><div class="model-fill" :style="'width:'+Math.max(2,m.requests/maxReq*100)+'%'"></div></div>
+                  <span class="model-count" x-text="fmt(m.requests)"></span>
+                </div>
+              </template>
+            </div>
+            <div class="empty" x-show="!topModels.length"><span class="ic ic-lg" x-html="ic('box')"></span>暂无调用数据</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>模型列表</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-show="models.state" x-text="modelsStateText"></span>
+            <button class="btn btn-secondary btn-sm" @click="refreshModels()" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新</button>
+          </div>
+          <div x-show="!models.loading && modelChips.length">
+            <div class="model-chips">
+              <template x-for="m in modelChips" :key="m.id">
+                <span class="model-chip" :title="m.name||m.id">
+                  <span class="mono" x-text="m.id"></span>
+                  <span class="model-chip-name" x-show="m.name && m.name!==m.id" x-text="m.name"></span>
+                </span>
+              </template>
+            </div>
+          </div>
+          <div class="empty" x-show="!models.loading && !modelChips.length">
+            <span class="ic ic-lg" x-html="ic('box')"></span>暂无模型
+          </div>
+          <div class="empty" x-show="models.loading"><span class="spin" style="width:18px;height:18px"></span>加载中…</div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>近期错误</h3></div>
+          <div class="table-wrap" x-show="(stats.recent_errors||[]).length">
+            <table>
+              <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>状态码</th><th>错误信息</th></tr></thead>
+              <tbody>
+                <template x-for="l in (stats.recent_errors||[])" :key="l.id">
+                  <tr>
+                    <td class="muted-xs" x-text="ts(l.created_at)"></td>
+                    <td x-text="l.model||'—'"></td>
+                    <td class="muted-xs" x-text="l.api_key_name||'—'"></td>
+                    <td><span class="badge badge-err" x-text="l.status_code"></span></td>
+                    <td class="muted-xs wrap" style="max-width:340px" x-text="l.error_msg"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!(stats.recent_errors||[]).length">
+            <span class="ic ic-lg" x-html="ic('shield')"></span>运行正常，暂无错误
+          </div>
+        </div>
+      </section>
+
+      <!-- ── 账号 ── -->
+      <section x-show="view==='account'" x-cloak class="space">
+        <header class="page-head">
+          <h1>账号</h1>
+          <div class="page-actions">
+            <button class="btn btn-secondary btn-sm" @click="exportAccount()" :disabled="loading"><span class="ic" x-html="ic('upload')"></span>导出凭证</button>
+            <button class="btn btn-secondary btn-sm" @click="importModal=true"><span class="ic" x-html="ic('download')"></span>导入凭证</button>
+            <template x-if="account.logged_in">
+              <button class="btn btn-secondary btn-sm" @click="refreshToken()" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新 Token</button>
+            </template>
+            <template x-if="account.logged_in">
+              <button class="btn btn-secondary btn-sm" @click="testAccount()" :disabled="loading"><span class="ic" x-html="ic('shield')"></span>测试连通</button>
+            </template>
+            <template x-if="account.logged_in">
+              <button class="btn btn-danger btn-sm" @click="deleteAccount()" :disabled="loading"><span class="ic" x-html="ic('logout')"></span>退出登录</button>
+            </template>
+          </div>
+        </header>
+
+        <template x-if="account.logged_in">
+          <div class="card">
+            <div class="card-head">
+              <h3>OAuth 凭证</h3>
+              <span class="badge" :class="account.expired?'badge-err':'badge-ok'" x-text="account.expired?'已过期':'正常'"></span>
+              <span class="badge" :class="account.region_match?'badge-muted':'badge-warn'" x-text="account.region_match?'与当前端点匹配':'凭证属于另一端点'"></span>
+              <div class="spacer"></div>
+              <span class="muted-xs" x-text="'uid '+(account.uid||'—')"></span>
+            </div>
+            <div class="kv-grid">
+              <div class="kv"><span class="k">昵称</span><span class="v" x-text="account.nickname||'—'"></span></div>
+              <div class="kv"><span class="k">enterprise_id</span><span class="v" x-text="account.enterprise_id||'（个人账号）'"></span></div>
+              <div class="kv"><span class="k">domain</span><span class="v" x-text="account.domain||'—'"></span></div>
+              <div class="kv"><span class="k">access_token</span><span class="v mono" x-text="account.access_token"></span></div>
+              <div class="kv"><span class="k">refresh_token</span><span class="v" x-text="account.has_refresh?'已保存':'无'"></span></div>
+              <div class="kv"><span class="k">过期时间</span><span class="v" x-text="account.expires_human+(account.expires_at?'（'+ts(account.expires_at)+'）':'')"></span></div>
+            </div>
+          </div>
+        </template>
+
+        <div class="card">
+          <div class="card-head"><h3 x-text="account.logged_in?'重新登录':'登录'"></h3></div>
+          <template x-if="!oauth.state">
+            <div>
+              <p class="oauth-desc">点击开始后，在打开的浏览器页面中完成授权登录。凭证仅保存在本地 data 目录。</p>
+              <button class="btn" @click="oauthStart()" :disabled="loading"><span class="ic" x-html="ic('external')"></span>开始登录</button>
+            </div>
+          </template>
+          <template x-if="oauth.state">
+            <div class="oauth-box">
+              <p>请在浏览器中打开以下链接完成授权：</p>
+              <div class="oauth-url"><a :href="oauth.auth_url" target="_blank" rel="noreferrer" x-text="oauth.auth_url"></a></div>
+              <div class="row-center">
+                <a :href="oauth.auth_url" target="_blank" rel="noreferrer"><button class="btn btn-secondary btn-sm"><span class="ic" x-html="ic('external')"></span>打开授权页面</button></a>
+                <button class="btn btn-ghost btn-sm" @click="copy(oauth.auth_url)"><span class="ic" x-html="ic('copy')"></span>复制链接</button>
+                <span class="muted-xs" x-text="oauth.poll_msg"></span>
+                <button class="btn btn-ghost btn-sm" @click="oauthCancel()">取消</button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </section>
+
+      <!-- ── Keys ── -->
+      <section x-show="view==='keys'" x-cloak class="space">
+        <header class="page-head">
+          <h1>密钥</h1>
+          <div class="page-actions">
+            <button class="btn btn-sm" @click="keyModal=true"><span class="ic" x-html="ic('plus')"></span>创建 Key</button>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="table-wrap" x-show="keys.length">
+            <table>
+              <thead><tr><th>Key</th><th>备注</th><th>请求数</th><th>Tokens</th><th>状态</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="k in keys" :key="k.id">
+                  <tr>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <code class="key-chip" :title="k.key_plain" x-text="k.key_plain"></code>
+                        <button class="btn btn-ghost btn-sm" @click="copy(k.key_plain)">复制</button>
+                      </div>
+                    </td>
+                    <td><input class="cell-edit" x-model="k.name" placeholder="备注" @change="updateKey(k,{name:k.name})"></td>
+                    <td x-text="fmt(k.total_requests)"></td>
+                    <td x-text="fmt(k.total_tokens)"></td>
+                    <td>
+                      <button class="badge clickable" :class="k.status==='active'?'badge-ok':'badge-muted'"
+                              @click="updateKey(k,{status:k.status==='active'?'disabled':'active'})"
+                              x-text="k.status==='active'?'启用':'停用'"></button>
+                    </td>
+                    <td><button class="btn btn-ghost btn-sm" style="color:var(--destructive)" @click="deleteKey(k)">删除</button></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!keys.length">
+            <span class="ic ic-lg" x-html="ic('keys')"></span>
+            还没有 Key，点击右上角创建
+          </div>
+        </div>
+      </section>
+
+      <!-- ── 余额 ── -->
+      <section x-show="view==='resources'" x-cloak class="space">
+        <header class="page-head">
+          <h1>余额</h1>
+          <div class="page-actions">
+            <span class="muted-xs" x-show="resources.updated_at" x-text="'更新于 '+ts(resources.updated_at)"></span>
+            <button class="btn btn-secondary btn-sm" @click="loadResources(true)" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新</button>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="row" style="gap:20px">
+            <div>
+              <p class="metric-label">官方总额度</p>
+              <div class="total-num" x-text="fmtDosage(resources.total_dosage)"></div>
+            </div>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-text="(resources.accounts||[]).length+' 个额度包'"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>每日签到</h3>
+            <span class="badge" :class="checkin.today_checked_in?'badge-ok':'badge-muted'" x-text="checkin.today_checked_in?'今日已签到':'未签到'"></span>
+            <div class="spacer"></div>
+            <button class="btn btn-sm" :class="checkin.today_checked_in?'btn-secondary':''" @click="claimCheckin()" :disabled="loading||checkin.today_checked_in">
+              <span class="ic" x-html="ic(checkin.today_checked_in?'check':'checkin')"></span>
+              <span x-text="checkin.today_checked_in?'已签到':'立即签到'"></span>
+            </button>
+          </div>
+          <div class="checkin-grid">
+            <div class="checkin-item"><span class="metric-label">活动状态</span><span class="checkin-val" x-text="checkin.active?'进行中':'未开启'"></span></div>
+            <div class="checkin-item"><span class="metric-label">今日积分</span><span class="checkin-val" x-text="checkin.today_credit ?? '—'"></span></div>
+            <div class="checkin-item"><span class="metric-label">连续签到</span><span class="checkin-val" x-text="(checkin.streak_days ?? 0)+' 天'"></span></div>
+          </div>
+          <p class="field-hint">可在「设置」中开启自动签到，由服务端按 cron 定时执行</p>
+        </div>
+
+        <div class="grid g2">
+          <template x-for="(a,i) in (resources.accounts||[])" :key="i">
+            <div class="card">
+              <div class="card-head">
+                <h3 class="truncate" x-text="a.package_name||'额度包'"></h3>
+                <div class="spacer"></div>
+                <span class="badge" :class="quotaBadge(a)" x-text="quotaBadgeText(a)"></span>
+              </div>
+              <div class="bar"><div :class="quotaBarClass(a)" :style="'width:'+pct(a)+'%'"></div></div>
+              <div class="row muted-xs" style="margin-top:10px;gap:14px">
+                <span x-text="'剩余 '+(a.capacity_remain??0)"></span>
+                <span x-text="'总量 '+(a.capacity_size??0)"></span>
+                <span x-text="'已用 '+(a.capacity_used??0)"></span>
+                <span x-show="a.capacity_unit" x-text="a.capacity_unit"></span>
+              </div>
+              <p class="muted-xs" style="margin-top:6px" x-text="'到期：'+quotaExpire(a)"></p>
+            </div>
+          </template>
+        </div>
+        <div class="empty" x-show="resources.loaded && !(resources.accounts||[]).length">
+          <span class="ic ic-lg" x-html="ic('wallet')"></span>暂无额度包数据（若持续为空，请检查凭证后刷新）
+        </div>
+        <div class="empty" x-show="!resources.loaded"><span class="spin" style="width:18px;height:18px"></span>加载中…</div>
+      </section>
+
+      <!-- ── 日志 ── -->
+      <section x-show="view==='logs'" x-cloak class="space">
+        <header class="page-head">
+          <h1>日志</h1>
+          <div class="page-actions"><span class="muted-xs" x-text="'共 '+logTotal+' 条'"></span></div>
+        </header>
+
+        <div class="card">
+          <div class="filters">
+            <input class="input input-sm" style="width:170px" x-model="logFilter.model" @input="loadLogsDebounced()" placeholder="模型（模糊匹配）">
+            <select class="select select-sm" style="width:150px" x-model="logFilter.key_id" @change="loadLogs(1)">
+              <option value="">全部 Key</option>
+              <template x-for="k in keys" :key="k.id"><option :value="k.id" x-text="k.name||('#'+k.id)"></option></template>
+            </select>
+            <select class="select select-sm" style="width:130px" x-model="logFilter.status" @change="loadLogs(1)">
+              <option value="">全部状态</option>
+              <option value="error">仅错误</option>
+              <option value="200">200</option>
+              <option value="401">401</option>
+              <option value="429">429</option>
+              <option value="503">503</option>
+            </select>
+          </div>
+
+          <div class="table-wrap" x-show="logs.length">
+            <table>
+              <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>流式</th><th>P / C / T</th><th>积分</th><th>finish</th><th>耗时</th><th>状态</th><th>错误</th></tr></thead>
+              <tbody>
+                <template x-for="l in logs" :key="l.id">
+                  <tr>
+                    <td class="muted-xs" x-text="ts(l.created_at,true)"></td>
+                    <td x-text="l.model||'—'"></td>
+                    <td class="muted-xs" x-text="l.api_key_name||'—'"></td>
+                    <td class="muted-xs" x-text="l.stream?'流式':'—'"></td>
+                    <td class="muted-xs mono" x-text="(l.prompt_tokens||0)+' / '+(l.completion_tokens||0)+' / '+(l.total_tokens||0)"></td>
+                    <td class="muted-xs" x-text="l.credit||''"></td>
+                    <td class="muted-xs" x-text="l.finish_reason||''"></td>
+                    <td class="muted-xs" x-text="l.duration_ms!=null?l.duration_ms+'ms':''"></td>
+                    <td><span class="badge" :class="l.status_code>=400?'badge-err':'badge-ok'" x-text="l.status_code"></span></td>
+                    <td class="muted-xs wrap" style="max-width:260px" :title="l.error_msg" x-text="l.error_msg"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!logs.length"><span class="ic ic-lg" x-html="ic('logs')"></span>暂无日志</div>
+
+          <div class="pager" x-show="logTotal>0">
+            <button class="btn btn-ghost btn-icon btn-sm" @click="loadLogs(logPage-1)" :disabled="logPage<=1" x-html="ic('chevronL')"></button>
+            <span x-text="logPage+' / '+Math.max(1,Math.ceil(logTotal/logPageSize))+' 页'"></span>
+            <button class="btn btn-ghost btn-icon btn-sm" @click="loadLogs(logPage+1)" :disabled="logPage>=Math.ceil(logTotal/logPageSize)" x-html="ic('chevronR')"></button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── 设置 ── -->
+      <section x-show="view==='settings'" x-cloak class="space">
+        <header class="page-head">
+          <h1>设置</h1>
+          <div class="page-actions">
+            <button class="btn btn-sm" @click="saveSettings()" :disabled="loading">
+              <span class="spin" x-show="loading"></span>
+              <span class="ic" x-show="!loading" x-html="ic('check')"></span>保存设置
+            </button>
+          </div>
+        </header>
+
+        <div class="grid settings-grid">
+          <div class="space">
+          <div class="card">
+            <div class="card-head"><h3>基本</h3></div>
+            <div class="form-row">
+              <label class="label">端点 Region</label>
+              <select class="select" x-model="settings.region">
+                <option value="cn">中国（copilot.tencent.com）</option>
+                <option value="global">国际（www.codebuddy.ai）</option>
+              </select>
+              <p class="field-hint">切换后凭证不互通，需重新登录</p>
+            </div>
+            <div class="form-row">
+              <label class="label">监听地址</label>
+              <input class="input" x-model="settings.listen" placeholder="127.0.0.1:10082">
+              <p class="field-hint">格式 host:port，如 127.0.0.1:10082、0.0.0.0:8080、:8080；修改后需手动重启服务生效</p>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>修改管理密码</h3></div>
+            <div class="form-grid c2">
+              <div class="form-row"><label class="label">旧密码</label><input class="input" type="password" x-model="pwForm.old_password" autocomplete="current-password"></div>
+              <div class="form-row"><label class="label">新密码</label><input class="input" type="password" x-model="pwForm.new_password" autocomplete="new-password"></div>
+            </div>
+            <p class="field-hint">留空表示不修改密码；修改后下次登录使用新密码</p>
+          </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>签到与缓存</h3></div>
+            <div class="switch-row">
+              <div>
+                <div class="sw-label">自动签到</div>
+                <p class="field-hint">由服务端定时执行签到</p>
+              </div>
+              <button type="button" class="switch" :class="{on:!!settings.auto_checkin}" @click="settings.auto_checkin=!settings.auto_checkin" aria-label="切换自动签到"></button>
+            </div>
+            <div class="form-row">
+              <label class="label">签到 Cron</label>
+              <input class="input" x-model="settings.checkin_cron" placeholder="0 0 9 * * *">
+              <p class="field-hint">含秒共 6 段，如 0 0 9 * * * 表示每天 9:00 执行</p>
+            </div>
+            <div class="form-grid c2">
+              <div class="form-row">
+                <label class="label">余额缓存（秒）</label>
+                <input class="input" type="number" x-model.number="settings.resource_cache_seconds">
+              </div>
+              <div class="form-row">
+                <label class="label">日志保留（天）</label>
+                <input class="input" type="number" min="1" x-model.number="settings.log_retention_days">
+              </div>
+              <div class="form-row">
+                <label class="label">日志大小上限（MB）</label>
+                <input class="input" type="number" min="1" x-model.number="settings.log_max_size_mb">
+                <p class="field-hint">超限时自动删除最旧日志，与保留天数同时生效</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+</template>
+
+<!-- ═══ 导入凭证弹窗 ═══ -->
+<template x-if="importModal">
+  <div class="overlay" @click.self="importModal=false">
+    <form class="modal" style="max-width:560px" @submit.prevent="importAccount()">
+      <div class="modal-title">导入凭证</div>
+      <p class="modal-msg">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。</p>
+      <div class="form-row">
+        <label class="label">从文件导入</label>
+        <div class="row">
+          <input x-ref="importFileInput" type="file" accept=".json,application/json" style="display:none" @change="onImportFile($event)">
+          <button type="button" class="btn btn-secondary btn-sm" @click="$refs.importFileInput.click()"><span class="ic" x-html="ic('download')"></span>选择文件</button>
+        </div>
+        <p class="field-hint" x-show="importForm.filename" x-text="'已选择：'+importForm.filename"></p>
+      </div>
+      <div class="form-row">
+        <label class="label">access_token</label>
+        <textarea class="input" rows="3" x-model="importForm.access_token" placeholder="eyJhbGciOi..." style="height:auto;resize:vertical;font-size:var(--fs-2xs)"></textarea>
+      </div>
+      <div class="form-grid c2">
+        <div class="form-row"><label class="label">refresh_token（可选）</label><input class="input mono" x-model="importForm.refresh_token" style="font-size:var(--fs-2xs)"></div>
+        <div class="form-row"><label class="label">domain（可选）</label><input class="input" x-model="importForm.domain" placeholder="留空按当前端点"></div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-secondary btn-sm" @click="importModal=false">取消</button>
+        <button type="submit" class="btn btn-sm" :disabled="loading">
+          <span class="spin" x-show="loading"></span>
+          <span x-show="!loading">导入</span>
+        </button>
+      </div>
+    </form>
+  </div>
+</template>
+
+<!-- ═══ 创建 Key 弹窗 ═══ -->
+<template x-if="keyModal">
+  <div class="overlay" @click.self="keyModal=false">
+    <form class="modal" @submit.prevent="createKey()">
+      <div class="modal-title">创建 Key</div>
+      <p class="modal-msg">生成的 Key 可用于调用 /v1/chat/completions 等接口。</p>
+      <div class="form-row"><label class="label">备注</label><input class="input" x-model="keyForm.name" placeholder="例如：Cherry Studio"></div>
+      <div class="form-row"><label class="label">自定义 Key（留空随机生成）</label><input class="input mono" x-model="keyForm.custom_key" placeholder="sk-..."></div>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-secondary btn-sm" @click="keyModal=false">取消</button>
+        <button type="submit" class="btn btn-sm" :disabled="loading">
+          <span class="spin" x-show="loading"></span>
+          <span x-show="!loading">创建</span>
+        </button>
+      </div>
+    </form>
+  </div>
+</template>
+
+<!-- ═══ 确认弹窗 ═══ -->
+<template x-if="confirmBox.open">
+  <div class="overlay" @click.self="confirmBox.open=false">
+    <div class="modal" role="alertdialog" style="max-width:380px">
+      <div class="modal-title" x-text="confirmBox.title"></div>
+      <p class="modal-msg" x-text="confirmBox.message"></p>
+      <div class="modal-foot">
+        <button class="btn btn-secondary btn-sm" @click="confirmBox.open=false">取消</button>
+        <button class="btn btn-danger btn-sm" @click="confirmBox.onOk && confirmBox.onOk()">确定</button>
+      </div>
     </div>
   </div>
 </template>
 
-<!-- 主界面 -->
-<template x-if="ready && loggedIn">
-<div class="layout">
-  <aside>
-    <div class="logo">Buddy2API<small x-text="health.region==='cn'?'中国端点':'国际端点'"></small></div>
-    <nav>
-      <a :class="{active:view==='dashboard'}" @click="go('dashboard')">📊 仪表盘</a>
-      <a :class="{active:view==='account'}" @click="go('account')">👤 账号</a>
-      <a :class="{active:view==='keys'}" @click="go('keys')">🔑 API Keys</a>
-      <a :class="{active:view==='resources'}" @click="go('resources')">💰 余额</a>
-      <a :class="{active:view==='checkin'}" @click="go('checkin')">📅 签到</a>
-      <a :class="{active:view==='logs'}" @click="go('logs')">📜 日志</a>
-      <a :class="{active:view==='settings'}" @click="go('settings')">⚙️ 设置</a>
-    </nav>
-    <div class="foot">
-      <div>v<span x-text="health.version||'dev'"></span></div>
-      <div x-show="health.has_token" style="margin-top:4px">
-        <span class="badge" :class="health.expired?'err':'ok'" x-text="health.expired?'凭证已过期':'凭证正常'"></span>
-      </div>
+<!-- ═══ 提示 ═══ -->
+<div class="toasts">
+  <template x-for="t in toasts" :key="t.id">
+    <div class="toast" :class="t.type">
+      <span class="ic" x-html="ic(t.type==='ok'?'check':'alert')"></span>
+      <span x-text="t.msg"></span>
     </div>
-  </aside>
-  <main>
-
-  <!-- 仪表盘 -->
-  <section x-show="view==='dashboard'" x-cloak>
-    <h2>仪表盘</h2>
-    <div class="grid c4" style="margin-bottom:18px">
-      <div class="stat"><div class="lbl">总请求</div><div class="num" x-text="stats.total_requests||0"></div></div>
-      <div class="stat"><div class="lbl">总 Tokens</div><div class="num" x-text="fmt(stats.total_tokens||0)"></div></div>
-      <div class="stat"><div class="lbl">今日请求</div><div class="num" x-text="stats.today_requests||0"></div></div>
-      <div class="stat"><div class="lbl">错误数</div><div class="num" x-text="stats.error_count||0"></div></div>
-    </div>
-    <div class="grid c2">
-      <div class="card"><h3>近 14 天请求 / Tokens</h3><div id="chartDaily"></div></div>
-      <div class="card"><h3>模型用量 Top10</h3><div id="chartModel"></div></div>
-    </div>
-    <div class="card">
-      <h3>近期错误</h3>
-      <table x-show="(stats.recent_errors||[]).length">
-        <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>状态</th><th>错误</th></tr></thead>
-        <tbody>
-          <template x-for="l in (stats.recent_errors||[])" :key="l.id">
-            <tr>
-              <td x-text="ts(l.created_at)"></td>
-              <td x-text="l.model"></td>
-              <td x-text="l.api_key_name"></td>
-              <td><span class="badge err" x-text="l.status_code"></span></td>
-              <td class="muted" x-text="l.error_msg"></td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
-      <div class="muted" x-show="!(stats.recent_errors||[]).length" style="padding:10px 0">暂无错误 ✨</div>
-    </div>
-  </section>
-
-  <!-- 账号 -->
-  <section x-show="view==='account'" x-cloak>
-    <h2>账号</h2>
-
-    <template x-if="account.logged_in">
-      <div class="card">
-        <div class="row" style="margin-bottom:12px">
-          <h3 style="margin:0">OAuth 凭证</h3>
-          <span class="badge" :class="account.expired?'err':'ok'" x-text="account.expired?'已过期':'正常'"></span>
-          <span class="badge" :class="account.region_match?'ok':'warn'"
-                x-text="account.region_match?'与当前端点匹配':'凭证属于另一端点'"></span>
-          <div class="spacer"></div>
-          <button class="ghost" @click="refreshToken()" :disabled="loading">刷新 Token</button>
-          <button class="ghost" @click="testAccount()" :disabled="loading">测试连通</button>
-          <button class="danger" @click="deleteAccount()">退出登录</button>
-        </div>
-        <div class="grid c2">
-          <div>
-            <div class="kv"><div class="k">昵称</div><div class="v" x-text="account.nickname||'—'"></div></div>
-            <div class="kv"><div class="k">UID</div><div class="v" x-text="account.uid||'—'"></div></div>
-            <div class="kv"><div class="k">enterprise_id</div><div class="v" x-text="account.enterprise_id||'（个人账号）'"></div></div>
-          </div>
-          <div>
-            <div class="kv"><div class="k">domain</div><div class="v" x-text="account.domain||'—'"></div></div>
-            <div class="kv"><div class="k">access_token</div><div class="v"><code x-text="account.access_token"></code></div></div>
-            <div class="kv"><div class="k">过期时间</div><div class="v" x-text="account.expires_human+'（'+ts(account.expires_at)+'）'"></div></div>
-          </div>
-        </div>
-      </div>
-    </template>
-
-    <div class="card">
-      <h3 x-text="account.logged_in?'重新扫码登录':'扫码登录'"></h3>
-      <template x-if="!oauth.state">
-        <div>
-          <p class="muted" style="margin-bottom:14px">OAuth 设备流：点击开始后，在打开的浏览器页面中完成授权（支持 GitHub 登录）。</p>
-          <button @click="oauthStart()" :disabled="loading">开始扫码登录</button>
-        </div>
-      </template>
-      <template x-if="oauth.state">
-        <div class="oauth-box">
-          <p>请在浏览器中打开以下链接完成授权：</p>
-          <div class="url"><a :href="oauth.auth_url" target="_blank" x-text="oauth.auth_url"></a></div>
-          <div class="row" style="justify-content:center">
-            <a :href="oauth.auth_url" target="_blank"><button>打开授权页面</button></a>
-            <span class="muted" x-text="oauth.poll_msg"></span>
-            <button class="ghost" @click="oauthCancel()">取消</button>
-          </div>
-        </div>
-      </template>
-    </div>
-  </section>
-
-  <!-- API Keys -->
-  <section x-show="view==='keys'" x-cloak>
-    <h2>API Keys</h2>
-    <div class="card">
-      <h3>创建 Key</h3>
-      <div class="grid c4">
-        <div><label>备注</label><input x-model="keyForm.name" placeholder="例如：我的 Cherry Studio"></div>
-        <div><label>自定义 Key（留空随机生成）</label><input x-model="keyForm.custom_key" placeholder="sk-..."></div>
-        <div><label>允许模型（逗号分隔，留空不限）</label><input x-model="keyForm.allowed_models" placeholder="auto, glm-5.3"></div>
-        <div><label>每日限额（0 不限）</label><input type="number" x-model.number="keyForm.daily_limit"></div>
-      </div>
-      <div style="margin-top:12px"><button @click="createKey()" :disabled="loading">创建</button></div>
-    </div>
-    <div class="card">
-      <table>
-        <thead><tr><th>ID</th><th>Key</th><th>备注</th><th>状态</th><th>今日/限额</th><th>请求数</th><th>Tokens</th><th>操作</th></tr></thead>
-        <tbody>
-          <template x-for="k in keys" :key="k.id">
-            <tr>
-              <td x-text="k.id"></td>
-              <td>
-                <code style="cursor:pointer" title="点击复制完整 Key" @click="copy(k.key_plain)"
-                      x-text="k.key_plain"></code>
-              </td>
-              <td>
-                <input x-model="k.name" style="padding:4px 8px;font-size:12px;width:130px"
-                       @change="updateKey(k,{name:k.name})">
-              </td>
-              <td>
-                <span class="badge" :class="k.status==='active'?'ok':'gray'" style="cursor:pointer"
-                      @click="updateKey(k,{status:k.status==='active'?'disabled':'active'})"
-                      x-text="k.status==='active'?'启用':'停用'"></span>
-              </td>
-              <td><span x-text="k.today_count"></span> / <span x-text="k.daily_limit||'∞'"></span></td>
-              <td x-text="k.total_requests"></td>
-              <td x-text="fmt(k.total_tokens)"></td>
-              <td><button class="danger" style="padding:4px 10px" @click="deleteKey(k)">删除</button></td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
-      <div class="muted" x-show="!keys.length" style="padding:10px 0">还没有 Key，先创建一个。</div>
-    </div>
-  </section>
-
-  <!-- 余额 -->
-  <section x-show="view==='resources'" x-cloak>
-    <h2>官方余额</h2>
-    <div class="card">
-      <div class="row">
-        <h3 style="margin:0">总额度：<b x-text="resources.total_dosage"></b></h3>
-        <div class="spacer"></div>
-        <span class="muted" x-show="resources.updated_at" x-text="'更新于 '+ts(resources.updated_at)"></span>
-        <button class="ghost" @click="loadResources(true)" :disabled="loading">刷新</button>
-      </div>
-    </div>
-    <div class="grid c2">
-      <template x-for="(a,i) in (resources.accounts||[])" :key="i">
-        <div class="card">
-          <div class="row">
-            <b x-text="a.package_name||'额度包'"></b>
-            <div class="spacer"></div>
-            <span class="badge" :class="a.warn==='expired'?'err':a.warn?'warn':'ok'"
-                  x-text="a.warn==='expired'?'已过期':(a.warn?a.warn+' 内到期':'正常')"></span>
-          </div>
-          <div class="bar"><div :style="'width:'+pct(a)+'%'"></div></div>
-          <div class="row muted">
-            <span x-text="'剩余 '+(a.capacity_remain??0)"></span>
-            <span x-text="'总量 '+(a.capacity_size??0)"></span>
-            <span x-text="'已用 '+(a.capacity_used??0)"></span>
-            <span x-show="a.capacity_unit" x-text="a.capacity_unit"></span>
-          </div>
-          <div class="muted" style="margin-top:6px">
-            到期：<span x-text="a.expire_time||(a.days_left!=null?a.days_left+' 天后':'—')"></span>
-          </div>
-        </div>
-      </template>
-    </div>
-    <div class="card muted" x-show="!(resources.accounts||[]).length && resources.loaded">暂无额度包数据（若持续为空，请检查凭证或刷新）。</div>
-  </section>
-
-  <!-- 签到 -->
-  <section x-show="view==='checkin'" x-cloak>
-    <h2>每日签到</h2>
-    <div class="card">
-      <template x-if="checkin.loaded">
-        <div>
-          <div class="grid c4" style="margin-bottom:14px">
-            <div class="stat"><div class="lbl">活动状态</div><div class="num" style="font-size:18px" x-text="checkin.active?'进行中':'未开启'"></div></div>
-            <div class="stat"><div class="lbl">今日已签</div><div class="num" style="font-size:18px" x-text="checkin.today_checked_in?'是':'否'"></div></div>
-            <div class="stat"><div class="lbl">今日积分</div><div class="num" style="font-size:18px" x-text="checkin.today_credit??'—'"></div></div>
-            <div class="stat"><div class="lbl">连续天数</div><div class="num" style="font-size:18px" x-text="checkin.streak_days??'—'"></div></div>
-          </div>
-          <button class="ok" @click="claimCheckin()" :disabled="loading||checkin.today_checked_in"
-                  x-text="checkin.today_checked_in?'今日已签到':'立即签到'"></button>
-        </div>
-      </template>
-      <div class="muted" x-show="!checkin.loaded">加载中…</div>
-    </div>
-  </section>
-
-  <!-- 日志 -->
-  <section x-show="view==='logs'" x-cloak>
-    <h2>请求日志</h2>
-    <div class="card">
-      <div class="row" style="margin-bottom:12px">
-        <input style="width:180px" x-model="logFilter.model" placeholder="模型（模糊）" @change="loadLogs(1)">
-        <select style="width:150px" x-model="logFilter.key_id" @change="loadLogs(1)">
-          <option value="">全部 Key</option>
-          <template x-for="k in keys" :key="k.id"><option :value="k.id" x-text="k.name||('#'+k.id)"></option></template>
-        </select>
-        <select style="width:130px" x-model="logFilter.status" @change="loadLogs(1)">
-          <option value="">全部状态</option>
-          <option value="error">仅错误</option>
-          <option value="200">200</option>
-          <option value="401">401</option>
-          <option value="429">429</option>
-          <option value="503">503</option>
-        </select>
-        <div class="spacer"></div>
-        <span class="muted" x-text="'共 '+logTotal+' 条'"></span>
-      </div>
-      <table>
-        <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>流式</th><th>P/C/T</th><th>积分</th><th>finish</th><th>耗时</th><th>状态</th><th>错误</th></tr></thead>
-        <tbody>
-          <template x-for="l in logs" :key="l.id">
-            <tr>
-              <td class="muted" x-text="ts(l.created_at,true)"></td>
-              <td x-text="l.model"></td>
-              <td x-text="l.api_key_name||'—'"></td>
-              <td x-text="l.stream?'⚡':'JSON'"></td>
-              <td class="muted" x-text="l.prompt_tokens+'/'+l.completion_tokens+'/'+l.total_tokens"></td>
-              <td x-text="l.credit||''"></td>
-              <td class="muted" x-text="l.finish_reason||''"></td>
-              <td class="muted" x-text="l.duration_ms+'ms'"></td>
-              <td><span class="badge" :class="l.status_code>=400?'err':'ok'" x-text="l.status_code"></span></td>
-              <td class="muted" x-text="l.error_msg"></td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
-      <div class="pager">
-        <button class="ghost" @click="loadLogs(logPage-1)" :disabled="logPage<=1">上一页</button>
-        <span class="muted" x-text="logPage+' / '+Math.max(1,Math.ceil(logTotal/logPageSize))+' 页'"></span>
-        <button class="ghost" @click="loadLogs(logPage+1)" :disabled="logPage>=Math.ceil(logTotal/logPageSize)">下一页</button>
-      </div>
-    </div>
-  </section>
-
-  <!-- 设置 -->
-  <section x-show="view==='settings'" x-cloak>
-    <h2>设置</h2>
-    <div class="card">
-      <h3>基本</h3>
-      <div class="grid c2">
-        <div>
-          <label>端点 region（切换后凭证不互通，需重新登录）</label>
-          <select :value="settings.region" @change="settings.region=$event.target.value">
-            <option value="cn">中国（copilot.tencent.com）</option>
-            <option value="global">国际（www.codebuddy.ai）</option>
-          </select>
-        </div>
-        <div>
-          <label>监听地址（改后需重启）</label>
-          <input :value="settings.listen" disabled>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <h3>签到与缓存</h3>
-      <div class="grid c3">
-        <div>
-          <label>自动签到</label>
-          <select :value="settings.auto_checkin" @change="settings.auto_checkin=$event.target.value==='true'">
-            <option value="false">关闭</option><option value="true">开启</option>
-          </select>
-        </div>
-        <div><label>签到 cron（6 段含秒）</label><input x-model="settings.checkin_cron" placeholder="0 0 9 * * *"></div>
-        <div><label>余额缓存秒数</label><input type="number" x-model.number="settings.resource_cache_seconds"></div>
-      </div>
-      <div style="margin-top:10px"><label>日志保留天数</label><input type="number" style="width:180px" x-model.number="settings.log_retention_days"></div>
-    </div>
-    <div class="card">
-      <h3>模型列表</h3>
-      <div class="row">
-        <span class="muted" x-show="settings.models"
-              x-text="(settings.models.fallback?'内置回退表':'实时列表')+' · '+settings.models.count+' 个模型 · '+ts(settings.models.fetched_at)"></span>
-        <div class="spacer"></div>
-        <button class="ghost" @click="refreshModels()" :disabled="loading">刷新模型列表</button>
-      </div>
-    </div>
-    <div class="card">
-      <h3>修改管理密码</h3>
-      <div class="grid c2">
-        <div><label>旧密码</label><input type="password" x-model="pwForm.old_password"></div>
-        <div><label>新密码（≥6 位）</label><input type="password" x-model="pwForm.new_password"></div>
-      </div>
-    </div>
-    <button @click="saveSettings()" :disabled="loading">保存设置</button>
-  </section>
-
-  </main>
+  </template>
 </div>
-</template>
+
 </div>
 
 <script>
+/* ═══ Lucide 图标（inline SVG path） ═══ */
+const ICONS = {
+  dashboard:'<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+  account:'<circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/>',
+  keys:'<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/>',
+  wallet:'<path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/>',
+  checkin:'<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="m9 16 2 2 4-4"/>',
+  logs:'<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/>',
+  settings:'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  refresh:'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  external:'<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  copy:'<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+  plus:'<path d="M5 12h14"/><path d="M12 5v14"/>',
+  logout:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+  sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+  moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  monitor:'<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>',
+  menu:'<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>',
+  check:'<path d="M20 6 9 17l-5-5"/>',
+  chevronL:'<path d="m15 18-6-6 6-6"/>',
+  chevronR:'<path d="m9 18 6-6-6-6"/>',
+  activity:'<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
+  type:'<polyline points="4 7 4 4 20 4 20 7"/><line x1="9" x2="15" y1="20" y2="20"/><line x1="12" x2="12" y1="4" y2="20"/>',
+  alert:'<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  dollar:'<circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 6v2m0 8v2"/>',
+  flame:'<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',
+  download:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+  upload:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
+  shield:'<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+  box:'<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
+};
+
 function app(){
   return {
+    /* ── 状态 ── */
     ready:false, loggedIn:false, loading:false, password:'',
-    view:'dashboard', toasts:[], _toastSeq:0,
-    health:{}, stats:{}, account:{}, keys:[], logs:[], logTotal:0, logPage:1, logPageSize:20,
-    logFilter:{model:'',key_id:'',status:''},
-    keyForm:{name:'',custom_key:'',allowed_models:'',daily_limit:0},
-    resources:{accounts:[],loaded:false}, checkin:{loaded:false},
+    view:'dashboard', mobileNav:false, toasts:[], _toastSeq:0,
+    theme: localStorage.getItem('buddy2api:theme') || 'system',
+    health:{}, stats:{}, account:{}, keys:[],
+    logs:[], logTotal:0, logPage:1, logPageSize:20,
+    logFilter:{model:'',key_id:'',status:''}, _logT:0,
+    keyForm:{name:'',custom_key:''}, keyModal:false,
+    resources:{accounts:[],loaded:false},
+    checkin:{loaded:false},
     settings:{}, pwForm:{old_password:'',new_password:''},
+    models:{models:[],ids:[],state:null,loading:false},
+    importModal:false, importForm:{access_token:'',refresh_token:'',domain:'',filename:''},
+    confirmBox:{open:false,title:'',message:'',onOk:null},
     oauth:{state:'',auth_url:'',poll_msg:'等待授权中…',_timer:null,_deadline:0},
-    charts:{},
+    _chartGeom:null,
 
+    nav:[
+      {id:'dashboard',label:'统计',icon:'dashboard'},
+      {id:'account',label:'账号',icon:'account'},
+      {id:'keys',label:'密钥',icon:'keys'},
+      {id:'resources',label:'余额',icon:'wallet'},
+      {id:'logs',label:'日志',icon:'logs'},
+      {id:'settings',label:'设置',icon:'settings'},
+    ],
+
+    /* ── 主题 ── */
+    get themeLabel(){ return this.theme==='light'?'浅色':this.theme==='dark'?'深色':'系统' },
+    applyTheme(){
+      const dark = this.theme==='dark' || (this.theme==='system' && matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.classList.toggle('dark', dark);
+    },
+    cycleTheme(){
+      this.theme = this.theme==='light'?'dark':this.theme==='dark'?'system':'light';
+      localStorage.setItem('buddy2api:theme', this.theme);
+      this.applyTheme();
+    },
+
+    /* ── 图标 ── */
+    ic(name){
+      const p = ICONS[name];
+      return p ? `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">${p}</svg>` : '';
+    },
+
+    /* ── 初始化 ── */
     async init(){
+      this.applyTheme();
+      matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ()=>{ if(this.theme==='system') this.applyTheme(); });
+      let rto;
+      window.addEventListener('resize', ()=>{ clearTimeout(rto); rto=setTimeout(()=>{ if(this.view==='dashboard') this.renderDaily(); }, 200); });
       try{
         const r = await this.api('/admin/session');
-        this.loggedIn = r.logged_in;
-      }catch(e){ this.loggedIn=false; }
+        this.loggedIn = !!r.logged_in;
+      }catch(e){ this.loggedIn = false; }
       this.ready = true;
       if(this.loggedIn) this.afterLogin();
     },
     afterLogin(){
-      this.loadHealth(); this.loadKeys();
-      this.go(this.view);
+      this.loadHealth(); this.loadKeys(); this.go(this.view);
     },
     go(v){
-      this.view=v;
-      if(v==='dashboard') this.loadStats();
+      this.view = v; this.mobileNav = false;
+      if(v==='dashboard'){ this.loadStats(); this.loadModels(); }
       if(v==='account') this.loadAccount();
       if(v==='keys') this.loadKeys();
-      if(v==='resources') this.loadResources(false);
-      if(v==='checkin') this.loadCheckin();
+      if(v==='resources'){ this.loadResources(false); this.loadCheckin(); }
       if(v==='logs') this.loadLogs(1);
       if(v==='settings') this.loadSettings();
     },
 
-    // ── API 基础 ──
+    /* ── API / 基础工具 ── */
     async api(path, opts={}){
       opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
       const r = await fetch(path, opts);
@@ -474,20 +996,31 @@ function app(){
     toast(msg, type=''){
       const id = ++this._toastSeq;
       this.toasts.push({id,msg,type});
-      setTimeout(()=>{ this.toasts=this.toasts.filter(t=>t.id!==id); }, 3200);
+      setTimeout(()=>{ this.toasts = this.toasts.filter(t=>t.id!==id); }, 3400);
     },
     busy(fn){
       return async (...a)=>{ this.loading=true; try{ return await fn(...a); }
         catch(e){ this.toast(e.message,'err'); }
         finally{ this.loading=false; } };
     },
+    askConfirm(title, message, fn){
+      this.confirmBox = {open:true, title, message, onOk:()=>{ this.confirmBox.open=false; fn(); }};
+    },
     copy(text){
-      navigator.clipboard.writeText(text).then(()=>this.toast('已复制','ok'));
+      navigator.clipboard.writeText(text).then(()=>this.toast('已复制到剪贴板','ok'));
     },
     fmt(n){ return (n||0).toLocaleString(); },
+    compact(n){
+      n = n||0;
+      if(n>=1e9) return (n/1e9).toFixed(1).replace(/\.0$/,'')+'B';
+      if(n>=1e6) return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
+      if(n>=1e3) return (n/1e3).toFixed(1).replace(/\.0$/,'')+'K';
+      return String(n);
+    },
     ts(unix, withSec){
       if(!unix) return '—';
-      const d = new Date(unix*1000);
+      const d = typeof unix==='number' ? new Date(unix*1000) : new Date(unix);
+      if(isNaN(d.getTime())) return String(unix);
       const p = n=>String(n).padStart(2,'0');
       let s = d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
       if(withSec) s += ':'+p(d.getSeconds());
@@ -495,62 +1028,125 @@ function app(){
     },
     pct(a){
       if(!a.capacity_size) return 0;
-      return Math.max(0, Math.min(100, a.capacity_remain/a.capacity_size*100));
+      return Math.max(0, Math.min(100, a.capacity_remain/a.capacity_size*100)).toFixed(1);
+    },
+    fmtDosage(v){
+      if(v==null) return '—';
+      return typeof v==='number' ? String(+v.toFixed(2)) : v;
     },
 
-    // ── 登录 ──
+    /* ── 登录 ── */
     async doLogin(){
       if(!this.password){ this.toast('请输入密码','err'); return; }
-      this.loading=true;
+      this.loading = true;
       try{
         await this.api('/admin/login',{method:'POST',body:JSON.stringify({password:this.password})});
-        this.loggedIn=true; this.password='';
+        this.loggedIn = true; this.password = '';
         this.toast('登录成功','ok');
         this.afterLogin();
       }catch(e){ this.toast(e.message,'err'); }
-      this.loading=false;
+      this.loading = false;
+    },
+    async logout(){
+      try{ await this.api('/admin/logout',{method:'POST'}); }catch(e){}
+      this.loggedIn = false; this.view = 'dashboard';
+      this.toast('已退出登录');
     },
 
-    // ── health / stats ──
+    /* ── 健康状态 / 统计 ── */
     async loadHealth(){
       try{ this.health = await fetch('/health').then(r=>r.json()); }catch(e){}
+    },
+    get successRate(){
+      const t = this.stats.total_requests||0;
+      if(!t) return null;
+      return (100*(1-(this.stats.error_count||0)/t)).toFixed(1);
+    },
+    get avg14(){
+      const d = (this.stats.daily||[]).slice(-14);
+      if(!d.length) return 0;
+      return Math.round(d.reduce((s,x)=>s+(x.requests||0),0)/d.length);
+    },
+    get topModels(){
+      return (this.stats.by_model||[]).slice().sort((a,b)=>b.requests-a.requests).slice(0,10);
+    },
+    get maxReq(){
+      return Math.max(1, ...this.topModels.map(m=>m.requests||0));
     },
     async loadStats(){
       try{
         this.stats = await this.api('/admin/stats');
-        this.$nextTick(()=>this.renderCharts());
+        this.$nextTick(()=>requestAnimationFrame(()=>this.renderDaily()));
       }catch(e){ this.toast(e.message,'err'); }
     },
-    renderCharts(){
-      if(typeof echarts==='undefined') return;
-      const d1 = document.getElementById('chartDaily');
-      const d2 = document.getElementById('chartModel');
-      if(!d1||!d2) return;
-      this.charts.daily = this.charts.daily||echarts.init(d1);
-      this.charts.model = this.charts.model||echarts.init(d2);
-      const daily = this.stats.daily||[];
-      this.charts.daily.setOption({
-        tooltip:{trigger:'axis'},
-        legend:{data:['请求','Tokens'],top:0},
-        grid:{left:44,right:16,top:30,bottom:24},
-        xAxis:{type:'category',data:daily.map(d=>d.date.slice(5))},
-        yAxis:[{type:'value'},{type:'value'}],
-        series:[
-          {name:'请求',type:'bar',data:daily.map(d=>d.requests),itemStyle:{color:'#3b82f6'}},
-          {name:'Tokens',type:'line',yAxisIndex:1,data:daily.map(d=>d.tokens),itemStyle:{color:'#10b981'},smooth:true},
-        ],
+
+    /* ── 图表：近 14 天（手写 SVG，双轴：柱=请求，线=Tokens） ── */
+    renderDaily(){
+      const el = document.getElementById('chartDaily');
+      if(!el) return;
+      const daily = (this.stats.daily||[]).slice(-14);
+      if(!daily.length){ el.innerHTML = '<div class="chart-empty">暂无数据</div>'; return; }
+      const W = el.clientWidth || 600;
+      if(W < 40) return;
+      const H = 236, padL = 34, padR = 44, padT = 12, padB = 24;
+      const iw = W-padL-padR, ih = H-padT-padB;
+      const maxR = Math.max(...daily.map(d=>d.requests||0), 1);
+      const maxT = Math.max(...daily.map(d=>d.tokens||0), 1);
+      const step = iw/daily.length;
+      const barW = Math.max(4, Math.min(16, step*0.48));
+      const cx = i => padL + step*i + step/2;
+      const yR = v => padT + ih - v/maxR*ih;
+      const yT = v => padT + ih - v/maxT*ih;
+      let s = '';
+      for(let g=0; g<=4; g++){
+        const gy = padT + ih - ih*g/4;
+        s += `<line class="grid-line" x1="${padL}" x2="${W-padR}" y1="${gy.toFixed(1)}" y2="${gy.toFixed(1)}"/>`;
+        s += `<text class="axis-label" text-anchor="end" x="${padL-7}" y="${(gy+3.5).toFixed(1)}">${this.compact(Math.round(maxR*g/4))}</text>`;
+        s += `<text class="axis-label" x="${W-padR+7}" y="${(gy+3.5).toFixed(1)}">${this.compact(Math.round(maxT*g/4))}</text>`;
+      }
+      daily.forEach((d,i)=>{
+        const y = yR(d.requests||0);
+        s += `<rect class="bar-c" data-i="${i}" x="${(cx(i)-barW/2).toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0,padT+ih-y).toFixed(1)}" rx="${Math.min(3,barW/2).toFixed(1)}"/>`;
       });
-      const bym = this.stats.by_model||[];
-      this.charts.model.setOption({
-        tooltip:{},
-        grid:{left:110,right:24,top:10,bottom:24},
-        xAxis:{type:'value'},
-        yAxis:{type:'category',data:bym.map(m=>m.model).reverse()},
-        series:[{type:'bar',data:bym.map(m=>m.requests).reverse(),itemStyle:{color:'#60a5fa'}}],
+      s += `<polyline class="tok-line" points="${daily.map((d,i)=>cx(i).toFixed(1)+','+yT(d.tokens||0).toFixed(1)).join(' ')}"/>`;
+      daily.forEach((d,i)=>{ s += `<circle class="tok-dot" cx="${cx(i).toFixed(1)}" cy="${yT(d.tokens||0).toFixed(1)}" r="2.6"/>`; });
+      const k = Math.max(1, Math.ceil(daily.length/7));
+      daily.forEach((d,i)=>{
+        if(i%k===0 || i===daily.length-1) s += `<text class="axis-label" text-anchor="middle" x="${cx(i).toFixed(1)}" y="${H-6}">${(d.date||'').slice(5)}</text>`;
+      });
+      daily.forEach((d,i)=>{ s += `<rect class="hz" data-i="${i}" x="${(padL+step*i).toFixed(1)}" y="${padT}" width="${step.toFixed(1)}" height="${ih.toFixed(1)}" fill="transparent"/>`; });
+      s += `<g class="tip" opacity="0" pointer-events="none"><rect class="tip-bg" rx="7" width="130" height="58"/><text class="tip-t" x="10" y="17"></text><text class="tip-l" x="10" y="32"></text><text class="tip-l" x="10" y="46"></text></g>`;
+      el.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${s}</svg>`;
+      this._chartGeom = {padL, step, W};
+      // 悬停提示
+      const svg = el.querySelector('svg');
+      const tip = svg.querySelector('.tip');
+      const bg = tip.querySelector('.tip-bg');
+      const [tt, l1, l2] = tip.querySelectorAll('text');
+      svg.querySelectorAll('.hz').forEach(hz=>{
+        hz.addEventListener('mouseenter', ()=>{
+          const i = +hz.dataset.i, d = daily[i];
+          tt.textContent = d.date||'';
+          l1.textContent = `请求 ${this.fmt(d.requests||0)}`;
+          l2.textContent = `Tokens ${this.fmt(d.tokens||0)}`;
+          const w = Math.max(...[tt,l1,l2].map(t=>t.getComputedTextLength())) + 20;
+          bg.setAttribute('width', w.toFixed(0));
+          const g = this._chartGeom;
+          let tx = g.padL + g.step*i + g.step + 8;
+          if(tx + w > g.W - 2) tx = g.padL + g.step*i - w - 8;
+          tip.setAttribute('transform', `translate(${tx.toFixed(1)},${padT+2})`);
+          tip.setAttribute('opacity','1');
+          const bar = svg.querySelector(`.bar-c[data-i="${i}"]`);
+          if(bar) bar.classList.add('hl');
+        });
+        hz.addEventListener('mouseleave', ()=>{
+          tip.setAttribute('opacity','0');
+          svg.querySelectorAll('.bar-c.hl').forEach(b=>b.classList.remove('hl'));
+        });
       });
     },
 
-    // ── 账号 ──
+    /* ── 账号 ── */
     async loadAccount(){
       try{ this.account = await this.api('/admin/account'); }catch(e){ this.toast(e.message,'err'); }
     },
@@ -558,31 +1154,80 @@ function app(){
       this.busy(async()=>{
         const r = await this.api('/admin/account/refresh',{method:'POST'});
         this.toast('已刷新，新有效期 '+r.expires_human,'ok');
-        this.loadAccount();
+        this.loadAccount(); this.loadHealth();
       })();
     },
     async testAccount(){
       this.busy(async()=>{
         const r = await this.api('/admin/account/test',{method:'POST'});
-        r.ok ? this.toast('凭证可用 ✅','ok') : this.toast('测试失败：'+r.message,'err');
+        r.ok ? this.toast('凭证可用，上游连通正常','ok') : this.toast('测试失败：'+r.message,'err');
       })();
     },
-    async deleteAccount(){
-      if(!confirm('确定退出登录并删除本地凭证？')) return;
+    deleteAccount(){
+      this.askConfirm('退出登录','将删除本地保存的 OAuth 凭证，确定继续？', ()=>{
+        this.busy(async()=>{
+          await this.api('/admin/account',{method:'DELETE'});
+          this.toast('已清除凭证','ok');
+          this.loadAccount(); this.loadHealth();
+        })();
+      });
+    },
+    async exportAccount(){
       this.busy(async()=>{
-        await this.api('/admin/account',{method:'DELETE'});
-        this.toast('已清除凭证','ok'); this.loadAccount(); this.loadHealth();
+        const r = await fetch('/admin/account/export');
+        if(r.status===401){ this.loggedIn=false; throw new Error('登录已过期'); }
+        if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.error||('HTTP '+r.status)); }
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'token.json';
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        this.toast('凭证已导出','ok');
+      })();
+    },
+    onImportFile(ev){
+      const file = ev.target.files && ev.target.files[0];
+      if(!file) return;
+      this.importForm.filename = file.name;
+      const reader = new FileReader();
+      reader.onload = ()=>{
+        try{
+          const obj = JSON.parse(reader.result);
+          this.importForm.access_token = obj.access_token || '';
+          this.importForm.refresh_token = obj.refresh_token || '';
+          this.importForm.domain = obj.domain || '';
+          this.toast('已读取文件，确认后导入','ok');
+        }catch(e){ this.toast('文件不是合法 JSON: '+e.message,'err'); }
+      };
+      reader.onerror = ()=>this.toast('读取文件失败','err');
+      reader.readAsText(file);
+      ev.target.value = '';
+    },
+    async importAccount(){
+      const f = this.importForm;
+      if(!f.access_token || !f.access_token.trim()){ this.toast('access_token 不能为空','err'); return; }
+      this.busy(async()=>{
+        const r = await this.api('/admin/account/import',{method:'POST',body:JSON.stringify({
+          access_token:f.access_token.trim(),
+          refresh_token:f.refresh_token.trim(),
+          domain:f.domain.trim(),
+        })});
+        this.toast('导入成功：'+(r.nickname||r.uid||'已保存'),'ok');
+        this.importModal = false;
+        this.importForm = {access_token:'',refresh_token:'',domain:'',filename:''};
+        this.loadAccount(); this.loadHealth();
       })();
     },
 
-    // ── OAuth ──
+    /* ── OAuth 设备流 ── */
     async oauthStart(){
       this.busy(async()=>{
         const r = await this.api('/admin/account/oauth/start',{method:'POST'});
         this.oauth.state = r.state;
         this.oauth.auth_url = r.auth_url;
         this.oauth.poll_msg = '等待授权中…';
-        this.oauth._deadline = Date.now()+5*60*1000;
+        this.oauth._deadline = Date.now() + 5*60*1000;
         window.open(r.auth_url, '_blank');
         this.oauth._timer = setInterval(()=>this.oauthPoll(), 3000);
         this.oauthPoll();
@@ -590,130 +1235,173 @@ function app(){
     },
     async oauthPoll(){
       if(!this.oauth.state) return;
-      if(Date.now()>this.oauth._deadline){ this.oauthStop('超时未完成授权'); return; }
+      if(Date.now() > this.oauth._deadline){ this.oauthStop('超时未完成授权'); return; }
       try{
         const r = await this.api('/admin/account/oauth/poll?state='+encodeURIComponent(this.oauth.state));
         if(r.status==='success'){
           this.oauthStop();
           this.toast('登录成功：'+(r.account.nickname||r.account.uid),'ok');
-          this.loadAccount(); this.loadHealth(); this.loadSettings();
+          this.loadAccount(); this.loadHealth(); this.loadModels();
         }else if(r.status==='error'){
           this.oauthStop(r.message);
         }else{
-          this.oauth.poll_msg = '等待授权中…（'+new Date().toLocaleTimeString()+'）';
+          this.oauth.poll_msg = '等待授权中（'+new Date().toLocaleTimeString('zh-CN',{hour12:false})+'）';
         }
       }catch(e){ /* 网络抖动忽略，下轮继续 */ }
     },
     oauthStop(errMsg){
-      if(this.oauth._timer){ clearInterval(this.oauth._timer); this.oauth._timer=null; }
+      if(this.oauth._timer){ clearInterval(this.oauth._timer); this.oauth._timer = null; }
       if(errMsg){ this.toast(errMsg,'err'); this.oauth.poll_msg = errMsg; }
       setTimeout(()=>{ this.oauth.state=''; this.oauth.auth_url=''; }, errMsg?2500:400);
     },
     oauthCancel(){ this.oauthStop(); },
 
-    // ── keys ──
+    /* ── Keys ── */
     async loadKeys(){
       try{ const r = await this.api('/admin/api-keys'); this.keys = r.keys||[]; }catch(e){}
     },
     async createKey(){
       this.busy(async()=>{
         const f = this.keyForm;
-        let allowed = '';
-        if(f.allowed_models && f.allowed_models.trim()){
-          allowed = JSON.stringify(f.allowed_models.split(/[,，\s]+/).filter(Boolean));
-        }
         await this.api('/admin/api-keys',{method:'POST',body:JSON.stringify({
-          name:f.name, custom_key:f.custom_key, allowed_models:allowed, daily_limit:+f.daily_limit||0 })});
-        this.toast('已创建','ok');
-        this.keyForm = {name:'',custom_key:'',allowed_models:'',daily_limit:0};
+          name:f.name, custom_key:f.custom_key })});
+        this.toast('Key 已创建','ok');
+        this.keyModal = false;
+        this.keyForm = {name:'',custom_key:''};
         this.loadKeys();
       })();
     },
     async updateKey(k, patch){
       try{
-        const body = {};
-        for(const key in patch) body[key]=patch[key];
-        await this.api('/admin/api-keys/'+k.id,{method:'PUT',body:JSON.stringify(body)});
+        await this.api('/admin/api-keys/'+k.id,{method:'PUT',body:JSON.stringify(patch)});
         this.toast('已更新','ok'); this.loadKeys();
       }catch(e){ this.toast(e.message,'err'); }
     },
-    async deleteKey(k){
-      if(!confirm('确定删除该 Key？')) return;
-      try{
-        await this.api('/admin/api-keys/'+k.id,{method:'DELETE'});
-        this.toast('已删除','ok'); this.loadKeys();
-      }catch(e){ this.toast(e.message,'err'); }
+    deleteKey(k){
+      this.askConfirm('删除 Key','确定删除该 Key？此操作不可撤销。', ()=>{
+        this.busy(async()=>{
+          await this.api('/admin/api-keys/'+k.id,{method:'DELETE'});
+          this.toast('已删除','ok'); this.loadKeys();
+        })();
+      });
     },
 
-    // ── 余额 ──
+    /* ── 余额 ── */
     async loadResources(force){
-      this.busy(async()=>{
+      if(this.resources._loading) return;
+      this.resources._loading = true; this.loading = true;
+      try{
         const r = await this.api('/admin/resources'+(force?'?force=1':''));
         this.resources = Object.assign({loaded:true}, r.data||{});
-      })();
+      }catch(e){
+        this.toast(e.message,'err');
+        this.resources.loaded = true;
+      }finally{
+        this.resources._loading = false; this.loading = false;
+      }
+    },
+    quotaBadge(a){
+      if(a.warn==='expired') return 'badge-err';
+      return a.warn ? 'badge-warn' : 'badge-ok';
+    },
+    quotaBadgeText(a){
+      if(a.warn==='expired') return '已过期';
+      return a.warn ? a.warn+' 内到期' : '正常';
+    },
+    quotaBarClass(a){
+      if(a.warn==='expired') return 'err';
+      return a.warn ? 'warn' : '';
+    },
+    quotaExpire(a){
+      return a.expire_time || (a.days_left!=null ? a.days_left+' 天后' : '—');
     },
 
-    // ── 签到 ──
+    /* ── 签到 ── */
     async loadCheckin(){
       try{
         const r = await this.api('/admin/checkin/status');
-        const d = r.data&&r.data.data ? r.data.data : (r.data||{});
+        const d = r.data && r.data.data ? r.data.data : (r.data||{});
         this.checkin = Object.assign({loaded:true}, d);
       }catch(e){ this.toast(e.message,'err'); }
     },
     async claimCheckin(){
       this.busy(async()=>{
         const r = await this.api('/admin/checkin/claim',{method:'POST'});
-        const d = (r.data&&r.data.data)||{};
-        this.toast(d.credit>0?('签到成功，+'+d.credit+' 积分'):'今日已签到或不可领取', d.credit>0?'ok':'');
+        const d = (r.data && r.data.data) || {};
+        if(d.credit > 0){ this.toast('签到成功，+'+d.credit+' 积分','ok'); }
+        else{ this.toast('今日已签到或暂不可领取'); }
         this.loadCheckin();
       })();
     },
 
-    // ── 日志 ──
+    /* ── 日志 ── */
+    loadLogsDebounced(){
+      clearTimeout(this._logT);
+      this._logT = setTimeout(()=>this.loadLogs(1), 500);
+    },
     async loadLogs(page){
-      if(page<1) page=1;
+      if(page<1) page = 1;
       const f = this.logFilter;
-      const qs = new URLSearchParams({page,page_size:this.logPageSize});
-      if(f.model) qs.set('model',f.model);
-      if(f.key_id) qs.set('key_id',f.key_id);
-      if(f.status) qs.set('status',f.status);
+      const qs = new URLSearchParams({page, page_size:this.logPageSize});
+      if(f.model) qs.set('model', f.model);
+      if(f.key_id) qs.set('key_id', f.key_id);
+      if(f.status) qs.set('status', f.status);
       try{
         const r = await this.api('/admin/logs?'+qs);
         this.logs = r.logs||[]; this.logTotal = r.total||0; this.logPage = page;
       }catch(e){ this.toast(e.message,'err'); }
     },
 
-    // ── 设置 ──
+    /* ── 设置 / 模型 ── */
+    get modelChips(){
+      if((this.models.models||[]).length) return this.models.models.map(m=>({id:m.id,name:m.name}));
+      return (this.models.ids||[]).map(id=>({id,name:id}));
+    },
+    get modelsStateText(){
+      const m = this.models.state;
+      if(!m) return '';
+      return (m.fallback?'内置回退表':'实时列表')+' · '+(m.count??0)+' 个模型'+(m.fetched_at?' · 更新于 '+this.ts(m.fetched_at):'');
+    },
+    async loadModels(){
+      this.models.loading = true;
+      try{
+        const r = await this.api('/admin/models');
+        this.models.models = r.models||[];
+        this.models.ids = r.ids||[];
+        this.models.state = r.state||null;
+      }catch(e){ /* 静默，设置页不走这里 */ }
+      finally{ this.models.loading = false; }
+    },
     async loadSettings(){
       try{ this.settings = await this.api('/admin/settings'); }catch(e){}
     },
     async refreshModels(){
       this.busy(async()=>{
         const r = await this.api('/admin/models/refresh',{method:'POST'});
-        this.toast('已刷新（'+r.ids.length+' 个模型）','ok');
-        this.loadSettings();
+        this.toast('模型列表已刷新（'+(r.ids||[]).length+' 个）','ok');
+        this.loadModels();
       })();
     },
     async saveSettings(){
       this.busy(async()=>{
         const s = this.settings, body = {
+          listen:(s.listen||'').trim(),
           region:s.region, auto_checkin:!!s.auto_checkin,
           checkin_cron:s.checkin_cron, resource_cache_seconds:+s.resource_cache_seconds,
-          log_retention_days:+s.log_retention_days,
+          log_retention_days:+s.log_retention_days, log_max_size_mb:+s.log_max_size_mb,
         };
-        if(this.pwForm.old_password||this.pwForm.new_password){
-          body.old_password=this.pwForm.old_password; body.new_password=this.pwForm.new_password;
+        if(this.pwForm.old_password || this.pwForm.new_password){
+          body.old_password = this.pwForm.old_password;
+          body.new_password = this.pwForm.new_password;
         }
         this.settings = await this.api('/admin/settings',{method:'PUT',body:JSON.stringify(body)});
-        this.pwForm={old_password:'',new_password:''};
-        this.toast('已保存','ok');
+        this.pwForm = {old_password:'',new_password:''};
+        this.toast('设置已保存'+(body.listen?'，监听地址修改需手动重启服务生效':''),'ok');
         this.loadHealth();
       })();
     },
   };
 }
 </script>
-<style>[x-cloak]{display:none!important}</style>
 </body>
 </html>

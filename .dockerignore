@@ -1,0 +1,21 @@
+# 版本控制
+.git
+.gitignore
+.github
+
+# 本地文档与测试（不随镜像分发）
+docs/
+references/
+tests/
+
+# 运行时数据（token.json / config.json / db —— 含凭证，严禁进镜像）
+data/
+
+# 本地构建产物与配置
+*.exe
+*.dll
+*.so
+*.dylib
+*.log
+.env
+.env.*

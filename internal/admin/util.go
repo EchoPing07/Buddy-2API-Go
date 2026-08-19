@@ -17,7 +17,7 @@ func hashPassword(pw string) string {
 	return string(b)
 }
 
-// secondsParser 6 段含秒 cron 解析器（DEVELOPMENT.md §10）。
+// secondsParser 6 段含秒 cron 解析器。
 var secondsParser = cron.NewParser(
 	cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
 )

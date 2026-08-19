@@ -38,8 +38,7 @@ func New(cfg *config.Manager, client *upstream.Client, st *store.Store) *Schedul
 	return s
 }
 
-// Reconfigure 按配置重装配签到任务（设置变更时调用）。
-// 仅当 auto_checkin 开启才注册；不做启动补签（决策 #7）。
+// Reconfigure 按配置重装配签到任务，仅当 auto_checkin 开启才注册。
 func (s *Scheduler) Reconfigure() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -102,9 +101,10 @@ func (s *Scheduler) doCheckin() {
 	}
 }
 
-// cleanupLogs 清理过期日志。
+// cleanupLogs 清理过期日志：先按保留天数，再按累计大小上限删最旧。
 func (s *Scheduler) cleanupLogs() {
-	days := s.cfg.Get().LogRetentionDays
+	cfg := s.cfg.Get()
+	days := cfg.LogRetentionDays
 	n, err := s.st.CleanupLogs(days)
 	if err != nil {
 		slog.Error("清理日志失败", "error", err)
@@ -112,6 +112,18 @@ func (s *Scheduler) cleanupLogs() {
 	}
 	if n > 0 {
 		slog.Info("已清理过期日志", "count", n, "retention_days", days)
+	}
+	maxBytes := int64(cfg.LogMaxSizeMB) * 1024 * 1024
+	if maxBytes <= 0 {
+		return
+	}
+	m, err := s.st.CleanupLogsBySize(maxBytes)
+	if err != nil {
+		slog.Error("按大小清理日志失败", "error", err)
+		return
+	}
+	if m > 0 {
+		slog.Info("已按大小上限清理日志", "count", m, "max_mb", cfg.LogMaxSizeMB)
 	}
 }
 

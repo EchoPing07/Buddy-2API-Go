@@ -1,10 +1,8 @@
-// Package store SQLite 数据层（modernc.org/sqlite，纯 Go 无 cgo）。
-// 表结构见 DEVELOPMENT.md §5.3（settings 表已裁剪，config.json 为唯一热更新配置源）。
+// Package store SQLite 数据层。
 package store
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,31 +11,17 @@ import (
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动
 )
 
-// APIKey OpenAI 端点 Key（明文存储，决策 #4）。
+// APIKey OpenAI 端点密钥（明文存储）。
 type APIKey struct {
 	ID            int64  `json:"id"`
 	KeyPrefix     string `json:"key_prefix"`
 	KeyPlain      string `json:"key_plain"`
 	Name          string `json:"name"`
 	Status        string `json:"status"`
-	AllowedModels string `json:"allowed_models"` // JSON 数组字符串，空表示不限
-	DailyLimit    int    `json:"daily_limit"`    // 0 = 不限
 	TotalRequests int64  `json:"total_requests"`
 	TotalTokens   int64  `json:"total_tokens"`
 	CreatedAt     int64  `json:"created_at"`
 	LastUsedAt    int64  `json:"last_used_at"`
-}
-
-// AllowedList 解析 allowed_models 为列表。
-func (k *APIKey) AllowedList() []string {
-	if k.AllowedModels == "" {
-		return nil
-	}
-	var list []string
-	if err := json.Unmarshal([]byte(k.AllowedModels), &list); err != nil {
-		return nil
-	}
-	return list
 }
 
 // LogEntry 请求日志（仅元信息，不存对话内容）。
@@ -96,8 +80,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_plain       TEXT,
   name            TEXT,
   status          TEXT DEFAULT 'active',
-  allowed_models  TEXT,
-  daily_limit     INTEGER DEFAULT 0,
   total_requests  INTEGER DEFAULT 0,
   total_tokens    INTEGER DEFAULT 0,
   created_at      INTEGER,
@@ -119,12 +101,7 @@ CREATE TABLE IF NOT EXISTS logs (
   error_msg         TEXT,
   created_at        INTEGER
 );
-CREATE TABLE IF NOT EXISTS api_key_daily_usage (
-  api_key_id INTEGER,
-  date       TEXT,
-  count      INTEGER DEFAULT 0,
-  PRIMARY KEY (api_key_id, date)
-);
+DROP TABLE IF EXISTS api_key_daily_usage; -- 已移除每日限额功能，清理遗留计数表
 CREATE TABLE IF NOT EXISTS resource_cache (
   account_key TEXT PRIMARY KEY,
   payload     TEXT,
@@ -142,23 +119,23 @@ CREATE INDEX IF NOT EXISTS idx_logs_model   ON logs(model);
 	return err
 }
 
-// ─────────────────────────── api_keys ───────────────────────────
+// ── api_keys ──
 
 func scanKey(row interface{ Scan(...any) error }) (*APIKey, error) {
 	var k APIKey
 	var stream sql.NullBool
 	_ = stream
-	err := row.Scan(&k.ID, &k.KeyPrefix, &k.KeyPlain, &k.Name, &k.Status, &k.AllowedModels,
-		&k.DailyLimit, &k.TotalRequests, &k.TotalTokens, &k.CreatedAt, &k.LastUsedAt)
+	err := row.Scan(&k.ID, &k.KeyPrefix, &k.KeyPlain, &k.Name, &k.Status,
+		&k.TotalRequests, &k.TotalTokens, &k.CreatedAt, &k.LastUsedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &k, nil
 }
 
-const keyCols = `id, COALESCE(key_prefix,''), COALESCE(key_plain,''), COALESCE(name,''), COALESCE(status,'active'), COALESCE(allowed_models,''), COALESCE(daily_limit,0), COALESCE(total_requests,0), COALESCE(total_tokens,0), COALESCE(created_at,0), COALESCE(last_used_at,0)`
+const keyCols = `id, COALESCE(key_prefix,''), COALESCE(key_plain,''), COALESCE(name,''), COALESCE(status,'active'), COALESCE(total_requests,0), COALESCE(total_tokens,0), COALESCE(created_at,0), COALESCE(last_used_at,0)`
 
-// ListKeys 全量 key 列表（用于常量时间比对鉴权 + 管理页展示）。
+// ListKeys 全量 key 列表。
 func (s *Store) ListKeys() ([]APIKey, error) {
 	rows, err := s.db.Query(`SELECT ` + keyCols + ` FROM api_keys ORDER BY id DESC`)
 	if err != nil {
@@ -179,9 +156,9 @@ func (s *Store) ListKeys() ([]APIKey, error) {
 // CreateKey 新增 key。
 func (s *Store) CreateKey(k *APIKey) error {
 	now := time.Now().Unix()
-	res, err := s.db.Exec(`INSERT INTO api_keys (key_prefix, key_plain, name, status, allowed_models, daily_limit, created_at)
-		VALUES (?,?,?,?,?,?,?)`,
-		k.KeyPrefix, k.KeyPlain, k.Name, orDefaultStr(k.Status, "active"), k.AllowedModels, k.DailyLimit, now)
+	res, err := s.db.Exec(`INSERT INTO api_keys (key_prefix, key_plain, name, status, created_at)
+		VALUES (?,?,?,?,?)`,
+		k.KeyPrefix, k.KeyPlain, k.Name, orDefaultStr(k.Status, "active"), now)
 	if err != nil {
 		return err
 	}
@@ -191,8 +168,8 @@ func (s *Store) CreateKey(k *APIKey) error {
 	return nil
 }
 
-// UpdateKey 更新备注/状态/限额/允许模型。
-func (s *Store) UpdateKey(id int64, name, status, allowedModels *string, dailyLimit *int) error {
+// UpdateKey 更新备注/状态。
+func (s *Store) UpdateKey(id int64, name, status *string) error {
 	k, err := s.GetKey(id)
 	if err != nil {
 		return err
@@ -209,32 +186,14 @@ func (s *Store) UpdateKey(id int64, name, status, allowedModels *string, dailyLi
 		}
 		k.Status = *status
 	}
-	if allowedModels != nil {
-		if *allowedModels != "" {
-			var list []string
-			if err := json.Unmarshal([]byte(*allowedModels), &list); err != nil {
-				return fmt.Errorf("allowed_models 需为 JSON 数组: %w", err)
-			}
-		}
-		k.AllowedModels = *allowedModels
-	}
-	if dailyLimit != nil {
-		if *dailyLimit < 0 {
-			return fmt.Errorf("daily_limit 不能为负")
-		}
-		k.DailyLimit = *dailyLimit
-	}
-	_, err = s.db.Exec(`UPDATE api_keys SET name=?, status=?, allowed_models=?, daily_limit=? WHERE id=?`,
-		k.Name, k.Status, k.AllowedModels, k.DailyLimit, id)
+	_, err = s.db.Exec(`UPDATE api_keys SET name=?, status=? WHERE id=?`,
+		k.Name, k.Status, id)
 	return err
 }
 
-// DeleteKey 删除 key（连带清理当日计数）。
+// DeleteKey 删除 key。
 func (s *Store) DeleteKey(id int64) error {
-	if _, err := s.db.Exec(`DELETE FROM api_keys WHERE id=?`, id); err != nil {
-		return err
-	}
-	_, err := s.db.Exec(`DELETE FROM api_key_daily_usage WHERE api_key_id=?`, id)
+	_, err := s.db.Exec(`DELETE FROM api_keys WHERE id=?`, id)
 	return err
 }
 
@@ -258,28 +217,7 @@ func (s *Store) IncrementKeyUsage(id int64, tokens int64) error {
 	return err
 }
 
-// ─────────────────────────── 每日限额 ───────────────────────────
-
-// DailyUsageCount 查询某 key 今日请求数。
-func (s *Store) DailyUsageCount(keyID int64) (int, error) {
-	var n int
-	err := s.db.QueryRow(`SELECT count FROM api_key_daily_usage WHERE api_key_id=? AND date=?`,
-		keyID, time.Now().Format("2006-01-02")).Scan(&n)
-	if err == sql.ErrNoRows {
-		return 0, nil
-	}
-	return n, err
-}
-
-// IncrementDailyUsage 今日计数 +1。
-func (s *Store) IncrementDailyUsage(keyID int64) error {
-	_, err := s.db.Exec(`INSERT INTO api_key_daily_usage (api_key_id, date, count) VALUES (?,?,1)
-		ON CONFLICT(api_key_id, date) DO UPDATE SET count=count+1`,
-		keyID, time.Now().Format("2006-01-02"))
-	return err
-}
-
-// ─────────────────────────── logs ───────────────────────────
+// ── logs ──
 
 // InsertLog 写入请求日志。
 func (s *Store) InsertLog(l *LogEntry) error {
@@ -354,7 +292,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]LogEntry, int, error) {
 	return out, total, rows.Err()
 }
 
-// ─────────────────────────── stats ───────────────────────────
+// ── stats ──
 
 // Stats 仪表盘聚合。
 type Stats struct {
@@ -370,7 +308,7 @@ type Stats struct {
 	RecentErrors  []LogEntry  `json:"recent_errors"`
 }
 
-// DailyStat 近 N 天请求/ token 曲线。
+// DailyStat 按日请求/token 统计。
 type DailyStat struct {
 	Date     string `json:"date"`
 	Requests int64  `json:"requests"`
@@ -398,7 +336,7 @@ func (s *Store) GetStats() (*Stats, error) {
 	err := func() error {
 		// 总量
 		if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(credit),0),
-			SUM(CASE WHEN status_code>=400 OR error_msg!='' THEN 1 ELSE 0 END) FROM logs`).
+			COALESCE(SUM(CASE WHEN status_code>=400 OR error_msg!='' THEN 1 ELSE 0 END),0) FROM logs`).
 			Scan(&st.TotalRequests, &st.TotalTokens, &st.TotalCredit, &st.ErrorCount); err != nil {
 			return err
 		}
@@ -494,7 +432,40 @@ func (s *Store) CleanupLogs(retentionDays int) (int64, error) {
 	return res.RowsAffected()
 }
 
-// ─────────────────────────── 缓存表 ───────────────────────────
+// CleanupLogsBySize 按累计大小估算删除最旧日志，使总占用降至 maxBytes 以下。
+func (s *Store) CleanupLogsBySize(maxBytes int64) (int64, error) {
+	if maxBytes <= 0 {
+		return 0, nil
+	}
+	var total, count int64
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(
+		length(CAST(COALESCE(model,'') AS BLOB)) +
+		length(CAST(COALESCE(api_key_name,'') AS BLOB)) +
+		length(CAST(COALESCE(finish_reason,'') AS BLOB)) +
+		length(CAST(COALESCE(error_msg,'') AS BLOB)) + 128), 0), COUNT(*)
+		FROM logs`).Scan(&total, &count)
+	if err != nil {
+		return 0, err
+	}
+	if count == 0 || total <= maxBytes {
+		return 0, nil
+	}
+	avg := total / count
+	if avg < 1 {
+		avg = 1
+	}
+	toDelete := (total - maxBytes) / avg
+	if toDelete < 1 {
+		toDelete = 1
+	}
+	res, err := s.db.Exec(`DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY id ASC LIMIT ?)`, toDelete)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ── 缓存表 ──
 
 // GetCache 读缓存（resource_cache / checkin_cache 共用），TTL 秒内有效。
 func (s *Store) GetCache(table, key string, ttlSeconds int) (string, int64, bool) {
@@ -519,7 +490,7 @@ func (s *Store) SetCache(table, key, payload string) error {
 	return err
 }
 
-// ─────────────────────────── util ───────────────────────────
+// ── util ──
 
 func boolToInt(b bool) int {
 	if b {

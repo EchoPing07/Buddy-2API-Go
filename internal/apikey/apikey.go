@@ -1,5 +1,4 @@
-// Package apikey 管理 OpenAI 端点 API Key（明文存储，决策 #4）：
-// 随机/自定义创建、启停、限额、常量时间比对鉴权。
+// Package apikey 管理 OpenAI 端点 API Key：创建、启停、常量时间比对鉴权。
 package apikey
 
 import (
@@ -10,16 +9,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"buddy2api-go/internal/store"
 )
 
 // KeyInfo 鉴权通过后注入 context 的 key 信息。
 type KeyInfo struct {
-	ID            int64
-	Name          string
-	AllowedModels []string
+	ID   int64
+	Name string
 }
 
 type ctxKey struct{}
@@ -46,7 +43,7 @@ func GenerateKey() (string, error) {
 }
 
 // Create 创建 key（custom 为空则随机生成）。
-func (m *Manager) Create(name, custom string, allowedModels string, dailyLimit int) (*store.APIKey, error) {
+func (m *Manager) Create(name, custom string) (*store.APIKey, error) {
 	plain := strings.TrimSpace(custom)
 	if plain == "" {
 		var err error
@@ -58,11 +55,9 @@ func (m *Manager) Create(name, custom string, allowedModels string, dailyLimit i
 		return nil, fmt.Errorf("自定义 key 至少 8 个字符")
 	}
 	k := &store.APIKey{
-		KeyPrefix:     plain[:min(8, len(plain))],
-		KeyPlain:      plain,
-		Name:          strings.TrimSpace(name),
-		AllowedModels: strings.TrimSpace(allowedModels),
-		DailyLimit:    dailyLimit,
+		KeyPrefix: plain[:min(8, len(plain))],
+		KeyPlain:  plain,
+		Name:      strings.TrimSpace(name),
 	}
 	if err := m.st.CreateKey(k); err != nil {
 		return nil, err
@@ -74,8 +69,8 @@ func (m *Manager) Create(name, custom string, allowedModels string, dailyLimit i
 func (m *Manager) List() ([]store.APIKey, error) { return m.st.ListKeys() }
 
 // Update 更新。
-func (m *Manager) Update(id int64, name, status, allowedModels *string, dailyLimit *int) error {
-	return m.st.UpdateKey(id, name, status, allowedModels, dailyLimit)
+func (m *Manager) Update(id int64, name, status *string) error {
+	return m.st.UpdateKey(id, name, status)
 }
 
 // Delete 删除。
@@ -100,7 +95,7 @@ func openaiError(w http.ResponseWriter, status int, code, msg string) {
 	fmt.Fprintf(w, `{"error":{"message":%q,"type":"%s","code":%q}}`, msg, "invalid_request_error", code)
 }
 
-// Authenticate 鉴权中间件：明文常量时间比对（决策 #4）+ 状态/限额校验。
+// Authenticate 鉴权中间件：明文常量时间比对 + 状态校验。
 func (m *Manager) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		plain := extractKey(r)
@@ -129,16 +124,7 @@ func (m *Manager) Authenticate(next http.Handler) http.Handler {
 			openaiError(w, http.StatusForbidden, "key_disabled", "API Key 已停用")
 			return
 		}
-		// 每日限额
-		if matched.DailyLimit > 0 {
-			n, err := m.st.DailyUsageCount(matched.ID)
-			if err == nil && n >= matched.DailyLimit {
-				openaiError(w, http.StatusTooManyRequests, "daily_limit_exceeded",
-					fmt.Sprintf("已达今日限额 %d 次", matched.DailyLimit))
-				return
-			}
-		}
-		info := &KeyInfo{ID: matched.ID, Name: matched.Name, AllowedModels: matched.AllowedList()}
+		info := &KeyInfo{ID: matched.ID, Name: matched.Name}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, info)))
 	})
 }
@@ -146,7 +132,6 @@ func (m *Manager) Authenticate(next http.Handler) http.Handler {
 // RecordUsage 记录一次使用（请求完成时调用）。
 func (m *Manager) RecordUsage(keyID int64, tokens int64) {
 	_ = m.st.IncrementKeyUsage(keyID, tokens)
-	_ = m.st.IncrementDailyUsage(keyID)
 }
 
 func min(a, b int) int {
@@ -155,5 +140,3 @@ func min(a, b int) int {
 	}
 	return b
 }
-
-var _ = time.Now // 保留 time 引用（未来限额重置用）

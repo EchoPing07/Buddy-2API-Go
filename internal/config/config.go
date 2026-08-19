@@ -1,12 +1,11 @@
-// Package config 负责加载与热更新 data/config.json，env（BUDDY2API_*）优先于文件。
+// Package config 加载与热更新配置（data/config.json，env 覆盖）。
 package config
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,8 +15,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Endpoint 描述一套上游端点（中国/国际）。
-// OAuth 设备流 host 与 Upstream 同 host（实测确认）。
+// Endpoint 一套上游端点（中国/国际）。
 type Endpoint struct {
 	Region   string // "cn" | "global"
 	Name     string // "中国" | "国际"
@@ -51,7 +49,7 @@ func EndpointOf(region string) Endpoint {
 // Regions 返回合法 region 列表。
 func Regions() []string { return []string{"cn", "global"} }
 
-// Config 全局配置，见 DEVELOPMENT.md §5.2。
+// Config 全局配置。
 type Config struct {
 	AdminPasswordHash    string `json:"admin_password_hash"`
 	Listen               string `json:"listen"`
@@ -60,6 +58,7 @@ type Config struct {
 	CheckinCron          string `json:"checkin_cron"`
 	ResourceCacheSeconds int    `json:"resource_cache_seconds"`
 	LogRetentionDays     int    `json:"log_retention_days"`
+	LogMaxSizeMB         int    `json:"log_max_size_mb"`
 }
 
 func defaults() Config {
@@ -70,6 +69,7 @@ func defaults() Config {
 		CheckinCron:          "0 0 9 * * *",
 		ResourceCacheSeconds: 300,
 		LogRetentionDays:     90,
+		LogMaxSizeMB:         50,
 	}
 }
 
@@ -91,6 +91,9 @@ func (c *Config) Normalize() {
 	if c.LogRetentionDays <= 0 {
 		c.LogRetentionDays = d.LogRetentionDays
 	}
+	if c.LogMaxSizeMB <= 0 {
+		c.LogMaxSizeMB = d.LogMaxSizeMB
+	}
 }
 
 // Manager 线程安全的配置管理器（读写锁 + 文件持久化）。
@@ -98,12 +101,11 @@ type Manager struct {
 	mu   sync.RWMutex
 	path string
 	cfg  Config
-	// envSets 记录被 env 覆盖的字段名，运行时修改不生效（env 优先级最高）
+	// envSets 记录被 env 覆盖的字段，运行时不可改
 	envSets map[string]bool
 }
 
-// Load 读取 config.json（不存在则用默认值），应用 env 覆盖，
-// 首次启动若无管理密码则随机生成并打印一次。
+// Load 读取 config.json，应用 env 覆盖；首次启动若无管理密码则使用默认值。
 func Load(dataDir string) (*Manager, error) {
 	m := &Manager{path: filepath.Join(dataDir, "config.json"), envSets: map[string]bool{}}
 	cfg := defaults()
@@ -145,8 +147,9 @@ func Load(dataDir string) (*Manager, error) {
 	envBool("BUDDY2API_AUTO_CHECKIN", "auto_checkin", &cfg.AutoCheckin)
 	envInt("BUDDY2API_RESOURCE_CACHE_SECONDS", "resource_cache_seconds", &cfg.ResourceCacheSeconds)
 	envInt("BUDDY2API_LOG_RETENTION_DAYS", "log_retention_days", &cfg.LogRetentionDays)
+	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
 
-	// 管理密码：env 明文 > 文件 hash > 随机生成
+	// 默认管理密码：env > 文件 hash > 内置 "password"（生产请尽快修改）。
 	if pw := strings.TrimSpace(os.Getenv("BUDDY2API_ADMIN_PASSWORD")); pw != "" {
 		hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
 		if err != nil {
@@ -159,10 +162,7 @@ func Load(dataDir string) (*Manager, error) {
 	}
 	firstRun := false
 	if cfg.AdminPasswordHash == "" {
-		pw, err := randomPassword(12)
-		if err != nil {
-			return nil, err
-		}
+		const pw = "password"
 		hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
 		if err != nil {
 			return nil, fmt.Errorf("哈希管理密码失败: %w", err)
@@ -173,7 +173,7 @@ func Load(dataDir string) (*Manager, error) {
 		if err := m.saveLocked(); err != nil {
 			return nil, err
 		}
-		slog.Warn("首次启动：已生成管理后台随机密码（只显示这一次，请立即登录修改）",
+		slog.Warn("首次启动：未设置管理密码，已使用默认密码（请尽快在管理后台修改）",
 			"password", pw)
 	}
 	m.cfg = cfg
@@ -192,15 +192,14 @@ func (m *Manager) Get() Config {
 	return m.cfg
 }
 
-// Effective 返回经 env 重放的配置（env 字段运行时不可被 PUT 覆盖）。
+// Effective 返回当前配置（env 字段运行时不可被 PUT 覆盖）。
 func (m *Manager) Effective() Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.cfg
 }
 
-// Update 在锁内修改配置并落盘。fn 返回 error 则放弃修改。
-// listen 与 admin_password_hash 不经此接口修改（前者需重启，后者走改密码逻辑）。
+// Update 在锁内修改配置并落盘，fn 返回 error 则放弃修改。
 func (m *Manager) Update(fn func(*Config) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -208,7 +207,7 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	if err := fn(&nc); err != nil {
 		return err
 	}
-	// env 覆盖的字段改回 env 值（保持优先级）
+	// env 覆盖的字段保持 env 值
 	if m.envSets["region"] {
 		nc.Region = m.cfg.Region
 	}
@@ -223,6 +222,12 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["log_retention_days"] {
 		nc.LogRetentionDays = m.cfg.LogRetentionDays
+	}
+	if m.envSets["listen"] {
+		nc.Listen = m.cfg.Listen
+	}
+	if m.envSets["log_max_size_mb"] {
+		nc.LogMaxSizeMB = m.cfg.LogMaxSizeMB
 	}
 	nc.Normalize()
 	old := m.cfg
@@ -268,16 +273,26 @@ func (m *Manager) saveLocked() error {
 	return os.WriteFile(m.path, data, 0o600)
 }
 
-// randomPassword 生成 n 位字母数字密码。
-func randomPassword(n int) (string, error) {
-	const alphabet = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"
-	var sb strings.Builder
-	for i := 0; i < n; i++ {
-		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
-		if err != nil {
-			return "", err
-		}
-		sb.WriteByte(alphabet[idx.Int64()])
+// ValidateListen 校验监听地址格式（host:port）。
+func ValidateListen(listen string) error {
+	listen = strings.TrimSpace(listen)
+	if listen == "" {
+		return fmt.Errorf("监听地址不能为空")
 	}
-	return sb.String(), nil
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("格式应为 host:port（如 127.0.0.1:10082 或 0.0.0.0:8080）")
+	}
+	if port == "" {
+		return fmt.Errorf("缺少端口")
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("端口须为 1-65535")
+	}
+	if host != "" && host != "localhost" && net.ParseIP(host) == nil {
+		return fmt.Errorf("host 须为合法 IP（或留空监听全部接口）")
+	}
+	return nil
 }
+

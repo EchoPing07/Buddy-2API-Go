@@ -6,8 +6,7 @@ import (
 	"time"
 )
 
-// builtinCraftModels 内置默认模型表（2026-08 实测快照，DEVELOPMENT.md §6.6）。
-// 未登录或 /v3/config 拉取失败时回退使用。
+// builtinCraftModels 内置默认模型表，未登录或拉取失败时回退使用。
 var builtinCraftModels = map[string][]string{
 	"cn": {
 		"auto", "hy3", "glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo",
@@ -21,8 +20,7 @@ var builtinCraftModels = map[string][]string{
 	},
 }
 
-// ModelCache 内存模型列表缓存：启动时拉取，region 切换/手动刷新时重拉，
-// 失败回退内置默认表。
+// ModelCache 内存模型列表缓存，失败回退内置默认表。
 type ModelCache struct {
 	mu        sync.RWMutex
 	region    string
@@ -42,8 +40,7 @@ func NewModelCache(region string, client *Client) *ModelCache {
 	return mc
 }
 
-// Refresh 按当前 region 重新拉取 /v3/config；失败时若 region 与缓存一致则保留旧数据，
-// 否则回退内置表。返回错误供调用方感知。
+// Refresh 按当前 region 重新拉取 /v3/config，失败则保留旧数据或回退内置表。
 func (mc *ModelCache) Refresh(client *Client) error {
 	region := client.regionProvider()
 	cfg, err := client.FetchConfig()

@@ -1,7 +1,4 @@
-// Package upstream 封装 CodeBuddy 上游客户端：chat 转发、token 刷新、
-// OAuth 设备流、billing、签到、/v3/config 模型列表，以及 CLI 指纹头。
-//
-// 指纹头逐字移植自 tests/fingerprint.go（实测验证），规范见 DEVELOPMENT.md §7。
+// Package upstream CodeBuddy 上游客户端：chat 转发、token 刷新、OAuth、billing、签到、模型列表与指纹头。
 package upstream
 
 import (
@@ -43,8 +40,7 @@ func stainlessOS() string {
 	}
 }
 
-// originFor 按 domain 推导 Origin/Referer（与 tests originFor() 一致，实测可用）：
-// 含 workbuddy → 国际 Origin，否则一律中国 Origin（国际端点亦发 cn Origin）。
+// originFor 按 domain 推导 Origin/Referer：含 workbuddy 用国际，否则用中国。
 func originFor(domain string) string {
 	if strings.Contains(strings.ToLower(domain), "workbuddy") {
 		return "https://www.workbuddy.ai"
@@ -114,8 +110,7 @@ func commonHeaders(domain string) http.Header {
 	return h
 }
 
-// chatHeaders chat 请求头：通用 + 账号 + IDE/CLI + SDK。
-// 红线：绝不带 X-Refresh-Token。
+// chatHeaders chat 请求头：通用 + 账号 + IDE/CLI + SDK（绝不带 refresh_token）。
 func chatHeaders(t *auth.Token) http.Header {
 	h := commonHeaders(t.Domain)
 
@@ -196,7 +191,7 @@ func refreshHeaders(t *auth.Token) http.Header {
 	return h
 }
 
-// oauthHeaders OAuth 启动/轮询头：无账号，X-No-* 标记（值 true，实测可用）。
+// oauthHeaders OAuth 启动/轮询头：无账号，X-No-* 标记。
 func oauthHeaders() http.Header {
 	h := http.Header{}
 	h.Set("Accept", "application/json, text/plain, */*")
@@ -204,7 +199,7 @@ func oauthHeaders() http.Header {
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Pragma", "no-cache")
 	h.Set("X-Requested-With", "XMLHttpRequest")
-	h.Set("X-Domain", "www.codebuddy.ai") // 固定值，中国端点同样如此（实测可登录）
+	h.Set("X-Domain", "www.codebuddy.ai") // 固定值，中国端点同样适用
 	h.Set("X-No-Authorization", "true")
 	h.Set("X-No-User-Id", "true")
 	h.Set("X-No-Enterprise-Id", "true")
@@ -218,7 +213,7 @@ func oauthHeaders() http.Header {
 	return h
 }
 
-// configHeaders /v3/config 用 VSCode 指纹（实测可用）。
+// configHeaders /v3/config 用 VSCode 指纹。
 func configHeaders(t *auth.Token) http.Header {
 	h := http.Header{}
 	h.Set("Accept", "application/json, text/plain, */*")

@@ -1,5 +1,4 @@
-// Package proxy 实现 OpenAI 兼容业务端点：
-// POST /v1/chat/completions（流式透传/非流式聚合）、GET /v1/models、GET /health。
+// Package proxy 实现 OpenAI 兼容业务端点（/v1/chat/completions、/v1/models、/health）。
 package proxy
 
 import (
@@ -20,7 +19,7 @@ import (
 	"buddy2api-go/internal/upstream"
 )
 
-// passthroughBodyKeys 透传白名单（同 tests，参考 wicm PASSTHROUGH_BODY_KEYS）。
+// passthroughBodyKeys 透传字段白名单。
 var passthroughBodyKeys = []string{
 	"model", "messages", "tools", "tool_choice", "temperature",
 	"max_tokens", "max_completion_tokens", "top_p", "stream",
@@ -29,7 +28,7 @@ var passthroughBodyKeys = []string{
 	"verbosity", "reasoning_summary",
 }
 
-// thoughtPrefixRE 上游 reasoning_content 的 "Thought: Xms\n" 前缀（参考 cyl）。
+// thoughtPrefixRE 上游 reasoning_content 的 "Thought: Xms\n" 前缀。
 var thoughtPrefixRE = regexp.MustCompile(`(?s)^\s*Thought: \d+ms\n`)
 
 const maxBodySize = 48 << 20 // 48MB
@@ -82,7 +81,7 @@ func openaiError(w http.ResponseWriter, status int, errType, code, msg string) {
 	fmt.Fprintf(w, `{"error":{"message":%q,"type":%q,"code":%q}}`, msg, errType, code)
 }
 
-// ─────────────────────────── chat/completions ───────────────────────────
+// ── chat/completions ──
 
 // Chat 处理 POST /v1/chat/completions。
 func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
@@ -103,20 +102,6 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		openaiError(w, http.StatusBadRequest, "invalid_request_error", "missing_model", "缺少 model 字段")
 		return
-	}
-	if key != nil && len(key.AllowedModels) > 0 {
-		allowed := false
-		for _, m := range key.AllowedModels {
-			if m == model {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			openaiError(w, http.StatusForbidden, "invalid_request_error", "model_not_allowed",
-				"模型 "+model+" 不在当前 Key 允许列表")
-			return
-		}
 	}
 	streamWanted := false
 	if v, ok := body["stream"].(bool); ok {
@@ -343,8 +328,7 @@ func (h *Handler) aggregate(r *http.Request, body io.Reader, reqBody map[string]
 	logEntry.StatusCode = http.StatusOK
 	applyAggToLog(agg, logEntry)
 
-	// 工具停转防护（DEVELOPMENT.md §9.1）：带 tools 且历史含 tool 结果，
-	// 上游以 stop+纯文本结束未调工具 → tool_choice=required 重试一次
+	// 工具停转防护：带 tools 且历史含 tool 结果，上游以 stop+纯文本结束未调工具 → tool_choice=required 重试一次
 	if needToolRetry(reqBody, agg) {
 		slog.Info("检测到工具停转，使用 tool_choice=required 重试一次", "model", logEntry.Model)
 		var retryBody map[string]any
@@ -489,7 +473,7 @@ func (a *aggregated) completionJSON() []byte {
 		msg["tool_calls"] = tcs
 	}
 
-	// finish_reason 修正（参考 cyl）：空则按内容推断
+	// finish_reason 修正：空则按内容推断
 	finish := a.FinishReason
 	if finish == "" {
 		if len(a.ToolCalls) > 0 {
@@ -560,7 +544,7 @@ func applyAggToLog(agg *aggregated, l *store.LogEntry) {
 	}
 }
 
-// ─────────────────────────── models / health ───────────────────────────
+// ── models / health ──
 
 // Models 处理 GET /v1/models。
 func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
@@ -595,7 +579,7 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // Version 由 main 通过 ldflags 注入（-X buddy2api-go/internal/proxy.Version=...）。
 var Version = "dev"
 
-// ─────────────────────────── util ───────────────────────────
+// ── util ──
 
 func keyID(k *apikey.KeyInfo) int64 {
 	if k == nil {

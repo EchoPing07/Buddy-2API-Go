@@ -17,7 +17,7 @@ import (
 // ErrNoToken 表示尚未登录（token.json 不存在）。
 var ErrNoToken = errors.New("尚未登录，请先在管理后台扫码登录")
 
-// Token 账号凭证，仅 OAuth 模式（api_key 模式已裁剪，见 DEVELOPMENT.md 决策 #5）。
+// Token 账号凭证（OAuth 模式）。
 type Token struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
@@ -142,7 +142,7 @@ func (s *TokenStore) Load() error {
 	if err := json.Unmarshal(raw, &t); err != nil {
 		return fmt.Errorf("解析 token.json: %w", err)
 	}
-	// 补提 JWT 里的 nickname（旧文件可能没存）
+	// 补提 nickname（旧文件可能没存）
 	if t.Nickname == "" && t.AccessToken != "" {
 		if _, _, _, nick, _, err := ParseJWT(t.AccessToken); err == nil {
 			t.Nickname = nick
@@ -200,8 +200,7 @@ func (s *TokenStore) Clear() error {
 	return nil
 }
 
-// EnsureValid 单飞地确保 token 未过期：过期则调用 refreshFn 刷新并落盘。
-// refreshFn 在持锁状态下执行（网络调用），天然避免并发重复刷新。
+// EnsureValid 单飞刷新过期 token；refreshFn 持锁执行，避免并发重复刷新。
 func (s *TokenStore) EnsureValid(refreshFn func(t *Token) (*Token, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
