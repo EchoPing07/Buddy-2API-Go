@@ -314,13 +314,21 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 // ── 余额 ──
 
 // resourceAccount 额度包明细。
+//
+// CapacityRemain/Size/Used 为「有效展示值」：当存在周期数据时优先取周期级
+// （CycleCapacity*），否则回退账户级（Capacity*）。CodeBuddy 免费/裂变包按月
+// 周期计费，账户级 CapacityUsed 恒为 0，真实已用落在周期级；直接取账户级会让
+// 前端「已用」恒显 0、进度条恒满。与 references/wicm84266964 effective_remain 一致。
+// CycleRemain/Used/Size 始终为周期级原始值（无周期数据则为 0），供前端细分展示。
 type resourceAccount struct {
 	PackageName    string  `json:"package_name"`
 	ProductName    string  `json:"product_name"`
-	CapacityRemain float64 `json:"capacity_remain"`
-	CapacitySize   float64 `json:"capacity_size"`
-	CapacityUsed   float64 `json:"capacity_used"`
-	CycleRemain    float64 `json:"cycle_remain"`
+	CapacityRemain float64 `json:"capacity_remain"` // 有效剩余（周期优先）
+	CapacitySize   float64 `json:"capacity_size"`   // 有效总量（周期优先）
+	CapacityUsed   float64 `json:"capacity_used"`   // 有效已用（周期优先）
+	CycleRemain    float64 `json:"cycle_remain"`    // 本周期剩余
+	CycleUsed      float64 `json:"cycle_used"`      // 本周期已用
+	CycleSize      float64 `json:"cycle_size"`      // 本周期总量
 	CapacityUnit   string  `json:"capacity_unit"`
 	PackageType    string  `json:"package_type"`
 	ResourceType   any     `json:"resource_type"`
@@ -386,15 +394,30 @@ func processResources(raw json.RawMessage) map[string]any {
 			a := resourceAccount{
 				PackageName:    strOr(acc, "PackageName", "ProductName"),
 				ProductName:    str(acc, "ProductName"),
-				CapacityRemain: number(acc["CapacityRemainPrecise"]),
-				CapacitySize:   number(acc["CapacitySizePrecise"]),
-				CapacityUsed:   number(acc["CapacityUsedPrecise"]),
-				CycleRemain:    number(acc["CycleCapacityRemainPrecise"]),
 				CapacityUnit:   toStr(acc["CapacityUnit"]),
 				PackageType:    toStr(acc["PackageType"]),
 				ResourceType:   acc["ResourceType"],
 				AutoRenewFlag:  acc["AutoRenewFlag"],
 				Status:         acc["Status"],
+			}
+			// 账户级与周期级分别取值（Precise → 非Precise 回退）。
+			acctRemain := numField(acc, "CapacityRemainPrecise", "CapacityRemain")
+			acctSize := numField(acc, "CapacitySizePrecise", "CapacitySize")
+			acctUsed := numField(acc, "CapacityUsedPrecise", "CapacityUsed")
+			cycRemain := numField(acc, "CycleCapacityRemainPrecise", "CycleCapacityRemain")
+			cycUsed := numField(acc, "CycleCapacityUsedPrecise", "CycleCapacityUsed")
+			cycSize := numField(acc, "CycleCapacitySizePrecise", "CycleCapacitySize")
+			if cycSize == 0 {
+				cycSize = acctSize // 周期总量缺失回退账户总量（与参考契约一致）
+			}
+			// 有效展示值：存在周期数据（剩余或已用 > 0）时优先用周期级，否则用账户级。
+			// CodeBuddy 免费/裂变包按月计费，账户级 CapacityUsed 恒为 0，真实已用
+			// 落在 CycleCapacityUsed；不做周期优先会让「已用」恒显 0、进度条恒满。
+			a.CycleRemain, a.CycleUsed, a.CycleSize = cycRemain, cycUsed, cycSize
+			if cycRemain > 0 || cycUsed > 0 {
+				a.CapacityRemain, a.CapacitySize, a.CapacityUsed = cycRemain, cycSize, cycUsed
+			} else {
+				a.CapacityRemain, a.CapacitySize, a.CapacityUsed = acctRemain, acctSize, acctUsed
 			}
 			// 到期时间按上游契约回退：ExpiredTime → DeductionEndTime → CycleEndTime。
 			// 实测免费/裂变包 ExpiredTime 常为空，真正到期落在 Deduction/Cycle 字段。
@@ -743,6 +766,31 @@ func number(v any) float64 {
 		var f float64
 		_, _ = fmt.Sscanf(n, "%g", &f)
 		return f
+	}
+	return 0
+}
+
+// numField 按优先级依次尝试 keys，返回首个“有值”字段的解析结果，与参考实现
+// _to_float(precise, _to_float(nonPrecise)) 语义一致：nil / 空串 / 解析失败视为无值
+// 并回退到下一个 key；"0" 是合法零值，不触发回退。用于额度包的 capacity 数值字段，
+// 上游对免费/裂变包常只返回非 Precise 字段或 Precise 为空串，缺少回退会导致
+// “已用/剩余/总量”恒为 0。
+func numField(acc map[string]any, keys ...string) float64 {
+	for _, k := range keys {
+		switch n := acc[k].(type) {
+		case nil:
+			continue
+		case string:
+			if strings.TrimSpace(n) == "" {
+				continue
+			}
+			var f float64
+			if _, err := fmt.Sscanf(n, "%g", &f); err == nil {
+				return f
+			}
+		case float64:
+			return n
+		}
 	}
 	return 0
 }

@@ -3,9 +3,18 @@ package admin
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 )
+
+// daysLeftStr 把 *int 转为可读串（nil → "nil"），避免 t.Logf 用 %v 打印指针地址。
+func daysLeftStr(p *int) string {
+	if p == nil {
+		return "nil"
+	}
+	return strconv.Itoa(*p)
+}
 
 // buildEnvelope 按上游 get-user-resource 真实响应结构（data.Response.Data）构造测试数据，
 // 日期相对 now 偏移，保证测试不随时间失效。
@@ -46,8 +55,8 @@ func TestProcessResourcesExpireFallback(t *testing.T) {
 	byName := map[string]resourceAccount{}
 	for _, a := range accs {
 		byName[a.PackageName] = a
-		t.Logf("%s: expire_time=%q days_left=%v expired=%v warn=%q",
-			a.PackageName, a.ExpireTime, a.DaysLeft, a.Expired, a.Warn)
+		t.Logf("%s: expire_time=%q days_left=%s expired=%v warn=%q",
+			a.PackageName, a.ExpireTime, daysLeftStr(a.DaysLeft), a.Expired, a.Warn)
 	}
 
 	// 1) ExpiredTime 空 → 应回退到 DeductionEndTime（数字 ms），展示串非空、days_left 解析出来
@@ -92,4 +101,154 @@ func TestProcessResourcesExpireFallback(t *testing.T) {
 	}
 
 	_ = json.Marshal
+}
+
+// TestProcessResourcesCapacityFallback 验证额度包数值字段的 Precise → 非Precise 回退。
+//
+// 这些用例均不含周期字段（hasCycle=false），有效值=账户级，专门测回退链。
+// 复现 bug：上游对某些包只返回非 Precise 字段或 Precise 为空串，旧实现仅读 *Precise，
+// 导致“已用”一栏恒为 0。修复后按 Precise → 非Precise 取首个有值字段（空串/nil 回退，
+// "0" 不回退），与 references/wicm84266964-Buddy2api 契约一致。
+func TestProcessResourcesCapacityFallback(t *testing.T) {
+	tpl := `{"code":0,"data":{"Response":{"Data":{
+		"TotalDosage": 1000, "TotalCount": 4,
+		"Accounts": [
+			{"PackageName":"A_仅Precise字符串","CapacityRemainPrecise":"400.5","CapacitySizePrecise":"500","CapacityUsedPrecise":"99.5","ExpiredTime":""},
+			{"PackageName":"B_Precise为空回退非Precise","CapacityRemainPrecise":"","CapacitySizePrecise":"","CapacityUsedPrecise":"","CapacityRemain":"400","CapacitySize":"500","CapacityUsed":"99","ExpiredTime":""},
+			{"PackageName":"C_完全无Precise","CapacityRemain":"300","CapacitySize":"600","CapacityUsed":"300","ExpiredTime":""},
+			{"PackageName":"D_Precise为零不回退","CapacityUsedPrecise":"0","CapacityUsed":"999","CapacityRemainPrecise":"500","CapacitySizePrecise":"500","ExpiredTime":""}
+		]
+	}}}}`
+	out := processResources([]byte(tpl))
+	accs, ok := out["accounts"].([]resourceAccount)
+	if !ok || len(accs) != 4 {
+		t.Fatalf("accounts 解析异常: ok=%v len=%v", ok, len(accs))
+	}
+	byName := map[string]resourceAccount{}
+	for _, a := range accs {
+		byName[a.PackageName] = a
+	}
+
+	cases := []struct {
+		name                       string
+		wantUsed, wantRemain, wantSize float64
+	}{
+		{"A_仅Precise字符串", 99.5, 400.5, 500},
+		{"B_Precise为空回退非Precise", 99, 400, 500},
+		{"C_完全无Precise", 300, 300, 600},
+		{"D_Precise为零不回退", 0, 500, 500},
+	}
+	for _, c := range cases {
+		a, ok := byName[c.name]
+		if !ok {
+			t.Fatalf("缺少用例 %q", c.name)
+		}
+		if a.CapacityUsed != c.wantUsed {
+			t.Errorf("%s capacity_used=%v，期望 %v", c.name, a.CapacityUsed, c.wantUsed)
+		}
+		if a.CapacityRemain != c.wantRemain {
+			t.Errorf("%s capacity_remain=%v，期望 %v", c.name, a.CapacityRemain, c.wantRemain)
+		}
+		if a.CapacitySize != c.wantSize {
+			t.Errorf("%s capacity_size=%v，期望 %v", c.name, a.CapacitySize, c.wantSize)
+		}
+		t.Logf("%s: used=%v remain=%v size=%v", c.name, a.CapacityUsed, a.CapacityRemain, a.CapacitySize)
+	}
+}
+
+// TestProcessResourcesCyclePreferred 验证存在周期数据时，有效展示值优先取周期级。
+//
+// 复现 bug：CodeBuddy 免费/裂变包按月周期计费，账户级 CapacityUsed 恒为 0，
+// 真实已用落在 CycleCapacityUsed。旧实现只提取账户级，前端「已用」恒显 0、
+// 进度条恒满。修复后：周期级 Remain/Used 任一 > 0 时，capacity_* 取周期值，
+// 并额外暴露 cycle_used/cycle_size；周期总量缺失回退账户总量。
+func TestProcessResourcesCyclePreferred(t *testing.T) {
+	tpl := `{"code":0,"data":{"Response":{"Data":{
+		"TotalDosage": 1000, "TotalCount": 3,
+		"Accounts": [
+			{"PackageName":"E_真实已用","CapacityRemainPrecise":"500","CapacitySizePrecise":"500","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"335.48","CycleCapacitySizePrecise":"500","CycleCapacityUsedPrecise":"164.52","ExpiredTime":""},
+			{"PackageName":"F_周期全零用账户级","CapacityRemainPrecise":"500","CapacitySizePrecise":"500","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"0","CycleCapacityUsedPrecise":"0","CycleCapacitySizePrecise":"500","ExpiredTime":""},
+			{"PackageName":"G_周期总量缺失回退账户","CapacityRemainPrecise":"500","CapacitySizePrecise":"500","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"100","CycleCapacityUsedPrecise":"50","ExpiredTime":""}
+		]
+	}}}}`
+	out := processResources([]byte(tpl))
+	accs, ok := out["accounts"].([]resourceAccount)
+	if !ok || len(accs) != 3 {
+		t.Fatalf("accounts 解析异常: ok=%v len=%v", ok, len(accs))
+	}
+	byName := map[string]resourceAccount{}
+	for _, a := range accs {
+		byName[a.PackageName] = a
+	}
+
+	// E：账户 used=0 但周期 used=164.52 → 有效已用应为 164.52（核心修复点）
+	if a := byName["E_真实已用"]; a.PackageName == "" {
+		t.Fatal("缺少 E 用例")
+	} else {
+		if a.CapacityUsed != 164.52 {
+			t.Errorf("E capacity_used=%v，期望 164.52（周期优先）", a.CapacityUsed)
+		}
+		if a.CapacityRemain != 335.48 {
+			t.Errorf("E capacity_remain=%v，期望 335.48", a.CapacityRemain)
+		}
+		if a.CapacitySize != 500 {
+			t.Errorf("E capacity_size=%v，期望 500", a.CapacitySize)
+		}
+		if a.CycleUsed != 164.52 || a.CycleSize != 500 || a.CycleRemain != 335.48 {
+			t.Errorf("E cycle 字段错: remain=%v used=%v size=%v", a.CycleRemain, a.CycleUsed, a.CycleSize)
+		}
+		t.Logf("E: effective used=%v remain=%v size=%v | cycle used=%v remain=%v size=%v",
+			a.CapacityUsed, a.CapacityRemain, a.CapacitySize, a.CycleUsed, a.CycleRemain, a.CycleSize)
+	}
+
+	// F：周期 Remain=0 且 Used=0 → 无周期活动，用账户级（used=0）
+	if a := byName["F_周期全零用账户级"]; a.PackageName == "" {
+		t.Fatal("缺少 F 用例")
+	} else {
+		if a.CapacityUsed != 0 {
+			t.Errorf("F capacity_used=%v，期望 0（周期全零回退账户级）", a.CapacityUsed)
+		}
+		if a.CapacityRemain != 500 {
+			t.Errorf("F capacity_remain=%v，期望 500（账户级）", a.CapacityRemain)
+		}
+		t.Logf("F: effective used=%v remain=%v size=%v", a.CapacityUsed, a.CapacityRemain, a.CapacitySize)
+	}
+
+	// G：周期有活动但无 CycleCapacitySize → 周期总量回退账户总量
+	if a := byName["G_周期总量缺失回退账户"]; a.PackageName == "" {
+		t.Fatal("缺少 G 用例")
+	} else {
+		if a.CapacityUsed != 50 || a.CapacityRemain != 100 || a.CapacitySize != 500 {
+			t.Errorf("G effective 错: used=%v remain=%v size=%v（期望 50/100/500）", a.CapacityUsed, a.CapacityRemain, a.CapacitySize)
+		}
+		if a.CycleSize != 500 {
+			t.Errorf("G cycle_size=%v，期望 500（回退账户总量）", a.CycleSize)
+		}
+		t.Logf("G: effective used=%v remain=%v size=%v | cycle_size=%v", a.CapacityUsed, a.CapacityRemain, a.CapacitySize, a.CycleSize)
+	}
+}
+
+// TestNumField 覆盖 numField 的回退与容错路径。
+func TestNumField(t *testing.T) {
+	cases := []struct {
+		name string
+		acc  map[string]any
+		keys []string
+		want float64
+	}{
+		{"首个有值", map[string]any{"a": "1.5"}, []string{"a", "b"}, 1.5},
+		{"空串回退下一个", map[string]any{"a": "", "b": "2.5"}, []string{"a", "b"}, 2.5},
+		{"nil 回退下一个", map[string]any{"a": nil, "b": 3.5}, []string{"a", "b"}, 3.5},
+		{"\"0\" 不回退（合法零）", map[string]any{"a": "0", "b": "999"}, []string{"a", "b"}, 0},
+		{"float64 零不回退", map[string]any{"a": float64(0), "b": "999"}, []string{"a", "b"}, 0},
+		{"Precise 不可解析→回退非Precise", map[string]any{"a": "abc", "b": "7.5"}, []string{"a", "b"}, 7.5},
+		{"全部缺失→0", map[string]any{}, []string{"a", "b"}, 0},
+		{"含空白字符的串", map[string]any{"a": "  4.5  "}, []string{"a"}, 4.5},
+	}
+	for _, c := range cases {
+		got := numField(c.acc, c.keys...)
+		if got != c.want {
+			t.Errorf("%s: numField=%v，期望 %v", c.name, got, c.want)
+		}
+	}
 }
