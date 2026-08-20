@@ -69,7 +69,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := upstream.New(toks, func() string { return cfg.Get().Region })
+	client := upstream.New(toks, func() string { return cfg.Get().Region }, cfg.Get().ChatTimeoutSeconds)
 	models := upstream.NewModelCache(cfg.Get().Region, client)
 	keys := apikey.New(st)
 	sched := scheduler.New(cfg, client, st)

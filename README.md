@@ -186,6 +186,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `BUDDY2API_RESOURCE_CACHE_SECONDS` | 余额缓存秒数（默认 300） |
 | `BUDDY2API_LOG_RETENTION_DAYS` | 日志保留天数（默认 90） |
 | `BUDDY2API_LOG_MAX_SIZE_MB` | 日志表容量上限 MB（默认 50） |
+| `BUDDY2API_CHAT_TIMEOUT_SECONDS` | chat 上游响应头超时秒数（默认 60）。只管上游多久不开始响应即判死，流式开始后（含长思考）不再受总超时截断；改后需重启生效 |
 | `BUDDY2API_DATA_DIR` | 数据目录（默认 `./data`） |
 
 指纹头伪装另有 `CB_GATEWAY_USER_AGENT` / `CB_GATEWAY_STAINLESS_OS` 等可选 env（一般无需修改），完整变量见 [.env.example](.env.example)。

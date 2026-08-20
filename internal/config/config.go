@@ -59,6 +59,7 @@ type Config struct {
 	ResourceCacheSeconds int    `json:"resource_cache_seconds"`
 	LogRetentionDays     int    `json:"log_retention_days"`
 	LogMaxSizeMB         int    `json:"log_max_size_mb"`
+	ChatTimeoutSeconds   int    `json:"chat_timeout_seconds"`
 }
 
 func defaults() Config {
@@ -70,6 +71,7 @@ func defaults() Config {
 		ResourceCacheSeconds: 300,
 		LogRetentionDays:     90,
 		LogMaxSizeMB:         50,
+		ChatTimeoutSeconds:   60,
 	}
 }
 
@@ -93,6 +95,9 @@ func (c *Config) Normalize() {
 	}
 	if c.LogMaxSizeMB <= 0 {
 		c.LogMaxSizeMB = d.LogMaxSizeMB
+	}
+	if c.ChatTimeoutSeconds <= 0 {
+		c.ChatTimeoutSeconds = d.ChatTimeoutSeconds
 	}
 }
 
@@ -148,6 +153,7 @@ func Load(dataDir string) (*Manager, error) {
 	envInt("BUDDY2API_RESOURCE_CACHE_SECONDS", "resource_cache_seconds", &cfg.ResourceCacheSeconds)
 	envInt("BUDDY2API_LOG_RETENTION_DAYS", "log_retention_days", &cfg.LogRetentionDays)
 	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
+	envInt("BUDDY2API_CHAT_TIMEOUT_SECONDS", "chat_timeout_seconds", &cfg.ChatTimeoutSeconds)
 
 	// 默认管理密码：env > 文件 hash > 内置 "password"（生产请尽快修改）。
 	if pw := strings.TrimSpace(os.Getenv("BUDDY2API_ADMIN_PASSWORD")); pw != "" {
@@ -228,6 +234,9 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["log_max_size_mb"] {
 		nc.LogMaxSizeMB = m.cfg.LogMaxSizeMB
+	}
+	if m.envSets["chat_timeout_seconds"] {
+		nc.ChatTimeoutSeconds = m.cfg.ChatTimeoutSeconds
 	}
 	nc.Normalize()
 	old := m.cfg

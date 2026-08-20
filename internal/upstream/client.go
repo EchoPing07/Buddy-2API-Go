@@ -26,10 +26,14 @@ type Client struct {
 	regionProvider func() string
 }
 
-// New 创建上游客户端。
-func New(toks *auth.TokenStore, regionProvider func() string) *Client {
+// New 创建上游客户端。chatTimeoutSeconds 设置 chat 上游的响应头超时（上游多久不开始
+// 响应即判死），仅在构建 Transport 时生效一次，运行时修改需重启；一旦进入流式阶段，
+// 只要持续吐字节（含 reasoning 思考流）就不再被本端总超时截断，客户端断开由请求 context 兜底。
+func New(toks *auth.TokenStore, regionProvider func() string, chatTimeoutSeconds int) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = time.Duration(chatTimeoutSeconds) * time.Second
 	return &Client{
-		long:           &http.Client{Timeout: 10 * time.Minute},
+		long:           &http.Client{Transport: transport},
 		short:          &http.Client{Timeout: 30 * time.Second},
 		toks:           toks,
 		regionProvider: regionProvider,
