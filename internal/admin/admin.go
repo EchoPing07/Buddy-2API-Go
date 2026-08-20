@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -413,14 +414,19 @@ func processResources(raw json.RawMessage) map[string]any {
 		}
 	}
 	// 按到期时间升序（未知的排最后）
-	for i := 0; i < len(accounts); i++ {
-		for j := i + 1; j < len(accounts); j++ {
-			pi, pj := accounts[i].DaysLeft, accounts[j].DaysLeft
-			if pj != nil && (pi == nil || *pj < *pi) {
-				accounts[i], accounts[j] = accounts[j], accounts[i]
-			}
+	sort.Slice(accounts, func(i, j int) bool {
+		pi, pj := accounts[i].DaysLeft, accounts[j].DaysLeft
+		switch {
+		case pi == nil && pj == nil:
+			return false
+		case pi == nil:
+			return false // i 未知 → 排后
+		case pj == nil:
+			return true // j 未知 → i 排前
+		default:
+			return *pi < *pj
 		}
-	}
+	})
 	out["accounts"] = accounts
 	return out
 }

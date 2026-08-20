@@ -2,7 +2,7 @@ services:
   buddy2api:
     build: .
     ports:
-      - "127.0.0.1:10082:10082"
+      - "0.0.0.0:10082:10082"   # 全网卡监听，局域网可访问；仅本机使用可改回 127.0.0.1:10082:10082
     volumes:
       - ./data:/app/data
     environment:

@@ -7,8 +7,10 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"buddy2api-go/internal/store"
 )
@@ -28,10 +30,51 @@ func FromContext(ctx context.Context) *KeyInfo {
 }
 
 // Manager key 管理器。
-type Manager struct{ st *store.Store }
+//
+// cache 在内存中持有全量 key 副本，鉴权路径无需每请求查库；
+// Create/Update/Delete 后 reload 刷新缓存。usageCh 把用量更新异步落库，
+// 避免请求 defer 上的同步写库阻塞热路径（原实现每请求 SELECT 全表 + 同步 UPDATE）。
+type Manager struct {
+	st      *store.Store
+	mu      sync.RWMutex
+	cache   []store.APIKey
+	usageCh chan usageUpdate
+}
 
-// New 创建管理器。
-func New(st *store.Store) *Manager { return &Manager{st: st} }
+type usageUpdate struct {
+	keyID  int64
+	tokens int64
+}
+
+// New 创建管理器并加载缓存、启动用量更新 worker。
+func New(st *store.Store) *Manager {
+	m := &Manager{st: st, usageCh: make(chan usageUpdate, 256)}
+	if err := m.reload(); err != nil {
+		slog.Error("加载 API Key 缓存失败", "error", err)
+	}
+	go m.usageWorker()
+	return m
+}
+
+// reload 从库重新加载全量 key 到缓存。
+func (m *Manager) reload() error {
+	keys, err := m.st.ListKeys()
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.cache = keys
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) usageWorker() {
+	for u := range m.usageCh {
+		if err := m.st.IncrementKeyUsage(u.keyID, u.tokens); err != nil {
+			slog.Error("更新 key 用量失败", "error", err)
+		}
+	}
+}
 
 // GenerateKey 生成随机 key：sk- + 24 字节 hex。
 func GenerateKey() (string, error) {
@@ -62,6 +105,9 @@ func (m *Manager) Create(name, custom string) (*store.APIKey, error) {
 	if err := m.st.CreateKey(k); err != nil {
 		return nil, err
 	}
+	if err := m.reload(); err != nil {
+		slog.Warn("刷新 key 缓存失败", "error", err)
+	}
 	return k, nil
 }
 
@@ -70,11 +116,25 @@ func (m *Manager) List() ([]store.APIKey, error) { return m.st.ListKeys() }
 
 // Update 更新。
 func (m *Manager) Update(id int64, name, status *string) error {
-	return m.st.UpdateKey(id, name, status)
+	if err := m.st.UpdateKey(id, name, status); err != nil {
+		return err
+	}
+	if err := m.reload(); err != nil {
+		slog.Warn("刷新 key 缓存失败", "error", err)
+	}
+	return nil
 }
 
 // Delete 删除。
-func (m *Manager) Delete(id int64) error { return m.st.DeleteKey(id) }
+func (m *Manager) Delete(id int64) error {
+	if err := m.st.DeleteKey(id); err != nil {
+		return err
+	}
+	if err := m.reload(); err != nil {
+		slog.Warn("刷新 key 缓存失败", "error", err)
+	}
+	return nil
+}
 
 // extractKey 从请求头提取 key：Authorization: Bearer <key> 或 X-API-Key: <key>。
 func extractKey(r *http.Request) string {
@@ -103,20 +163,19 @@ func (m *Manager) Authenticate(next http.Handler) http.Handler {
 			openaiError(w, http.StatusUnauthorized, "invalid_api_key", "缺少 API Key（Authorization: Bearer <key> 或 X-API-Key）")
 			return
 		}
-		keys, err := m.st.ListKeys()
-		if err != nil {
-			openaiError(w, http.StatusInternalServerError, "internal_error", "读取 key 列表失败")
-			return
-		}
-		var matched *store.APIKey
+		m.mu.RLock()
+		keys := m.cache
+		m.mu.RUnlock()
+		var matched store.APIKey
+		found := false
 		for i := range keys {
-			// 常量时间比对，防时序侧信道
+			// 常量时间比对，防时序侧信道；不 break，使总耗时与命中位置无关
 			if subtle.ConstantTimeCompare([]byte(plain), []byte(keys[i].KeyPlain)) == 1 {
-				matched = &keys[i]
-				break
+				matched = keys[i]
+				found = true
 			}
 		}
-		if matched == nil {
+		if !found {
 			openaiError(w, http.StatusUnauthorized, "invalid_api_key", "API Key 无效")
 			return
 		}
@@ -129,9 +188,13 @@ func (m *Manager) Authenticate(next http.Handler) http.Handler {
 	})
 }
 
-// RecordUsage 记录一次使用（请求完成时调用）。
+// RecordUsage 异步记录一次使用（请求完成时调用）；队列满则丢弃，不阻塞热路径。
 func (m *Manager) RecordUsage(keyID int64, tokens int64) {
-	_ = m.st.IncrementKeyUsage(keyID, tokens)
+	select {
+	case m.usageCh <- usageUpdate{keyID, tokens}:
+	default:
+		slog.Warn("用量更新队列已满，丢弃一次更新")
+	}
 }
 
 func min(a, b int) int {

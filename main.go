@@ -62,7 +62,6 @@ func main() {
 		slog.Error("打开数据库失败", "error", err)
 		os.Exit(1)
 	}
-	defer st.Close()
 
 	toks, err := auth.NewTokenStore(dataDirAbs)
 	if err != nil {
@@ -124,24 +123,37 @@ func main() {
 		Handler:           r,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	serveErr := make(chan struct{}, 1) // ListenAndServe 异常退出信号
 	go func() {
 		slog.Info("HTTP 服务已启动", "listen", listen, "region", cfg.Get().Region)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("HTTP 服务异常退出", "error", err)
-			os.Exit(1)
+			serveErr <- struct{}{}
 		}
 	}()
 
-	// 优雅退出
+	// 优雅退出（收到信号或 HTTP 服务异常退出时走统一关闭路径，确保资源释放）
+	fatal := false
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	slog.Info("正在退出…")
+	select {
+	case <-stop:
+		slog.Info("正在退出…")
+	case <-serveErr:
+		fatal = true
+		slog.Info("HTTP 服务异常，正在退出…")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	sched.Stop()
+	if err := st.Close(); err != nil { // 显式关闭，避免 os.Exit 跳过 defer
+		slog.Error("关闭数据库失败", "error", err)
+	}
 	slog.Info("已退出")
+	if fatal {
+		os.Exit(1)
+	}
 }
 
 func envOr(name, def string) string {

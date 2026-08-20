@@ -81,6 +81,26 @@ func openaiError(w http.ResponseWriter, status int, errType, code, msg string) {
 	fmt.Fprintf(w, `{"error":{"message":%q,"type":%q,"code":%q}}`, msg, errType, code)
 }
 
+// upstreamErrorMessage 解析上游错误体提取可读信息；非 JSON 或解析失败时回退截断原文，
+// 避免把上游 HTML/非 JSON 错误体原样当作 JSON 透传给客户端。
+func upstreamErrorMessage(raw []byte, status int) string {
+	var env struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &env); err == nil && (env.Code != 0 || env.Msg != "") {
+		if env.Msg != "" {
+			return fmt.Sprintf("上游返回 %d（code=%d）: %s", status, env.Code, trunc(env.Msg, 300))
+		}
+		return fmt.Sprintf("上游返回 %d（code=%d）", status, env.Code)
+	}
+	s := strings.TrimSpace(string(raw))
+	if s == "" {
+		return fmt.Sprintf("上游返回 %d 且响应体为空", status)
+	}
+	return fmt.Sprintf("上游返回 %d: %s", status, trunc(s, 300))
+}
+
 // ── chat/completions ──
 
 // Chat 处理 POST /v1/chat/completions。
@@ -135,9 +155,7 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		errRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		logEntry.StatusCode = resp.StatusCode
 		logEntry.ErrorMsg = trunc(string(errRaw), 500)
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(resp.StatusCode)
-		w.Write(errRaw)
+		openaiError(w, resp.StatusCode, "upstream_error", "upstream_error", upstreamErrorMessage(errRaw, resp.StatusCode))
 		return
 	}
 
@@ -195,6 +213,7 @@ type usageJSON struct {
 }
 
 // passthroughSSE 流式透传：逐行转发（Flusher 实时），末尾补全 finish_reason。
+// 写失败/客户端断开统一标记 clientGone 并在循环出口记录 ErrorMsg，避免日志误判成功。
 func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io.Reader, logEntry *store.LogEntry) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -212,12 +231,21 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 	var lastChunk sseChunk
 	clientGone := false
 
+	// writeLine 写入一行；失败标记 clientGone（不再从内部 break，统一在循环出口处理）。
 	writeLine := func(line string) bool {
+		if clientGone {
+			return false
+		}
 		if _, err := io.WriteString(w, line); err != nil {
 			clientGone = true
 			return false
 		}
 		return true
+	}
+	flush := func() {
+		if flusher != nil && !clientGone {
+			flusher.Flush()
+		}
 	}
 
 	for {
@@ -242,17 +270,11 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 						synth["usage"] = lastChunk.Usage
 					}
 					if raw, err := json.Marshal(synth); err == nil {
-						if !writeLine("data: " + string(raw) + "\n\n") {
-							break
-						}
+						writeLine("data: " + string(raw) + "\n\n")
 					}
 				}
-				if !writeLine("data: [DONE]\n\n") {
-					break
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
+				writeLine("data: [DONE]\n\n")
+				flush()
 				if logEntry.FinishReason == "" {
 					logEntry.FinishReason = "stop"
 				}
@@ -287,18 +309,16 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 					}
 				}
 			}
-			if !writeLine(line) {
-				break
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
+			writeLine(line)
+			flush()
 		}
 		if err != nil {
 			if err != io.EOF {
-				slog.Error("读取上游 SSE 失败", "error", err)
-				if !clientGone {
-					logEntry.ErrorMsg = trunc(err.Error(), 300)
+				if clientGone {
+					logEntry.ErrorMsg = orDefault(logEntry.ErrorMsg, "client canceled")
+				} else {
+					slog.Error("读取上游 SSE 失败", "error", err)
+					logEntry.ErrorMsg = orDefault(logEntry.ErrorMsg, trunc(err.Error(), 300))
 				}
 			}
 			break
@@ -339,9 +359,23 @@ func (h *Handler) aggregate(r *http.Request, body io.Reader, reqBody map[string]
 					if resp.StatusCode == http.StatusOK {
 						agg2 := scanSSE(resp.Body)
 						resp.Body.Close()
+						// 重试无论是否采用其结果，上游都已计费：累计 token，避免漏计费
+						if agg2 != nil && agg2.Usage != nil {
+							logEntry.PromptTokens += agg2.Usage.PromptTokens
+							logEntry.CompletionTokens += agg2.Usage.CompletionTokens
+							logEntry.TotalTokens += agg2.Usage.TotalTokens
+							logEntry.Credit += agg2.Usage.Credit
+						}
 						if agg2 != nil && len(agg2.ToolCalls) > 0 {
+							if agg2.Model != "" {
+								logEntry.Model = agg2.Model
+							}
+							fr := agg2.FinishReason
+							if fr == "" {
+								fr = "tool_calls"
+							}
+							logEntry.FinishReason = fr
 							agg = agg2 // 重试产出工具调用则采用重试结果
-							applyAggToLog(agg, logEntry)
 						}
 					} else {
 						resp.Body.Close()

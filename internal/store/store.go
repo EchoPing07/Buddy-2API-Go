@@ -467,8 +467,17 @@ func (s *Store) CleanupLogsBySize(maxBytes int64) (int64, error) {
 
 // ── 缓存表 ──
 
+// cacheTables 允许作为缓存表的白名单，防止 table 参数拼接 SQL 注入。
+var cacheTables = map[string]bool{
+	"resource_cache": true,
+	"checkin_cache":  true,
+}
+
 // GetCache 读缓存（resource_cache / checkin_cache 共用），TTL 秒内有效。
 func (s *Store) GetCache(table, key string, ttlSeconds int) (string, int64, bool) {
+	if !cacheTables[table] {
+		return "", 0, false
+	}
 	var payload string
 	var updatedAt int64
 	err := s.db.QueryRow(`SELECT payload, updated_at FROM `+table+` WHERE account_key=?`, key).
@@ -484,6 +493,9 @@ func (s *Store) GetCache(table, key string, ttlSeconds int) (string, int64, bool
 
 // SetCache 写缓存。
 func (s *Store) SetCache(table, key, payload string) error {
+	if !cacheTables[table] {
+		return fmt.Errorf("非法缓存表: %s", table)
+	}
 	_, err := s.db.Exec(`INSERT INTO `+table+` (account_key, payload, updated_at) VALUES (?,?,?)
 		ON CONFLICT(account_key) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`,
 		key, payload, time.Now().Unix())

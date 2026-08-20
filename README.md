@@ -55,7 +55,7 @@
 ### 方式二：Docker（推荐）
 
 ```bash
-docker compose up -d          # http://127.0.0.1:10082
+docker compose up -d          # 浏览器访问 http://<服务器IP>:10082（局域网可访问）
 ```
 
 或手动运行：
@@ -63,7 +63,7 @@ docker compose up -d          # http://127.0.0.1:10082
 ```bash
 docker run -d \
   --name buddy2api \
-  -p 127.0.0.1:10082:10082 \
+  -p 0.0.0.0:10082:10082 \
   -v "$(pwd)/data:/app/data" \
   -e BUDDY2API_LISTEN=0.0.0.0:10082 \
   ghcr.io/echoping07/buddy-2api-go:latest
@@ -116,7 +116,7 @@ go build -ldflags="-s -w -X buddy2api-go/internal/proxy.Version=v1.0.0" -o buddy
 
 ## 📖 使用
 
-1. 打开 `http://127.0.0.1:10082`，输入管理密码登录（默认 `password`）
+1. 打开管理后台：本机部署访问 `http://127.0.0.1:10082`，Docker/局域网部署访问 `http://<服务器IP>:10082`，输入管理密码登录（默认 `password`）
 2. 「账号」页 → **登录**（OAuth 设备流，浏览器完成授权）
 3. 「密钥」页 → 创建 API Key（随机或自定义，支持备注/启停）
 4. 在任意 OpenAI 兼容客户端填入：
@@ -178,7 +178,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 
 | env | 说明 |
 |---|---|
-| `BUDDY2API_LISTEN` | 监听地址（默认 `127.0.0.1:10082`；Docker 内用 `0.0.0.0:10082`） |
+| `BUDDY2API_LISTEN` | 监听地址（二进制默认 `127.0.0.1:10082`；Docker 镜像内默认 `0.0.0.0:10082`） |
 | `BUDDY2API_REGION` | `cn`（默认，`copilot.tencent.com`）/ `global`（`www.codebuddy.ai`），两套端点凭证不互通，切换后需重新扫码登录 |
 | `BUDDY2API_ADMIN_PASSWORD` | 管理密码（明文，启动时 bcrypt 哈希写回 config.json，优先级最高）；未设置且无 hash 时默认 `password` |
 | `BUDDY2API_AUTO_CHECKIN` | 自动签到开关（默认关闭） |
@@ -199,7 +199,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `data/buddy2api.db` | SQLite（API Keys / 请求日志 / 缓存），**只存元信息，不存对话内容** |
 
 - API Key 明文存储（管理页可复制完整 Key），校验用常量时间比对
-- 默认只监听 `127.0.0.1`；公网部署请放反代后并加 TLS
+- 二进制直跑默认只监听 `127.0.0.1`；Docker（compose / 本文示例）默认全网卡监听 `0.0.0.0:10082`，局域网可直接访问——公网部署请务必放反代后并加 TLS，或改回仅本机监听
 - 出站请求复刻官方 CLI 指纹头；chat 请求绝不携带 refresh_token
 - 日志不记录请求/响应正文，只记元信息
 

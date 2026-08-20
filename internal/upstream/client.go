@@ -307,6 +307,9 @@ func (c *Client) billing(path string) (*BillingResult, int, error) {
 		return nil, 0, err
 	}
 	t = c.toks.Get()
+	if t == nil { // EnsureValid 与 Get 之间可能被并发登出清空
+		return nil, 0, ErrNoToken
+	}
 	old := *t
 	old.Domain = orDefault(t.Domain, c.ep().Domain)
 	status, raw, err := postJSON(c.short, c.ep().Upstream+path, "{}", billingHeaders(&old))

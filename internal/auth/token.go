@@ -112,10 +112,15 @@ func (t *Token) ExpiresInHuman() string {
 }
 
 // TokenStore 线程安全的 token.json 读写 + 单飞刷新。
+//
+// mu 保护 t（读写锁，读取走 RLock 不阻塞并发读）；refreshMu 串行化刷新，
+// 配合「进入后重检」实现单飞，且刷新 HTTP 在 mu 锁外执行，
+// 避免刷新期间阻塞所有 Get（原实现刷新 HTTP 全程持互斥锁，高并发下 = 全站卡顿）。
 type TokenStore struct {
-	mu   sync.Mutex
-	path string
-	t    *Token
+	mu        sync.RWMutex
+	path      string
+	t         *Token
+	refreshMu sync.Mutex
 }
 
 // NewTokenStore 创建并尝试加载 data/token.json。
@@ -152,10 +157,10 @@ func (s *TokenStore) Load() error {
 	return nil
 }
 
-// Get 返回 token 副本；未登录返回 nil。
+// Get 返回 token 副本；未登录返回 nil。读锁不阻塞并发读，也不阻塞于刷新。
 func (s *TokenStore) Get() *Token {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.t == nil {
 		return nil
 	}
@@ -200,33 +205,56 @@ func (s *TokenStore) Clear() error {
 	return nil
 }
 
-// EnsureValid 单飞刷新过期 token；refreshFn 持锁执行，避免并发重复刷新。
+// EnsureValid 单飞刷新过期 token。刷新 HTTP 在 token 锁外执行，不阻塞并发 Get。
 func (s *TokenStore) EnsureValid(refreshFn func(t *Token) (*Token, error)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.t == nil {
+	s.mu.RLock()
+	t := s.t
+	s.mu.RUnlock()
+	if t == nil {
 		return ErrNoToken
 	}
-	if !s.t.IsExpired() {
+	if !t.IsExpired() {
 		return nil
 	}
-	nt, err := refreshFn(s.t)
-	if err != nil {
-		return err
-	}
-	return s.saveLocked(nt)
+	return s.refresh(refreshFn, false)
 }
 
-// ForceRefresh 强制刷新（手动触发）。
+// ForceRefresh 强制刷新（手动触发 / 401 重试）。
 func (s *TokenStore) ForceRefresh(refreshFn func(t *Token) (*Token, error)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.t == nil {
+	s.mu.RLock()
+	t := s.t
+	s.mu.RUnlock()
+	if t == nil {
 		return ErrNoToken
 	}
-	nt, err := refreshFn(s.t)
+	return s.refresh(refreshFn, true)
+}
+
+// refresh 单飞刷新：refreshMu 串行化，进入后重检 token 状态（可能已被另一
+// goroutine 刷新或被登出清空）；force=true 时跳过过期判断总是刷新。
+// refreshFn 在 token 锁外执行，期间 Get 可继续返回（可能为旧的）token。
+// 落盘前以写锁原子校验 s.t 仍为刷新起点，避免覆盖并发登录/登出产生的新凭证。
+func (s *TokenStore) refresh(refreshFn func(t *Token) (*Token, error), force bool) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	s.mu.RLock()
+	t := s.t
+	s.mu.RUnlock()
+	if t == nil {
+		return ErrNoToken
+	}
+	if !force && !t.IsExpired() {
+		return nil // 另一 goroutine 已刷新
+	}
+	tcopy := *t
+	nt, err := refreshFn(&tcopy)
 	if err != nil {
 		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.t != t {
+		return nil // 期间 token 已被替换（如重新登录），放弃本次刷新结果
 	}
 	return s.saveLocked(nt)
 }
