@@ -395,12 +395,15 @@ func processResources(raw json.RawMessage) map[string]any {
 				ResourceType:   acc["ResourceType"],
 				AutoRenewFlag:  acc["AutoRenewFlag"],
 				Status:         acc["Status"],
-				ExpireTime:     toStr(acc["ExpiredTime"]),
 			}
-			if t, ok := parseFlexibleTime(acc["ExpiredTime"]); ok {
-				days := int(t.Sub(now).Hours() / 24)
+			// 到期时间按上游契约回退：ExpiredTime → DeductionEndTime → CycleEndTime。
+			// 实测免费/裂变包 ExpiredTime 常为空，真正到期落在 Deduction/Cycle 字段。
+			disp, et, ok := resolveExpireTime(acc)
+			a.ExpireTime = disp
+			if ok {
+				days := int(et.Sub(now).Hours() / 24)
 				a.DaysLeft = &days
-				a.Expired = t.Before(now)
+				a.Expired = et.Before(now)
 				switch {
 				case a.Expired:
 					a.Warn = "expired"
@@ -742,6 +745,33 @@ func number(v any) float64 {
 		return f
 	}
 	return 0
+}
+
+// resolveExpireTime 按上游契约回退选取到期时间：ExpiredTime → DeductionEndTime → CycleEndTime。
+// 实测 CodeBuddy 免费/裂变包 ExpiredTime 常为空字符串，真正到期信息落在 DeductionEndTime
+// （毫秒时间戳）或 CycleEndTime（日期串）。返回 (展示串, 时间, 是否有效)；空值/0/9999-99-99
+// 哨兵跳过，数字时间戳格式化为本地可读串，字符串原样返回。
+func resolveExpireTime(acc map[string]any) (string, time.Time, bool) {
+	for _, key := range []string{"ExpiredTime", "DeductionEndTime", "CycleEndTime"} {
+		raw := acc[key]
+		switch v := raw.(type) {
+		case string:
+			if v == "" || strings.HasPrefix(v, "9999-99-99") {
+				continue
+			}
+		case float64:
+			if v == 0 {
+				continue
+			}
+		}
+		if et, ok := parseFlexibleTime(raw); ok && !et.IsZero() {
+			if s, ok := raw.(string); ok {
+				return s, et, true
+			}
+			return et.Local().Format("2006-01-02 15:04:05"), et, true
+		}
+	}
+	return "", time.Time{}, false
 }
 
 // parseFlexibleTime 宽容解析时间：数字（秒/毫秒）、RFC3339、常见格式。
