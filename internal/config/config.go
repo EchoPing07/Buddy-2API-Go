@@ -114,10 +114,18 @@ func (c *Config) Normalize() {
 	if c.ChatTimeoutSeconds <= 0 {
 		c.ChatTimeoutSeconds = d.ChatTimeoutSeconds
 	}
+	if c.ChatTimeoutSeconds > MaxChatTimeoutSeconds {
+		c.ChatTimeoutSeconds = MaxChatTimeoutSeconds
+	}
 }
 
 // MaxCheckinWindowEnd 随机窗口最晚结束时刻：需保证主尝试 + 5 分钟重试在末班 23:50 前完成。
 const MaxCheckinWindowEnd = "23:30"
+
+// MaxChatTimeoutSeconds chat 响应头超时上限（秒）。等待上游「开始响应」不该超过一小时；
+// 更关键的是过大的秒数在 time.Duration 秒→纳秒换算时会溢出为负，令 Transport 对所有
+// chat 请求立即判超时，且该值会持久化到 config.json 无法自愈。
+const MaxChatTimeoutSeconds = 3600
 
 // ParseHHMM 把 "HH:MM" 解析为当日分钟数（0-1439），格式非法返回 ok=false。
 func ParseHHMM(s string) (minutes int, ok bool) {
@@ -206,6 +214,11 @@ func Load(dataDir string) (*Manager, error) {
 	envInt("BUDDY2API_LOG_RETENTION_DAYS", "log_retention_days", &cfg.LogRetentionDays)
 	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
 	envInt("BUDDY2API_CHAT_TIMEOUT_SECONDS", "chat_timeout_seconds", &cfg.ChatTimeoutSeconds)
+	// env 覆盖发生在上面的 Normalize 之后（envInt 只挡 <=0），超界值在此钳制，
+	// 防止 Duration 换算溢出为负导致所有 chat 请求立即超时并被落盘
+	if cfg.ChatTimeoutSeconds > MaxChatTimeoutSeconds {
+		cfg.ChatTimeoutSeconds = MaxChatTimeoutSeconds
+	}
 
 	// 默认管理密码：env > 文件 hash > 内置 "password"（生产请尽快修改）。
 	if pw := strings.TrimSpace(os.Getenv("BUDDY2API_ADMIN_PASSWORD")); pw != "" {
@@ -344,6 +357,14 @@ func (m *Manager) saveLocked() error {
 		return err
 	}
 	return os.WriteFile(m.path, data, 0o600)
+}
+
+// ValidateChatTimeoutSeconds 校验 chat 响应头超时秒数（1 ~ MaxChatTimeoutSeconds）。
+func ValidateChatTimeoutSeconds(n int) error {
+	if n < 1 || n > MaxChatTimeoutSeconds {
+		return fmt.Errorf("chat 响应超时需在 1-%d 秒之间", MaxChatTimeoutSeconds)
+	}
+	return nil
 }
 
 // ValidateListen 校验监听地址格式（host:port）。

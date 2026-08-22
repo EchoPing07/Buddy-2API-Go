@@ -751,6 +751,11 @@ section[x-show]{animation:fadeUp .18s ease-out}
               <input class="input" x-model="settings.listen" placeholder="127.0.0.1:10082">
               <p class="field-hint">格式 host:port，如 127.0.0.1:10082、0.0.0.0:8080、:8080；修改后需手动重启服务生效</p>
             </div>
+            <div class="form-row">
+              <label class="label">Chat 响应超时（秒）</label>
+              <input class="input" type="number" min="1" max="3600" x-model.number="settings.chat_timeout_seconds">
+              <p class="field-hint">上游自请求发出至开始响应的等待上限（1-3600 秒），超时即中止本次请求；流式连接建立后（含推理阶段）不再受超时约束。修改后需重启服务生效</p>
+            </div>
           </div>
 
           <div class="card">
@@ -1425,6 +1430,7 @@ function app(){
           checkin_random_start:s.checkin_random_start||'', checkin_random_end:s.checkin_random_end||'',
           checkin_fallback:!!s.checkin_fallback,
           resource_cache_seconds:+s.resource_cache_seconds,
+          chat_timeout_seconds:+s.chat_timeout_seconds,
           log_retention_days:+s.log_retention_days, log_max_size_mb:+s.log_max_size_mb,
         };
         if(this.pwForm.old_password || this.pwForm.new_password){

@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseHHMM(t *testing.T) {
 	cases := []struct {
@@ -71,5 +76,62 @@ func TestNormalizeCheckin(t *testing.T) {
 	c.Normalize()
 	if c.CheckinMode != "random" || c.CheckinRandomStart != "08:30" || c.CheckinRandomEnd != "12:00" {
 		t.Errorf("合法自定义被误改: mode=%q window=%q~%q", c.CheckinMode, c.CheckinRandomStart, c.CheckinRandomEnd)
+	}
+}
+
+func TestValidateChatTimeoutSeconds(t *testing.T) {
+	for _, n := range []int{1, 60, MaxChatTimeoutSeconds} { // 上下边界均合法
+		if err := ValidateChatTimeoutSeconds(n); err != nil {
+			t.Errorf("ValidateChatTimeoutSeconds(%d) 不应报错，得到 %v", n, err)
+		}
+	}
+	for _, n := range []int{0, -1, MaxChatTimeoutSeconds + 1, 9999999999} { // 9999999999 秒→纳秒换算溢出区
+		if err := ValidateChatTimeoutSeconds(n); err == nil {
+			t.Errorf("ValidateChatTimeoutSeconds(%d) 应报错", n)
+		}
+	}
+}
+
+func TestNormalizeChatTimeout(t *testing.T) {
+	c := Config{ChatTimeoutSeconds: 0}
+	c.Normalize()
+	if c.ChatTimeoutSeconds != 60 {
+		t.Errorf("0 应回退默认 60，得到 %d", c.ChatTimeoutSeconds)
+	}
+	c = Config{ChatTimeoutSeconds: 9999999999}
+	c.Normalize()
+	if c.ChatTimeoutSeconds != MaxChatTimeoutSeconds {
+		t.Errorf("超界应钳到 %d，得到 %d", MaxChatTimeoutSeconds, c.ChatTimeoutSeconds)
+	}
+	c = Config{ChatTimeoutSeconds: 300}
+	c.Normalize()
+	if c.ChatTimeoutSeconds != 300 {
+		t.Errorf("合法值不应被改，得到 %d", c.ChatTimeoutSeconds)
+	}
+}
+
+// TestLoadEnvChatTimeoutClamp 复现 bug：Load 的 Normalize 在 env 覆盖之前执行，
+// envInt 只挡 <=0，超界 env 值会绕过钳制直接进运行配置并被落盘。
+func TestLoadEnvChatTimeoutClamp(t *testing.T) {
+	t.Setenv("BUDDY2API_CHAT_TIMEOUT_SECONDS", "9999999999")
+	dir := t.TempDir()
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Get().ChatTimeoutSeconds; got != MaxChatTimeoutSeconds {
+		t.Errorf("env 超界应钳到 %d，得到 %d", MaxChatTimeoutSeconds, got)
+	}
+	// 落盘的 config.json 也应是钳制后的值
+	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Config
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ChatTimeoutSeconds != MaxChatTimeoutSeconds {
+		t.Errorf("落盘值应已钳制，得到 %d", persisted.ChatTimeoutSeconds)
 	}
 }

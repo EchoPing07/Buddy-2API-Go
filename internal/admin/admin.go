@@ -614,6 +614,7 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		"resource_cache_seconds": cfg.ResourceCacheSeconds,
 		"log_retention_days":     cfg.LogRetentionDays,
 		"log_max_size_mb":        cfg.LogMaxSizeMB,
+		"chat_timeout_seconds":   cfg.ChatTimeoutSeconds,
 	})
 }
 
@@ -632,6 +633,7 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		ResourceCacheSeconds *int    `json:"resource_cache_seconds"`
 		LogRetentionDays     *int    `json:"log_retention_days"`
 		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
+		ChatTimeoutSeconds   *int    `json:"chat_timeout_seconds"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -716,6 +718,13 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.LogMaxSizeMB != nil && *req.LogMaxSizeMB > 0 {
 			c.LogMaxSizeMB = *req.LogMaxSizeMB
+		}
+		// 写入 Transport 的构建参数，保存后需重启生效（同 listen）
+		if req.ChatTimeoutSeconds != nil {
+			if err := config.ValidateChatTimeoutSeconds(*req.ChatTimeoutSeconds); err != nil {
+				return err
+			}
+			c.ChatTimeoutSeconds = *req.ChatTimeoutSeconds
 		}
 		return nil
 	})
