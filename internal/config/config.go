@@ -56,6 +56,10 @@ type Config struct {
 	Region               string `json:"region"`
 	AutoCheckin          bool   `json:"auto_checkin"`
 	CheckinCron          string `json:"checkin_cron"`
+	CheckinMode          string `json:"checkin_mode"`         // "fixed"（按 cron）| "random"（时间范围内随机）
+	CheckinRandomStart   string `json:"checkin_random_start"` // random 模式窗口起 "HH:MM"
+	CheckinRandomEnd     string `json:"checkin_random_end"`   // random 模式窗口止 "HH:MM"
+	CheckinFallback      bool   `json:"checkin_fallback"`     // 末班兜底：23:50/23:55 各再试一次
 	ResourceCacheSeconds int    `json:"resource_cache_seconds"`
 	LogRetentionDays     int    `json:"log_retention_days"`
 	LogMaxSizeMB         int    `json:"log_max_size_mb"`
@@ -68,6 +72,10 @@ func defaults() Config {
 		Region:               "cn",
 		AutoCheckin:          false,
 		CheckinCron:          "0 0 9 * * *",
+		CheckinMode:          "fixed",
+		CheckinRandomStart:   "09:00",
+		CheckinRandomEnd:     "18:00",
+		CheckinFallback:      true,
 		ResourceCacheSeconds: 300,
 		LogRetentionDays:     90,
 		LogMaxSizeMB:         50,
@@ -87,6 +95,13 @@ func (c *Config) Normalize() {
 	if strings.TrimSpace(c.CheckinCron) == "" {
 		c.CheckinCron = d.CheckinCron
 	}
+	if c.CheckinMode != "random" {
+		c.CheckinMode = "fixed"
+	}
+	if err := ValidateCheckinWindow(c.CheckinRandomStart, c.CheckinRandomEnd); err != nil {
+		c.CheckinRandomStart = d.CheckinRandomStart
+		c.CheckinRandomEnd = d.CheckinRandomEnd
+	}
 	if c.ResourceCacheSeconds <= 0 {
 		c.ResourceCacheSeconds = d.ResourceCacheSeconds
 	}
@@ -99,6 +114,39 @@ func (c *Config) Normalize() {
 	if c.ChatTimeoutSeconds <= 0 {
 		c.ChatTimeoutSeconds = d.ChatTimeoutSeconds
 	}
+}
+
+// MaxCheckinWindowEnd 随机窗口最晚结束时刻：需保证主尝试 + 5 分钟重试在末班 23:50 前完成。
+const MaxCheckinWindowEnd = "23:30"
+
+// ParseHHMM 把 "HH:MM" 解析为当日分钟数（0-1439），格式非法返回 ok=false。
+func ParseHHMM(s string) (minutes int, ok bool) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+// ValidateCheckinWindow 校验随机签到窗口：HH:MM 格式、start < end、end 不晚于 23:30。
+func ValidateCheckinWindow(start, end string) error {
+	sm, ok1 := ParseHHMM(start)
+	em, ok2 := ParseHHMM(end)
+	if !ok1 || !ok2 {
+		return fmt.Errorf("时间格式应为 HH:MM（如 09:00）")
+	}
+	if em <= sm {
+		return fmt.Errorf("开始时间需早于结束时间")
+	}
+	if max, _ := ParseHHMM(MaxCheckinWindowEnd); em > max {
+		return fmt.Errorf("结束时间最晚 %s（需在末班签到前留出重试时间）", MaxCheckinWindowEnd)
+	}
+	return nil
 }
 
 // Manager 线程安全的配置管理器（读写锁 + 文件持久化）。
@@ -149,6 +197,10 @@ func Load(dataDir string) (*Manager, error) {
 	envStr("BUDDY2API_LISTEN", "listen", &cfg.Listen)
 	envStr("BUDDY2API_REGION", "region", &cfg.Region)
 	envStr("BUDDY2API_CHECKIN_CRON", "checkin_cron", &cfg.CheckinCron)
+	envStr("BUDDY2API_CHECKIN_MODE", "checkin_mode", &cfg.CheckinMode)
+	envStr("BUDDY2API_CHECKIN_RANDOM_START", "checkin_random_start", &cfg.CheckinRandomStart)
+	envStr("BUDDY2API_CHECKIN_RANDOM_END", "checkin_random_end", &cfg.CheckinRandomEnd)
+	envBool("BUDDY2API_CHECKIN_FALLBACK", "checkin_fallback", &cfg.CheckinFallback)
 	envBool("BUDDY2API_AUTO_CHECKIN", "auto_checkin", &cfg.AutoCheckin)
 	envInt("BUDDY2API_RESOURCE_CACHE_SECONDS", "resource_cache_seconds", &cfg.ResourceCacheSeconds)
 	envInt("BUDDY2API_LOG_RETENTION_DAYS", "log_retention_days", &cfg.LogRetentionDays)
@@ -222,6 +274,18 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["checkin_cron"] {
 		nc.CheckinCron = m.cfg.CheckinCron
+	}
+	if m.envSets["checkin_mode"] {
+		nc.CheckinMode = m.cfg.CheckinMode
+	}
+	if m.envSets["checkin_random_start"] {
+		nc.CheckinRandomStart = m.cfg.CheckinRandomStart
+	}
+	if m.envSets["checkin_random_end"] {
+		nc.CheckinRandomEnd = m.cfg.CheckinRandomEnd
+	}
+	if m.envSets["checkin_fallback"] {
+		nc.CheckinFallback = m.cfg.CheckinFallback
 	}
 	if m.envSets["resource_cache_seconds"] {
 		nc.ResourceCacheSeconds = m.cfg.ResourceCacheSeconds
@@ -304,4 +368,3 @@ func ValidateListen(listen string) error {
 	}
 	return nil
 }
-

@@ -639,7 +639,7 @@ section[x-show]{animation:fadeUp .18s ease-out}
             <div class="checkin-item"><span class="metric-label">今日积分</span><span class="checkin-val" x-text="checkin.today_credit ?? '—'"></span></div>
             <div class="checkin-item"><span class="metric-label">连续签到</span><span class="checkin-val" x-text="(checkin.streak_days ?? 0)+' 天'"></span></div>
           </div>
-          <p class="field-hint">可在「设置」中开启自动签到，由服务端按 cron 定时执行</p>
+          <p class="field-hint" x-text="checkinHint()"></p>
         </div>
 
         <div class="grid g2">
@@ -773,9 +773,34 @@ section[x-show]{animation:fadeUp .18s ease-out}
               <button type="button" class="switch" :class="{on:!!settings.auto_checkin}" @click="settings.auto_checkin=!settings.auto_checkin" aria-label="切换自动签到"></button>
             </div>
             <div class="form-row">
+              <label class="label">签到方式</label>
+              <select class="select" x-model="settings.checkin_mode">
+                <option value="fixed">定时（Cron 表达式）</option>
+                <option value="random">随机（时间范围内随机时刻）</option>
+              </select>
+            </div>
+            <div class="form-row" x-show="settings.checkin_mode!=='random'">
               <label class="label">签到 Cron</label>
               <input class="input" x-model="settings.checkin_cron" placeholder="0 0 9 * * *">
               <p class="field-hint">含秒共 6 段，如 0 0 9 * * * 表示每天 9:00 执行</p>
+            </div>
+            <div class="form-grid c2" x-show="settings.checkin_mode==='random'">
+              <div class="form-row">
+                <label class="label">最早时间</label>
+                <input class="input" type="time" x-model="settings.checkin_random_start">
+              </div>
+              <div class="form-row">
+                <label class="label">最晚时间</label>
+                <input class="input" type="time" x-model="settings.checkin_random_end">
+                <p class="field-hint">每天在此范围内随机取一个时刻签到，最晚 23:30</p>
+              </div>
+            </div>
+            <div class="switch-row">
+              <div>
+                <div class="sw-label">末班兜底</div>
+                <p class="field-hint">当天没签成时：23:50 尝试，若失败 23:55 重试，再失败当天放弃</p>
+              </div>
+              <button type="button" class="switch" :class="{on:!!settings.checkin_fallback}" @click="settings.checkin_fallback=!settings.checkin_fallback" aria-label="切换末班兜底"></button>
             </div>
             <div class="form-grid c2">
               <div class="form-row">
@@ -979,7 +1004,7 @@ function app(){
       if(v==='dashboard'){ this.loadStats(); this.loadModels(); }
       if(v==='account') this.loadAccount();
       if(v==='keys') this.loadKeys();
-      if(v==='resources'){ this.loadResources(false); this.loadCheckin(); }
+      if(v==='resources'){ this.loadResources(false); this.loadCheckin(); this.loadSettings(); }
       if(v==='logs') this.loadLogs(1);
       if(v==='settings') this.loadSettings();
     },
@@ -1317,11 +1342,20 @@ function app(){
     },
 
     /* ── 签到 ── */
+    checkinHint(){
+      const s = this.settings || {};
+      if(!s.auto_checkin) return '可在「设置」中开启自动签到，支持定时或时间范围内随机执行';
+      if(s.checkin_mode==='random'){
+        const base = `每天 ${s.checkin_random_start}–${s.checkin_random_end} 内随机签到`;
+        return this.checkin.random_target ? `今日随机时刻 ${this.checkin.random_target}（${base}）` : base;
+      }
+      return `按 Cron 定时签到（${s.checkin_cron}）`;
+    },
     async loadCheckin(){
       try{
         const r = await this.api('/admin/checkin/status');
         const d = r.data && r.data.data ? r.data.data : (r.data||{});
-        this.checkin = Object.assign({loaded:true}, d);
+        this.checkin = Object.assign({loaded:true, random_target:r.random_target||''}, d);
       }catch(e){ this.toast(e.message,'err'); }
     },
     async claimCheckin(){
@@ -1387,7 +1421,10 @@ function app(){
         const s = this.settings, body = {
           listen:(s.listen||'').trim(),
           region:s.region, auto_checkin:!!s.auto_checkin,
-          checkin_cron:s.checkin_cron, resource_cache_seconds:+s.resource_cache_seconds,
+          checkin_cron:s.checkin_cron, checkin_mode:s.checkin_mode||'fixed',
+          checkin_random_start:s.checkin_random_start||'', checkin_random_end:s.checkin_random_end||'',
+          checkin_fallback:!!s.checkin_fallback,
+          resource_cache_seconds:+s.resource_cache_seconds,
           log_retention_days:+s.log_retention_days, log_max_size_mb:+s.log_max_size_mb,
         };
         if(this.pwForm.old_password || this.pwForm.new_password){

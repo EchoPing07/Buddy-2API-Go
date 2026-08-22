@@ -27,7 +27,7 @@
 | OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/models`、`/health` |
 | 多 API Key   | 随机 / 自定义 Key，支持备注、启停、使用量统计                              |
 | 官方余额        | 实时拉取额度包明细，本地缓存，标注到期 / 临期                                |
-| 每日签到        | 独立开关 + cron 定时，也可手动领取                                   |
+| 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取     |
 | 仪表盘         | 请求量、Token、模型分布、Key 用量等聚合统计                              |
 | 自动刷新        | token 过期自动刷新，401 时刷新后重试一次                               |
 | 指纹头         | 出站请求复刻官方 CLI 指纹头；chat 请求绝不携带 refresh_token              |
@@ -182,7 +182,10 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `BUDDY2API_REGION` | `cn`（默认，`copilot.tencent.com`）/ `global`（`www.codebuddy.ai`），两套端点凭证不互通，切换后需重新扫码登录 |
 | `BUDDY2API_ADMIN_PASSWORD` | 管理密码（明文，启动时 bcrypt 哈希写回 config.json，优先级最高）；未设置且无 hash 时默认 `password` |
 | `BUDDY2API_AUTO_CHECKIN` | 自动签到开关（默认关闭） |
-| `BUDDY2API_CHECKIN_CRON` | 签到 cron，6 段含秒（默认 `0 0 9 * * *`） |
+| `BUDDY2API_CHECKIN_MODE` | 签到方式（默认 `fixed`）：`fixed` 按 cron 定时 / `random` 每天在时间范围内随机一个时刻 |
+| `BUDDY2API_CHECKIN_CRON` | `fixed` 模式签到 cron，6 段含秒（默认 `0 0 9 * * *`） |
+| `BUDDY2API_CHECKIN_RANDOM_START` / `BUDDY2API_CHECKIN_RANDOM_END` | `random` 模式时间范围 `HH:MM`（默认 `09:00` / `18:00`，结束最晚 `23:30`） |
+| `BUDDY2API_CHECKIN_FALLBACK` | 末班兜底（默认开启）：当天没签成时 23:50 尝试，若失败 23:55 重试，再失败当天放弃 |
 | `BUDDY2API_RESOURCE_CACHE_SECONDS` | 余额缓存秒数（默认 300） |
 | `BUDDY2API_LOG_RETENTION_DAYS` | 日志保留天数（默认 90） |
 | `BUDDY2API_LOG_MAX_SIZE_MB` | 日志表容量上限 MB（默认 50） |

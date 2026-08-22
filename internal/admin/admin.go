@@ -392,13 +392,13 @@ func processResources(raw json.RawMessage) map[string]any {
 				continue
 			}
 			a := resourceAccount{
-				PackageName:    strOr(acc, "PackageName", "ProductName"),
-				ProductName:    str(acc, "ProductName"),
-				CapacityUnit:   toStr(acc["CapacityUnit"]),
-				PackageType:    toStr(acc["PackageType"]),
-				ResourceType:   acc["ResourceType"],
-				AutoRenewFlag:  acc["AutoRenewFlag"],
-				Status:         acc["Status"],
+				PackageName:   strOr(acc, "PackageName", "ProductName"),
+				ProductName:   str(acc, "ProductName"),
+				CapacityUnit:  toStr(acc["CapacityUnit"]),
+				PackageType:   toStr(acc["PackageType"]),
+				ResourceType:  acc["ResourceType"],
+				AutoRenewFlag: acc["AutoRenewFlag"],
+				Status:        acc["Status"],
 			}
 			// 账户级与周期级分别取值（Precise → 非Precise 回退）。
 			acctRemain := numField(acc, "CapacityRemainPrecise", "CapacityRemain")
@@ -460,11 +460,18 @@ func processResources(raw json.RawMessage) map[string]any {
 // ── 签到 ──
 
 func (h *Handler) checkinStatus(w http.ResponseWriter, r *http.Request) {
+	// 附带今日随机签到时刻（random 模式下由调度器生成并缓存，重启不重摇）
+	randomTarget := ""
+	if payload, _, ok := h.st.GetCache("checkin_cache", "random_target", 48*3600); ok {
+		if t, err := time.Parse(time.RFC3339, payload); err == nil && t.Format("2006-01-02") == time.Now().Format("2006-01-02") {
+			randomTarget = t.Format("15:04")
+		}
+	}
 	// 优先读缓存（60s），避免高频查询
 	if payload, updatedAt, ok := h.st.GetCache("checkin_cache", "status", 60); ok {
 		var parsed any
 		_ = json.Unmarshal([]byte(payload), &parsed)
-		jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "data": parsed})
+		jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "random_target": randomTarget, "data": parsed})
 		return
 	}
 	res, err := h.client.CheckinStatus()
@@ -475,7 +482,7 @@ func (h *Handler) checkinStatus(w http.ResponseWriter, r *http.Request) {
 	_ = h.st.SetCache("checkin_cache", "status", string(res.Raw))
 	var parsed any
 	_ = json.Unmarshal(res.Raw, &parsed)
-	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "data": parsed})
+	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "random_target": randomTarget, "data": parsed})
 }
 
 func (h *Handler) checkinClaim(w http.ResponseWriter, r *http.Request) {
@@ -600,6 +607,10 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		"region":                 cfg.Region,
 		"auto_checkin":           cfg.AutoCheckin,
 		"checkin_cron":           cfg.CheckinCron,
+		"checkin_mode":           cfg.CheckinMode,
+		"checkin_random_start":   cfg.CheckinRandomStart,
+		"checkin_random_end":     cfg.CheckinRandomEnd,
+		"checkin_fallback":       cfg.CheckinFallback,
 		"resource_cache_seconds": cfg.ResourceCacheSeconds,
 		"log_retention_days":     cfg.LogRetentionDays,
 		"log_max_size_mb":        cfg.LogMaxSizeMB,
@@ -614,6 +625,10 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		Region               *string `json:"region"`
 		AutoCheckin          *bool   `json:"auto_checkin"`
 		CheckinCron          *string `json:"checkin_cron"`
+		CheckinMode          *string `json:"checkin_mode"`
+		CheckinRandomStart   *string `json:"checkin_random_start"`
+		CheckinRandomEnd     *string `json:"checkin_random_end"`
+		CheckinFallback      *bool   `json:"checkin_fallback"`
 		ResourceCacheSeconds *int    `json:"resource_cache_seconds"`
 		LogRetentionDays     *int    `json:"log_retention_days"`
 		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
@@ -669,6 +684,29 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 				return fmt.Errorf("cron 表达式非法（需 6 段含秒，如 0 0 9 * * *）")
 			}
 			c.CheckinCron = *req.CheckinCron
+		}
+		if req.CheckinMode != nil {
+			if m := strings.TrimSpace(*req.CheckinMode); m != "fixed" && m != "random" {
+				return fmt.Errorf("签到方式仅支持 fixed/random")
+			} else {
+				c.CheckinMode = m
+			}
+		}
+		if req.CheckinRandomStart != nil || req.CheckinRandomEnd != nil {
+			start, end := c.CheckinRandomStart, c.CheckinRandomEnd
+			if req.CheckinRandomStart != nil {
+				start = strings.TrimSpace(*req.CheckinRandomStart)
+			}
+			if req.CheckinRandomEnd != nil {
+				end = strings.TrimSpace(*req.CheckinRandomEnd)
+			}
+			if err := config.ValidateCheckinWindow(start, end); err != nil {
+				return err
+			}
+			c.CheckinRandomStart, c.CheckinRandomEnd = start, end
+		}
+		if req.CheckinFallback != nil {
+			c.CheckinFallback = *req.CheckinFallback
 		}
 		if req.ResourceCacheSeconds != nil && *req.ResourceCacheSeconds > 0 {
 			c.ResourceCacheSeconds = *req.ResourceCacheSeconds
