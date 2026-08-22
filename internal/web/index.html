@@ -768,6 +768,7 @@ section[x-show]{animation:fadeUp .18s ease-out}
           </div>
           </div>
 
+          <div class="space">
           <div class="card">
             <div class="card-head"><h3>签到与缓存</h3></div>
             <div class="switch-row">
@@ -807,11 +808,15 @@ section[x-show]{animation:fadeUp .18s ease-out}
               </div>
               <button type="button" class="switch" :class="{on:!!settings.checkin_fallback}" @click="settings.checkin_fallback=!settings.checkin_fallback" aria-label="切换末班兜底"></button>
             </div>
+            <div class="form-row">
+              <label class="label">余额缓存（秒）</label>
+              <input class="input" type="number" x-model.number="settings.resource_cache_seconds">
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>日志</h3></div>
             <div class="form-grid c2">
-              <div class="form-row">
-                <label class="label">余额缓存（秒）</label>
-                <input class="input" type="number" x-model.number="settings.resource_cache_seconds">
-              </div>
               <div class="form-row">
                 <label class="label">日志保留（天）</label>
                 <input class="input" type="number" min="1" x-model.number="settings.log_retention_days">
@@ -819,9 +824,10 @@ section[x-show]{animation:fadeUp .18s ease-out}
               <div class="form-row">
                 <label class="label">日志大小上限（MB）</label>
                 <input class="input" type="number" min="1" x-model.number="settings.log_max_size_mb">
-                <p class="field-hint">超限时自动删除最旧日志，与保留天数同时生效</p>
               </div>
             </div>
+            <p class="field-hint">超限时自动删除最旧日志，与保留天数同时生效</p>
+          </div>
           </div>
         </div>
       </section>
