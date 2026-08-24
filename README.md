@@ -29,6 +29,7 @@
 | 官方余额        | 实时拉取额度包明细，本地缓存，标注到期 / 临期                                |
 | 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取     |
 | 仪表盘         | 请求量、Token、模型分布、Key 用量等聚合统计                              |
+| 模型倍率         | 模型列表展示当前实际倍率（如 `GLM-5.2 x0.50`），自动套用官方分时段折扣（夜间折扣 / 限时免费等，支持跨零点时段窗与时区） |
 | 自动刷新        | token 过期自动刷新，401 时刷新后重试一次                               |
 | 指纹头         | 出站请求复刻官方 CLI 指纹头；chat 请求绝不携带 refresh_token              |
 
@@ -164,7 +165,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `GET /admin/logs` | 请求日志（分页 + 筛选 model/key/status） |
 | `GET /admin/stats` | 仪表盘聚合 |
 | `GET /admin/settings` `PUT /admin/settings` | 读 / 改配置（密码、region、签到、cron 等） |
-| `GET /admin/models` `POST /admin/models/refresh` | 模型列表 / 手动重新拉取 `/v3/config` |
+| `GET /admin/models` `POST /admin/models/refresh` | 模型列表（含当前生效倍率）/ 手动重新拉取 `/v3/config`。倍率取自上游 `models[].credits` 与 `modelPromotions` 折扣活动，按请求时刻实时评估时段窗口；仅作展示参考，非计费接口 |
 
 ### Web
 

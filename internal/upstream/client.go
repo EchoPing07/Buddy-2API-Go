@@ -353,14 +353,49 @@ func (c *Client) ClaimCheckin() (*BillingResult, error) {
 
 // ModelInfo 模型详情。
 type ModelInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Credits string `json:"credits,omitempty"` // 官方倍率，如 "x0.79"；auto 等动态倍率模型无此字段
+}
+
+// DailyWindow 每日时段窗（HH:MM，支持跨零点，如 23:00-07:50）。
+type DailyWindow struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+// ModelPromotion /v3/config 下发的分时段折扣活动（夜间折扣、高峰计价、限时免费等）。
+type ModelPromotion struct {
+	ID       string `json:"id"`
+	Kind     string `json:"kind"` // 目前仅见 "discount"
+	Enabled  bool   `json:"enabled"`
+	Priority int    `json:"priority"` // 数值大的优先
+	Badge    struct {
+		Label string `json:"label"` // 如 "夜间折扣"
+		Color string `json:"color"`
+	} `json:"badge"`
+	ModelIDs []string `json:"modelIds"`
+	Discount struct {
+		Factor            float64 `json:"factor"`
+		DiscountedCredits string  `json:"discountedCredits"` // 生效期倍率展示串，如 "0.50x" / "0x"
+		DisplayMode       string  `json:"displayMode"`       // strikethrough / replace
+	} `json:"discount"`
+	Schedule PromoSchedule `json:"schedule"`
+}
+
+// PromoSchedule 活动生效时间：绝对起止（RFC3339，可空）+ 每日时段窗（可空 = 不限时段）。
+type PromoSchedule struct {
+	Timezone   string        `json:"timezone"` // 如 Asia/Shanghai；空则按本地时间
+	Daily      []DailyWindow `json:"daily"`
+	ValidFrom  string        `json:"validFrom"`
+	ValidUntil string        `json:"validUntil"`
 }
 
 // ModelsConfig /v3/config 解析结果。
 type ModelsConfig struct {
-	Models []ModelInfo `json:"models"` // 全部模型详情
-	Craft  []string    `json:"craft"`  // craft agent 可用模型 ID（对话可用集）
+	Models     []ModelInfo      `json:"models"`     // 全部模型详情
+	Promotions []ModelPromotion `json:"promotions"` // 分时段折扣活动
+	Craft      []string         `json:"craft"`      // craft agent 可用模型 ID（对话可用集）
 }
 
 // FetchConfig 拉取 /v3/config（VSCode 指纹）。
@@ -390,10 +425,12 @@ func (c *Client) FetchConfig() (*ModelsConfig, error) {
 		Msg  string `json:"msg"`
 		Data struct {
 			Models []struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
+				ID      string `json:"id"`
+				Name    string `json:"name"`
+				Credits string `json:"credits"`
 			} `json:"models"`
-			Agents []struct {
+			Promotions []ModelPromotion `json:"modelPromotions"`
+			Agents     []struct {
 				Name   string   `json:"name"`
 				Models []string `json:"models"`
 			} `json:"agents"`
@@ -407,8 +444,9 @@ func (c *Client) FetchConfig() (*ModelsConfig, error) {
 	}
 	mc := &ModelsConfig{}
 	for _, m := range env.Data.Models {
-		mc.Models = append(mc.Models, ModelInfo{ID: m.ID, Name: m.Name})
+		mc.Models = append(mc.Models, ModelInfo{ID: m.ID, Name: m.Name, Credits: m.Credits})
 	}
+	mc.Promotions = env.Data.Promotions
 	for _, a := range env.Data.Agents {
 		if a.Name == "craft" {
 			mc.Craft = a.Models

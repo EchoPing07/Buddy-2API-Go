@@ -754,7 +754,7 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"ids":    h.models.List(),
-		"models": h.models.Models(),
+		"models": h.models.View(), // 含当前生效倍率（基础倍率 + 折扣活动计算）
 		"state":  h.models.State(),
 	})
 }
