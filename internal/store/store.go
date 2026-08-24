@@ -308,11 +308,11 @@ type Stats struct {
 	RecentErrors  []LogEntry  `json:"recent_errors"`
 }
 
-// DailyStat 按日请求/token 统计。
+// DailyStat 按日请求/credits 统计。
 type DailyStat struct {
-	Date     string `json:"date"`
-	Requests int64  `json:"requests"`
-	Tokens   int64  `json:"tokens"`
+	Date     string  `json:"date"`
+	Requests int64   `json:"requests"`
+	Credit   float64 `json:"credit"`
 }
 
 // ModelStat 按模型聚合。
@@ -347,7 +347,7 @@ func (s *Store) GetStats() (*Stats, error) {
 			return err
 		}
 		// 近 14 天
-		rows, err := s.db.Query(`SELECT date(created_at,'unixepoch','localtime') d, COUNT(*), COALESCE(SUM(total_tokens),0)
+		rows, err := s.db.Query(`SELECT date(created_at,'unixepoch','localtime') d, COUNT(*), COALESCE(SUM(credit),0)
 			FROM logs WHERE created_at >= strftime('%s','now','-13 days','start of day')
 			GROUP BY d ORDER BY d`)
 		if err != nil {
@@ -356,7 +356,7 @@ func (s *Store) GetStats() (*Stats, error) {
 		defer rows.Close()
 		for rows.Next() {
 			var d DailyStat
-			if err := rows.Scan(&d.Date, &d.Requests, &d.Tokens); err != nil {
+			if err := rows.Scan(&d.Date, &d.Requests, &d.Credit); err != nil {
 				return err
 			}
 			st.Daily = append(st.Daily, d)

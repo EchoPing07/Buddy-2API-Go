@@ -404,7 +404,7 @@ section[x-show]{animation:fadeUp .18s ease-out}
             <p class="metric-detail" x-text="'今日 '+fmt(stats.today_requests)+' · 日均 '+compact(avg14)"></p>
           </article>
           <article class="metric">
-            <header class="metric-head"><span class="metric-label">总 Tokens</span><span class="ic" x-html="ic('type')"></span></header>
+            <header class="metric-head"><span class="metric-label">Tokens 用量</span><span class="ic" x-html="ic('type')"></span></header>
             <div class="metric-value" x-text="fmt(stats.total_tokens)"></div>
             <p class="metric-detail" x-text="'今日 '+fmt(stats.today_tokens)"></p>
           </article>
@@ -414,7 +414,7 @@ section[x-show]{animation:fadeUp .18s ease-out}
             <p class="metric-detail" x-text="successRate!==null ? '成功率 '+successRate+'%' : '—'"></p>
           </article>
           <article class="metric">
-            <header class="metric-head"><span class="metric-label">累计积分</span><span class="ic" x-html="ic('dollar')"></span></header>
+            <header class="metric-head"><span class="metric-label">积分消耗</span><span class="ic" x-html="ic('dollar')"></span></header>
             <div class="metric-value" x-text="fmt(stats.total_credit)"></div>
             <p class="metric-detail" x-text="keys.length+' 个 Key · '+(stats.by_model||[]).length+' 个模型'"></p>
           </article>
@@ -427,7 +427,7 @@ section[x-show]{animation:fadeUp .18s ease-out}
               <div class="spacer"></div>
               <div class="legend">
                 <span class="lg lg-bar"><i></i>请求</span>
-                <span class="lg lg-line"><i></i>Tokens</span>
+                <span class="lg lg-line"><i></i>Credits</span>
               </div>
             </div>
             <div id="chartDaily" class="chart-box"></div>
@@ -1116,7 +1116,7 @@ function app(){
       }catch(e){ this.toast(e.message,'err'); }
     },
 
-    /* ── 图表：近 14 天（手写 SVG，双轴：柱=请求，线=Tokens） ── */
+    /* ── 图表：近 14 天（手写 SVG，双轴：柱=请求，线=Credits） ── */
     renderDaily(){
       const el = document.getElementById('chartDaily');
       if(!el) return;
@@ -1127,7 +1127,7 @@ function app(){
       const H = 236, padL = 34, padR = 44, padT = 12, padB = 24;
       const iw = W-padL-padR, ih = H-padT-padB;
       const maxR = Math.max(...daily.map(d=>d.requests||0), 1);
-      const maxT = Math.max(...daily.map(d=>d.tokens||0), 1);
+      const maxT = Math.max(...daily.map(d=>d.credit||0), 1);
       const step = iw/daily.length;
       const barW = Math.max(4, Math.min(16, step*0.48));
       const cx = i => padL + step*i + step/2;
@@ -1144,8 +1144,8 @@ function app(){
         const y = yR(d.requests||0);
         s += `<rect class="bar-c" data-i="${i}" x="${(cx(i)-barW/2).toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0,padT+ih-y).toFixed(1)}" rx="${Math.min(3,barW/2).toFixed(1)}"/>`;
       });
-      s += `<polyline class="tok-line" points="${daily.map((d,i)=>cx(i).toFixed(1)+','+yT(d.tokens||0).toFixed(1)).join(' ')}"/>`;
-      daily.forEach((d,i)=>{ s += `<circle class="tok-dot" cx="${cx(i).toFixed(1)}" cy="${yT(d.tokens||0).toFixed(1)}" r="2.6"/>`; });
+      s += `<polyline class="tok-line" points="${daily.map((d,i)=>cx(i).toFixed(1)+','+yT(d.credit||0).toFixed(1)).join(' ')}"/>`;
+      daily.forEach((d,i)=>{ s += `<circle class="tok-dot" cx="${cx(i).toFixed(1)}" cy="${yT(d.credit||0).toFixed(1)}" r="2.6"/>`; });
       const k = Math.max(1, Math.ceil(daily.length/7));
       daily.forEach((d,i)=>{
         if(i%k===0 || i===daily.length-1) s += `<text class="axis-label" text-anchor="middle" x="${cx(i).toFixed(1)}" y="${H-6}">${(d.date||'').slice(5)}</text>`;
@@ -1164,7 +1164,7 @@ function app(){
           const i = +hz.dataset.i, d = daily[i];
           tt.textContent = d.date||'';
           l1.textContent = `请求 ${this.fmt(d.requests||0)}`;
-          l2.textContent = `Tokens ${this.fmt(d.tokens||0)}`;
+          l2.textContent = `Credits ${this.fmt(d.credit||0)}`;
           const w = Math.max(...[tt,l1,l2].map(t=>t.getComputedTextLength())) + 20;
           bg.setAttribute('width', w.toFixed(0));
           const g = this._chartGeom;
