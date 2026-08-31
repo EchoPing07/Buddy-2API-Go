@@ -617,8 +617,13 @@ section[x-show]{animation:fadeUp .18s ease-out}
         <div class="card">
           <div class="row" style="gap:20px">
             <div>
-              <p class="metric-label">官方总额度</p>
+              <p class="metric-label">可用额度</p>
               <div class="total-num" x-text="fmtDosage(resources.total_dosage)"></div>
+              <!-- 官方 TotalDosage 按账户级剩余聚合，含周期外/已过期额度；与本地聚合一致、或上游字段缺失/为 0 时隐藏 -->
+              <p class="muted-xs" style="margin-top:4px"
+                 x-show="resources.upstream_total_dosage>0 && resources.upstream_total_dosage!=resources.total_dosage"
+                 title="官方 TotalDosage 按账户级剩余聚合，包含周期外/已过期额度，仅供参考"
+                 x-text="'官方 TotalDosage：'+fmtDosage(resources.upstream_total_dosage)"></p>
             </div>
             <div class="spacer"></div>
             <span class="muted-xs" x-text="(resources.accounts||[]).length+' 个额度包'"></span>
@@ -653,9 +658,9 @@ section[x-show]{animation:fadeUp .18s ease-out}
               </div>
               <div class="bar"><div :class="quotaBarClass(a)" :style="'width:'+pct(a)+'%'"></div></div>
               <div class="row muted-xs" style="margin-top:10px;gap:14px">
-                <span x-text="'剩余 '+(a.capacity_remain??0)"></span>
-                <span x-text="'总量 '+(a.capacity_size??0)"></span>
-                <span x-text="'已用 '+(a.capacity_used??0)"></span>
+                <span x-text="'剩余 '+fmtDosage(a.capacity_remain)"></span>
+                <span x-text="'总量 '+fmtDosage(a.capacity_size)"></span>
+                <span x-text="'已用 '+fmtDosage(a.capacity_used)"></span>
                 <span x-show="a.capacity_unit" x-text="a.capacity_unit"></span>
               </div>
               <p class="muted-xs" style="margin-top:6px" x-text="'到期：'+quotaExpire(a)"></p>

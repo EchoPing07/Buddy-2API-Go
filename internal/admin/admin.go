@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -343,7 +344,9 @@ type resourceAccount struct {
 func (h *Handler) resources(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Get()
 	force := r.URL.Query().Get("force") == "1"
-	table, key := "resource_cache", "default"
+	// v2：total_dosage 由透传上游 TotalDosage 改为本地聚合，旧缓存 key 的加工值
+	// 仍含幻影额度，换 key 使其立即失效（旧行残留在表内无害）
+	table, key := "resource_cache", "default_v2"
 
 	if !force {
 		if payload, updatedAt, ok := h.st.GetCache(table, key, cfg.ResourceCacheSeconds); ok {
@@ -363,6 +366,8 @@ func (h *Handler) resources(w http.ResponseWriter, r *http.Request) {
 	if raw, err := json.Marshal(processed); err == nil {
 		_ = h.st.SetCache(table, key, string(raw))
 	}
+	// 清理 v1 遗留 key（total_dosage 旧口径加工值）：缓存表无清理任务，不删则永久残留；幂等
+	_ = h.st.DeleteCacheKey(table, "default")
 	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "data": processed})
 }
 
@@ -379,9 +384,9 @@ func processResources(raw json.RawMessage) map[string]any {
 		}
 	}
 	out := map[string]any{
-		"total_dosage": number(node["TotalDosage"]),
-		"total_count":  number(node["TotalCount"]),
-		"raw":          top,
+		"upstream_total_dosage": number(node["TotalDosage"]), // 官方原始值（账户级聚合，含周期外幻影），仅供对照
+		"total_count":           number(node["TotalCount"]),
+		"raw":                   top,
 	}
 	now := time.Now()
 	var accounts []resourceAccount
@@ -439,6 +444,20 @@ func processResources(raw json.RawMessage) map[string]any {
 			accounts = append(accounts, a)
 		}
 	}
+	// 可用额度 total_dosage = Σ 未过期包的有效剩余（capacity_remain，周期优先口径），
+	// 与包卡片「剩余」合计一致；到期未知（days_left == nil）的包视为有效，纳入累计。
+	// 不透传上游 TotalDosage：该字段按账户级 CapacityRemain 聚合，而按月周期计费的
+	// 包（体验版/裂变包）周期额度用尽后账户级 Remain 不随周期扣减，周期外幻影剩余
+	// 会被一直计入（实测体验版恒多算 500，真实可用为 0 时总额度仍显示 500）。
+	// 官方原始值保留在 upstream_total_dosage 供前端对照展示。
+	available := 0.0
+	for _, a := range accounts {
+		if !a.Expired {
+			available += a.CapacityRemain
+		}
+	}
+	out["total_dosage"] = math.Round(available*100) / 100
+
 	// 按到期时间升序（未知的排最后）
 	sort.Slice(accounts, func(i, j int) bool {
 		pi, pj := accounts[i].DaysLeft, accounts[j].DaysLeft
@@ -869,7 +888,15 @@ func resolveExpireTime(acc map[string]any) (string, time.Time, bool) {
 	return "", time.Time{}, false
 }
 
+// billingTZ 上游 billing 日期串（"2006-01-02 15:04:05" 等无时区格式）为腾讯云
+// 北京时间（UTC+8，无夏令时，实测周期边界如 CycleStartTime "2026-08-01 00:00:00"
+// 印证），与部署时区无关。若用 time.Local 解析，非 +8 时区部署（Docker TZ 覆盖）的
+// 到期判定会偏差最多 8 小时；Expired 现在直接决定包是否计入可用额度聚合。
+// 用 FixedZone 而非 LoadLocation，避免运行环境缺 tzdata 时解析失败。
+var billingTZ = time.FixedZone("UTC+8", 8*60*60)
+
 // parseFlexibleTime 宽容解析时间：数字（秒/毫秒）、RFC3339、常见格式。
+// 无时区格式的日期串按 billingTZ（北京时间）解析；RFC3339 自带偏移不受影响。
 func parseFlexibleTime(v any) (time.Time, bool) {
 	switch t := v.(type) {
 	case float64:
@@ -884,7 +911,7 @@ func parseFlexibleTime(v any) (time.Time, bool) {
 		}
 		layouts := []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02"}
 		for _, layout := range layouts {
-			if ts, err := time.ParseInLocation(layout, t, time.Local); err == nil {
+			if ts, err := time.ParseInLocation(layout, t, billingTZ); err == nil {
 				return ts, true
 			}
 		}

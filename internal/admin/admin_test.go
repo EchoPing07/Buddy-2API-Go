@@ -19,10 +19,10 @@ func daysLeftStr(p *int) string {
 // buildEnvelope 按上游 get-user-resource 真实响应结构（data.Response.Data）构造测试数据，
 // 日期相对 now 偏移，保证测试不随时间失效。
 func buildEnvelope(now time.Time) []byte {
-	d100 := now.Add(100 * 24 * time.Hour).Format("2006-01-02 15:04:05")  // 仅 ExpiredTime 为空时回退 DeductionEndTime
+	d100 := now.Add(100 * 24 * time.Hour).Format("2006-01-02 15:04:05") // 仅 ExpiredTime 为空时回退 DeductionEndTime
 	deductionMs := now.Add(1000 * 24 * time.Hour).UnixMilli()
-	d50 := now.Add(50 * 24 * time.Hour).Format("2006-01-02 15:04:05")     // CycleEndTime
-	d365 := now.Add(365 * 24 * time.Hour).Format("2006-01-02 15:04:05")   // 有效 ExpiredTime
+	d50 := now.Add(50 * 24 * time.Hour).Format("2006-01-02 15:04:05")   // CycleEndTime
+	d365 := now.Add(365 * 24 * time.Hour).Format("2006-01-02 15:04:05") // 有效 ExpiredTime
 	tpl := `{
 	  "code": 0,
 	  "data": {"Response": {"Data": {
@@ -130,7 +130,7 @@ func TestProcessResourcesCapacityFallback(t *testing.T) {
 	}
 
 	cases := []struct {
-		name                       string
+		name                           string
 		wantUsed, wantRemain, wantSize float64
 	}{
 		{"A_仅Precise字符串", 99.5, 400.5, 500},
@@ -225,6 +225,119 @@ func TestProcessResourcesCyclePreferred(t *testing.T) {
 			t.Errorf("G cycle_size=%v，期望 500（回退账户总量）", a.CycleSize)
 		}
 		t.Logf("G: effective used=%v remain=%v size=%v | cycle_size=%v", a.CapacityUsed, a.CapacityRemain, a.CapacitySize, a.CycleSize)
+	}
+}
+
+// TestProcessResourcesTotalDosageAggregation 验证 total_dosage 为本地聚合值：
+// Σ 未过期包的有效剩余（周期优先 capacity_remain），不再透传上游 TotalDosage。
+//
+// 复现 bug：上游 TotalDosage 按账户级 CapacityRemain 聚合，而按月周期计费的
+// 体验版包周期额度用尽后账户级 Remain 不随周期扣减（幻影剩余），导致余额页
+// 顶部「官方总额度」恒多算该幻影值（实测 500），真实可用额度为 0 时仍显示
+// 500。修复后 total_dosage 与包卡片「剩余」合计一致（实测 2236 → 1736.88），
+// 上游原始值保留在 upstream_total_dosage 供对照。
+func TestProcessResourcesTotalDosageAggregation(t *testing.T) {
+	expired := time.Now().Add(-24 * time.Hour).Format("2006-01-02 15:04:05") // 已过期
+	tpl := `{"code":0,"data":{"Response":{"Data":{
+		"TotalDosage": 9999, "TotalCount": 5,
+		"Accounts": [
+			{"PackageName":"H_周期用尽的体验版(幻影500)","CapacityRemainPrecise":"500","CapacitySizePrecise":"500","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"0","CycleCapacityUsedPrecise":"500","CycleCapacitySizePrecise":"500","CapacityUnit":"credits","ExpiredTime":""},
+			{"PackageName":"I_正常裂变包","CapacityRemainPrecise":"1236.88","CapacitySizePrecise":"1500","CapacityUsedPrecise":"263.12","CycleCapacityRemainPrecise":"1236.88","CycleCapacitySizePrecise":"1500","CycleCapacityUsedPrecise":"263.12","CapacityUnit":"credits","ExpiredTime":""},
+			{"PackageName":"J_已过期包不计入","CapacityRemainPrecise":"200","CapacitySizePrecise":"200","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"200","CycleCapacitySizePrecise":"200","CycleCapacityUsedPrecise":"0","CapacityUnit":"credits","ExpiredTime":"%s"},
+			{"PackageName":"K_到期未知计入","CapacityRemainPrecise":"80","CapacitySizePrecise":"100","CapacityUsedPrecise":"20","CycleCapacityRemainPrecise":"80","CycleCapacitySizePrecise":"100","CycleCapacityUsedPrecise":"20","CapacityUnit":"credits"},
+			{"PackageName":"L_未动用签到包","CapacityRemainPrecise":"100","CapacitySizePrecise":"100","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"100","CycleCapacitySizePrecise":"100","CycleCapacityUsedPrecise":"0","CapacityUnit":"credits","ExpiredTime":""}
+		]
+	}}}}`
+	out := processResources([]byte(fmt.Sprintf(tpl, expired)))
+
+	// total_dosage = 0(幻影不计) + 1236.88 + 0(已过期不计) + 80 + 100 = 1416.88
+	if got, _ := out["total_dosage"].(float64); got != 1416.88 {
+		t.Errorf("total_dosage=%v，期望 1416.88（Σ未过期包有效剩余，剔除幻影/已过期）", out["total_dosage"])
+	}
+	// upstream_total_dosage 原样透传官方值，不受聚合影响
+	if got, _ := out["upstream_total_dosage"].(float64); got != 9999 {
+		t.Errorf("upstream_total_dosage=%v，期望 9999（透传官方原始值）", out["upstream_total_dosage"])
+	}
+
+	accs, ok := out["accounts"].([]resourceAccount)
+	if !ok || len(accs) != 5 {
+		t.Fatalf("accounts 解析异常: ok=%v len=%v", ok, len(accs))
+	}
+	byName := map[string]resourceAccount{}
+	for _, a := range accs {
+		byName[a.PackageName] = a
+	}
+	// H：周期用尽 → 有效剩余 0（幻影 500 不进合计，包卡片口径一致）
+	if a := byName["H_周期用尽的体验版(幻影500)"]; a.CapacityRemain != 0 {
+		t.Errorf("H capacity_remain=%v，期望 0（周期优先）", a.CapacityRemain)
+	}
+	// J：已过期 → 不计入合计，但包级字段保留原值
+	if a := byName["J_已过期包不计入"]; !a.Expired || a.CapacityRemain != 200 {
+		t.Errorf("J expired=%v remain=%v，期望 expired=true remain=200（字段保留原值，仅不计入合计）", a.Expired, a.CapacityRemain)
+	}
+	// K：到期未知 → 不标记过期（已计入合计）
+	if a := byName["K_到期未知计入"]; a.Expired || a.DaysLeft != nil {
+		t.Errorf("K expired=%v days_left=%s，期望未过期且 days_left=nil", a.Expired, daysLeftStr(a.DaysLeft))
+	}
+	t.Logf("total_dosage=%v upstream_total_dosage=%v", out["total_dosage"], out["upstream_total_dosage"])
+}
+
+// TestProcessResourcesTotalDosageMissingUpstream 验证上游 Data 缺 TotalDosage 字段时
+// upstream_total_dosage 落 0（number 对缺失字段返回 0，不 panic），且可用额度聚合
+// 不依赖该字段照常计算。前端对照行守卫为 >0，0 时隐藏，不会误导显示「官方 TotalDosage：0」。
+func TestProcessResourcesTotalDosageMissingUpstream(t *testing.T) {
+	tpl := `{"code":0,"data":{"Response":{"Data":{
+		"TotalCount": 1,
+		"Accounts": [
+			{"PackageName":"M_上游缺TotalDosage","CapacityRemainPrecise":"400.5","CapacitySizePrecise":"500","CapacityUsedPrecise":"99.5","CycleCapacityRemainPrecise":"400.5","CycleCapacitySizePrecise":"500","CycleCapacityUsedPrecise":"99.5","CapacityUnit":"credits","ExpiredTime":""}
+		]
+	}}}}`
+	out := processResources([]byte(tpl))
+	if got, _ := out["upstream_total_dosage"].(float64); got != 0 {
+		t.Errorf("upstream_total_dosage=%v，期望 0（字段缺失时 number 落 0）", out["upstream_total_dosage"])
+	}
+	if got, _ := out["total_dosage"].(float64); got != 400.5 {
+		t.Errorf("total_dosage=%v，期望 400.5（本地聚合不依赖上游字段）", out["total_dosage"])
+	}
+}
+
+// TestProcessResourcesTotalDosageEqualsUpstream 验证健康账号（无周期外幻影、无过期包、
+// 账户级与周期级一致）时本地聚合与官方 TotalDosage 相等——这是前端对照行隐藏
+// （x-show 两值不等才显示）的数据前提。
+func TestProcessResourcesTotalDosageEqualsUpstream(t *testing.T) {
+	tpl := `{"code":0,"data":{"Response":{"Data":{
+		"TotalDosage": 600, "TotalCount": 2,
+		"Accounts": [
+			{"PackageName":"N_正常包","CapacityRemainPrecise":"500","CapacitySizePrecise":"500","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"500","CycleCapacitySizePrecise":"500","CycleCapacityUsedPrecise":"0","CapacityUnit":"credits","ExpiredTime":""},
+			{"PackageName":"O_正常包","CapacityRemainPrecise":"100","CapacitySizePrecise":"100","CapacityUsedPrecise":"0","CycleCapacityRemainPrecise":"100","CycleCapacitySizePrecise":"100","CycleCapacityUsedPrecise":"0","CapacityUnit":"credits","ExpiredTime":""}
+		]
+	}}}}`
+	out := processResources([]byte(tpl))
+	got, _ := out["total_dosage"].(float64)
+	up, _ := out["upstream_total_dosage"].(float64)
+	if got != 600 || up != 600 {
+		t.Errorf("total_dosage=%v upstream_total_dosage=%v，期望均为 600（健康账号两口径一致，对照行应隐藏）", got, up)
+	}
+}
+
+// TestParseFlexibleTimeBillingZone 验证无时区格式的日期串按北京时间（UTC+8）解析，
+// 不随部署时区漂移；RFC3339 自带偏移不受影响。过期判定（Expired → 是否计入
+// 可用额度聚合）依赖该解析，非 +8 时区部署时若用 time.Local 解析会偏差最多 8 小时。
+func TestParseFlexibleTimeBillingZone(t *testing.T) {
+	ts, ok := parseFlexibleTime("2026-09-20 18:35:00")
+	if !ok {
+		t.Fatal("日期串解析失败")
+	}
+	if _, off := ts.Zone(); off != 8*3600 {
+		t.Errorf("解析偏移 = %d 秒，期望 +28800（北京时间，不随部署时区变化）", off)
+	}
+	// RFC3339 自带偏移，解析结果应保留串内时区而非套用 billingTZ
+	ts2, ok := parseFlexibleTime("2026-09-20T18:35:00+09:00")
+	if !ok {
+		t.Fatal("RFC3339 解析失败")
+	}
+	if _, off := ts2.Zone(); off != 9*3600 {
+		t.Errorf("RFC3339 偏移 = %d 秒，期望 +32400（保留串内时区）", off)
 	}
 }
 

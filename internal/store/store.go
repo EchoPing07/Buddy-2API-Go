@@ -503,6 +503,16 @@ func (s *Store) SetCache(table, key, payload string) error {
 	return err
 }
 
+// DeleteCacheKey 删除指定缓存行（幂等）。缓存表无 TTL 清理任务，换 key 后
+// 旧行会永久残留，由调用方在写入新 key 时顺手清理遗留 key。
+func (s *Store) DeleteCacheKey(table, key string) error {
+	if !cacheTables[table] {
+		return fmt.Errorf("非法缓存表: %s", table)
+	}
+	_, err := s.db.Exec(`DELETE FROM `+table+` WHERE account_key=?`, key)
+	return err
+}
+
 // ── util ──
 
 func boolToInt(b bool) int {
