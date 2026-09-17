@@ -72,7 +72,7 @@ func main() {
 	client := upstream.New(toks, func() string { return cfg.Get().Region }, cfg.Get().ChatTimeoutSeconds)
 	models := upstream.NewModelCache(cfg.Get().Region, client)
 	keys := apikey.New(st)
-	sched := scheduler.New(cfg, client, st)
+	sched := scheduler.New(cfg, client, st, models)
 
 	session, err := admin.NewSession(dataDirAbs)
 	if err != nil {

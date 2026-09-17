@@ -1,4 +1,4 @@
-// Package scheduler 定时任务：自动签到状态机（cron 定时 / 时间范围随机 / 末班兜底）+ 日志清理。
+// Package scheduler 定时任务：自动签到状态机（cron 定时 / 时间范围随机 / 末班兜底）+ 模型列表刷新 + 日志清理。
 package scheduler
 
 import (
@@ -22,6 +22,9 @@ const (
 	checkinRetryDelay = 5 * time.Minute
 	// checkinFallbackMin 末班兜底时刻（当日 23:50），失败 23:55 重试一次后认栽。
 	checkinFallbackMin = 23*60 + 50
+	// modelsRefreshSpec 每小时 01 分刷新一次模型列表（避开整点的签到/成长等任务密集期；
+	// 失败由 ModelCache 自行保留旧表或回落内置表，此处仅记录日志）。
+	modelsRefreshSpec = "0 1 * * * *"
 	// randomTargetTTL 随机主时刻缓存有效期（跨日后失效重摇）。
 	randomTargetTTL = 48 * 3600
 )
@@ -38,6 +41,7 @@ type Scheduler struct {
 	cfg    *config.Manager
 	client *upstream.Client
 	st     *store.Store
+	models *upstream.ModelCache // 可为 nil（测试构造 Scheduler 时未注入则跳过模型刷新）
 	tickID cron.EntryID
 	ck     checkinDay // 签到日内状态（mu 保护，跨日自动重置）
 	// 成长任务：growth 为链编排依赖的上游接口（生产为 client 本体，测试可注入 fake）
@@ -49,11 +53,14 @@ type Scheduler struct {
 	growthCatchupTimer *time.Timer  // 启动补跑 timer（s.mu 保护；Stop 时取消，重入重置不叠加）
 }
 
-// New 创建调度器并启动日志清理任务（每天 03:00）。
-func New(cfg *config.Manager, client *upstream.Client, st *store.Store) *Scheduler {
-	s := &Scheduler{c: cron.New(cron.WithParser(secondsParser), cron.WithChain()), cfg: cfg, client: client, st: st, growth: client}
+// New 创建调度器并启动日志清理任务（每天 03:00）与模型列表刷新（每小时 01 分）。
+func New(cfg *config.Manager, client *upstream.Client, st *store.Store, models *upstream.ModelCache) *Scheduler {
+	s := &Scheduler{c: cron.New(cron.WithParser(secondsParser), cron.WithChain()), cfg: cfg, client: client, st: st, models: models, growth: client}
 	if _, err := s.c.AddFunc("0 0 3 * * *", s.cleanupLogs); err != nil {
 		slog.Error("注册日志清理任务失败", "error", err)
+	}
+	if _, err := s.c.AddFunc(modelsRefreshSpec, s.refreshModels); err != nil {
+		slog.Error("注册模型列表刷新任务失败", "error", err)
 	}
 	s.Reconfigure()
 	s.c.Start()
@@ -285,6 +292,17 @@ func dayStart(t time.Time) time.Time {
 // minuteOfDay 当地时区当日第 minutes 分钟（0-1439）。
 func minuteOfDay(t time.Time, minutes int) time.Time {
 	return dayStart(t).Add(time.Duration(minutes) * time.Minute)
+}
+
+// refreshModels 定时刷新模型列表（/v3/config）。失败不改变已有缓存：
+// ModelCache.Refresh 在同 region 失败时保留旧表，换 region 失败时才回落内置表。
+func (s *Scheduler) refreshModels() {
+	if s.models == nil {
+		return
+	}
+	if err := s.models.Refresh(s.client); err != nil {
+		slog.Warn("定时刷新模型列表失败（已保留旧表）", "error", err)
+	}
 }
 
 // ── 日志清理 ──
