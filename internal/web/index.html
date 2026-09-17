@@ -705,31 +705,51 @@ section[x-show]{animation:fadeUp .18s ease-out}
                   :title="growthLastRunTitle()" x-text="'上次执行 '+growthLastRunText()"></span>
             <button class="btn btn-sm" @click="runGrowthChain()" :disabled="growthBusy">
               <span class="spin" x-show="growthBusy"></span>
-              <span class="ic" x-show="!growthBusy" x-html="ic('growth')"></span>立即执行全部
+              <span class="ic" x-show="!growthBusy" x-html="ic('growth')"></span>执行全部
             </button>
             <button class="btn btn-secondary btn-sm" @click="loadGrowth(true); loadCheckin()" :disabled="loading">
               <span class="ic" x-html="ic('refresh')"></span>刷新
             </button>
+            <a :href="growthCenterUrl" target="_blank" rel="noreferrer" title="在新窗口打开个人中心">
+              <button class="btn btn-secondary btn-sm" type="button">
+                <span class="ic" x-html="ic('external')"></span>个人中心
+              </button>
+            </a>
           </div>
         </header>
 
-        <!-- 每日签到（国内版功能，与成长任务同页；overview 未就绪/失败时仍可手动签到，仅确认不可用时隐藏） -->
+        <!-- 每日签到（国内版功能，与成长任务同页；仅 overview 明确返回 available:false 时随降级横幅隐藏，
+             overview 未就绪/请求失败时仍展示，签到接口自身失败则卡内降级 + 重试） -->
         <div class="card" x-show="!growth.loaded || growth.available">
           <div class="card-head">
             <h3>每日签到</h3>
-            <span class="badge" :class="checkin.today_checked_in?'badge-ok':'badge-muted'" x-text="checkin.today_checked_in?'今日已签到':'未签到'"></span>
             <div class="spacer"></div>
-            <button class="btn btn-sm" :class="checkin.today_checked_in?'btn-secondary':''" @click="claimCheckin()" :disabled="loading||checkin.today_checked_in">
-              <span class="ic" x-html="ic(checkin.today_checked_in?'check':'checkin')"></span>
-              <span x-text="checkin.today_checked_in?'已签到':'立即签到'"></span>
-            </button>
+            <span class="badge" x-show="checkinOk" :class="checkin.today_checked_in?'badge-ok':'badge-muted'" x-text="checkin.today_checked_in?'今日已签到':'未签到'"></span>
           </div>
-          <div class="checkin-grid">
-            <div class="checkin-item"><span class="metric-label">活动状态</span><span class="checkin-val" x-text="checkin.active?'进行中':'未开启'"></span></div>
-            <div class="checkin-item"><span class="metric-label">今日积分</span><span class="checkin-val" x-text="checkin.today_credit ?? '—'"></span></div>
-            <div class="checkin-item"><span class="metric-label">连续签到</span><span class="checkin-val" x-text="(checkin.streak_days ?? 0)+' 天'"></span></div>
+          <template x-if="checkinOk && !checkinPending">
+            <div>
+              <div class="stat-grid">
+                <div class="stat"><span class="metric-label">今日积分</span><span class="stat-v" x-text="checkin.today_credit ?? '—'"></span></div>
+                <div class="stat"><span class="metric-label">连续签到</span><span class="stat-v" x-text="(checkin.streak_days ?? 0)+' 天'"></span></div>
+                <div class="stat"><span class="metric-label">活动状态</span><span class="stat-v" x-text="checkin.active?'进行中':'未开启'"></span></div>
+              </div>
+              <div class="action-row">
+                <button class="btn btn-sm" :class="checkin.today_checked_in?'btn-secondary':''" @click="claimCheckin()" :disabled="loading||checkin.today_checked_in">
+                  <span class="ic" x-html="ic(checkin.today_checked_in?'check':'checkin')"></span>
+                  <span x-text="checkin.today_checked_in?'今日已签到':'立即签到'"></span>
+                </button>
+                <span class="muted-xs" x-text="checkinHint()"></span>
+              </div>
+            </div>
+          </template>
+          <div class="empty" style="padding:24px 0" x-show="checkinPending || !checkin.loaded">
+            <span class="spin" style="width:18px;height:18px"></span>加载中…
           </div>
-          <p class="field-hint" x-text="checkinHint()"></p>
+          <div class="empty" style="padding:24px 0" x-show="checkin.loaded && !checkinOk && !checkinPending">
+            <span class="ic ic-lg" x-html="ic('checkin')"></span>
+            <p class="muted-xs" style="margin:0" x-text="'签到状态加载失败：'+(checkinErr||'未知错误')"></p>
+            <button class="btn btn-secondary btn-sm" @click="loadCheckin()">重试</button>
+          </div>
         </div>
 
         <!-- 不可用横幅（region=global / 未登录） -->
@@ -750,58 +770,56 @@ section[x-show]{animation:fadeUp .18s ease-out}
           <div class="card">
             <div class="card-head">
               <h3>连登与奖励</h3>
-              <span class="badge" :class="growthDegraded('streak')?'badge-muted':(growth.streak&&growth.streak.days>0?'badge-ok':'badge-muted')"
+              <div class="spacer"></div>
+              <span class="badge" :class="growth.streak&&growth.streak.days>0?'badge-ok':'badge-muted'"
                     x-show="!growthDegraded('streak')">
                 <span class="ic ic-sm" x-html="ic('flame')"></span>连登 <span x-text="(growth.streak||{}).days ?? 0"></span> 天
               </span>
-              <div class="spacer"></div>
               <span class="badge badge-warn" x-show="growthDegraded('streak')">部分数据不可用</span>
             </div>
             <template x-if="!growthDegraded('streak') && growth.streak">
               <div>
-                <div class="row" style="gap:16px;margin-bottom:14px">
-                  <div>
-                    <p class="metric-label">连登天数</p>
-                    <div class="big-num" style="font-size:var(--fs-2xl)" x-text="growth.streak.days"></div>
+                <div class="stat-grid">
+                  <div class="stat">
+                    <span class="metric-label">距下一档</span>
+                    <span class="stat-v" x-text="growth.streak.remaining_days>0 ? '还差 '+growth.streak.remaining_days+' 天' : '已到最高档'"></span>
                   </div>
-                  <div>
-                    <p class="metric-label">距下一档</p>
-                    <div class="checkin-val" x-text="growth.streak.remaining_days>0 ? '还差 '+growth.streak.remaining_days+' 天' : '已到最高档'"></div>
-                    <p class="muted-xs">补签卡 <span x-text="growth.streak.makeup_cards.balance"></span> / <span x-text="growth.streak.makeup_cards.max"></span> 张</p>
+                  <div class="stat">
+                    <span class="metric-label">补签卡</span>
+                    <span class="stat-v" x-text="growth.streak.makeup_cards.balance+' / '+growth.streak.makeup_cards.max+' 张'"></span>
+                  </div>
+                  <div class="stat">
+                    <span class="metric-label">抽奖次数</span>
+                    <span class="stat-v" x-text="growthDegraded('lottery') ? '—（暂不可用）' : ((growth.lottery||{}).chances ?? '—')"></span>
                   </div>
                 </div>
-                <div class="tier-grid">
+                <div class="tier-grid" style="margin-top:14px">
                   <template x-for="t in (growth.streak.tiers||[])" :key="t.tier">
                     <div class="tier-card" :class="t.status"
-                         @click="t.status==='available' && runGrowthRedeem(t.tier)">
+                         :tabindex="t.status==='available'?0:null"
+                         :role="t.status==='available'?'button':null"
+                         :aria-disabled="t.status!=='available'"
+                         :aria-label="t.status==='available' ? ('兑换 '+t.tier+' 档奖励') : null"
+                         @click="t.status==='available' && runGrowthRedeem(t.tier)"
+                         @keydown.enter.prevent="t.status==='available' && runGrowthRedeem(t.tier)"
+                         @keydown.space.prevent="t.status==='available' && runGrowthRedeem(t.tier)">
                       <div class="tier-head">
                         <span x-text="t.tier"></span>
                         <span class="badge" :class="t.status==='claimed'?'badge-muted':(t.status==='available'?'badge-ok':'badge-muted')" x-text="growthTierSub(t)"></span>
                       </div>
-                      <span x-text="'+'+t.credit+' 积分 · +'+t.energy+' 能量'"></span>
-                      <span x-text="'+'+t.cards+' 补签卡 · +'+t.chances+' 抽奖'"></span>
+                      <div class="tier-row"><span class="metric-label">奖励</span><span class="v" x-text="'+'+t.credit+' 积分 · +'+t.energy+' 能量'"></span></div>
+                      <div class="tier-row"><span class="v" x-text="'+'+t.cards+' 补签卡 · +'+t.chances+' 抽奖'"></span></div>
                     </div>
                   </template>
                 </div>
-                <div style="margin-top:10px">
-                  <div class="growth-row">
-                    <span class="muted">抽奖次数</span>
-                    <span class="checkin-val" x-text="(growth.lottery||{}).chances ?? '—'"></span>
-                    <button class="btn btn-secondary btn-sm" @click="runGrowthLottery()" :disabled="growthBusy || !(growth.lottery&&growth.lottery.chances>0)">抽奖一次</button>
-                  </div>
-                  <div class="growth-row">
-                    <span class="muted">昨日漏签</span>
-                    <template x-if="growthMakeupReady()">
-                      <button class="btn btn-sm" style="background:var(--bar-fill);color:#fff"
-                              @click="runGrowthMakeup()" :disabled="growthBusy"
-                              x-text="'补签 '+(growth.heatmap.yesterday.date||'')+'（连登保住）'"></button>
-                    </template>
-                    <span class="muted-xs" x-show="!growthMakeupReady()">昨日正常活跃、无判据或无补签卡</span>
-                  </div>
-                  <div class="growth-row">
-                    <span class="muted">新手礼包 / 活动补偿</span>
-                    <button class="btn btn-secondary btn-sm" @click="runGrowthBonus()" :disabled="growthBusy">领取</button>
-                  </div>
+                <div class="action-row">
+                  <!-- 昨日漏签且有余卡时才出现（其余情况不占位，避免常态多一行死信息） -->
+                  <button class="btn btn-warn btn-sm" x-show="growthMakeupReady()"
+                          @click="runGrowthMakeup()" :disabled="growthBusy"
+                          x-text="'补签 '+(((growth.heatmap||{}).yesterday||{}).date||'')+'（连登保住）'"></button>
+                  <button class="btn btn-secondary btn-sm" @click="runGrowthLottery()" :disabled="growthBusy || !(growth.lottery&&growth.lottery.chances>0)"
+                          :title="growthDegraded('lottery')?'抽奖次数查询失败，请刷新后重试':''">抽奖一次</button>
+                  <button class="btn btn-secondary btn-sm" @click="runGrowthBonus()" :disabled="growthBusy">领取新手礼包 / 活动补偿</button>
                 </div>
               </div>
             </template>
@@ -810,18 +828,20 @@ section[x-show]{animation:fadeUp .18s ease-out}
             </div>
           </div>
 
-          <!-- 卡片B：活跃地图 -->
+          <!-- 卡片B：活跃地图 + 今日上报 -->
           <div class="card">
             <div class="card-head">
-              <h3>活跃地图 · 对话上报</h3>
-              <span class="badge" :class="(growth.today||{}).report_done?'badge-ok':'badge-muted'"
-                    x-text="(growth.today||{}).report_done?'今日已上报':'今日未上报'"></span>
+              <h3>活跃地图</h3>
+              <span class="muted-xs" x-show="((growth.heatmap||{}).cells||[]).length">近 <span x-text="((growth.heatmap||{}).cells||[]).length"></span> 天</span>
               <div class="spacer"></div>
+              <span class="badge" :class="(growth.today||{}).report_done?'badge-ok':'badge-muted'"
+                    x-show="!growthDegraded('heatmap')"
+                    x-text="(growth.today||{}).report_done?'今日已上报':'今日未上报'"></span>
               <span class="badge badge-warn" x-show="growthDegraded('heatmap')">部分数据不可用</span>
             </div>
             <template x-if="!growthDegraded('heatmap') && growth.heatmap">
               <div>
-                <div class="hm-cells" x-show="(growth.heatmap.cells||[]).length">
+                <div class="hm-cells" x-show="((growth.heatmap||{}).cells||[]).length">
                   <template x-for="(cell,i) in (growth.heatmap.cells||[])" :key="i">
                     <span class="hm-cell"
                           :class="{ 'hm-on':cell.score>0,
@@ -830,23 +850,26 @@ section[x-show]{animation:fadeUp .18s ease-out}
                           :title="cell.date+(cell.score>0?' 活跃':' 漏签')"></span>
                   </template>
                 </div>
-                <p class="muted-xs" x-show="!(growth.heatmap.cells||[]).length">暂无活跃地图数据</p>
-                <p class="muted-xs" style="margin-top:6px"
-                   x-text="'每格一日：绿色=活跃 · 灰=漏签 · 黑框=今日 · 黄框=昨日漏签可补'"></p>
+                <p class="muted-xs" x-show="!((growth.heatmap||{}).cells||[]).length">暂无活跃地图数据</p>
+                <div class="legend-row" x-show="((growth.heatmap||{}).cells||[]).length">
+                  <span class="lg"><i class="dot on"></i>活跃</span>
+                  <span class="lg"><i class="dot"></i>漏签</span>
+                  <span class="lg"><i class="dot ring"></i>今日</span>
+                  <span class="lg"><i class="dot ring-miss"></i>昨日漏签（可补）</span>
+                </div>
               </div>
             </template>
             <div class="empty" x-show="growthDegraded('heatmap')">
               <span class="ic ic-lg" x-html="ic('growth')"></span>热力图暂不可用
             </div>
-            <div style="margin-top:12px">
-              <div class="row" style="gap:12px">
-                <span class="muted-xs" x-text="'今日上报 '+((growth.today||{}).report_count||5)+' 条/天'"></span>
-                <button class="btn btn-sm" @click="runGrowthReport()" :disabled="growthBusy">
-                  <span class="spin" x-show="growthBusy"></span>
-                  <span x-text="growthBusy?'上报中…（约 10 秒）':'立即上报'"></span>
-                </button>
-              </div>
-              <p class="field-hint">每条上报模拟一次官方客户端对话事件，点亮活跃地图连登天数，同时累积领养猫的前置对话任务（chat_5）</p>
+            <!-- 上报是写操作（POST），不被只读的 heatmap 降级连带隐藏：读取失败时上报往往仍可用，
+                 真不可用由 POST 返回的错误提示兜底 -->
+            <div class="action-row">
+              <button class="btn btn-sm" @click="runGrowthReport()" :disabled="growthBusy">
+                <span class="spin" x-show="growthBusy"></span>
+                <span x-text="growthBusy?'上报中…':'立即上报'"></span>
+              </button>
+              <span class="muted-xs">上报对话活跃，点亮连登天数</span>
             </div>
           </div>
 
@@ -854,7 +877,7 @@ section[x-show]{animation:fadeUp .18s ease-out}
           <div class="card">
             <div class="card-head">
               <h3>猫猫旅行</h3>
-              <span class="badge badge-muted">每日 1 次</span>
+              <span class="muted-xs" x-show="growth.buddy&&growth.buddy.has">每日 1 次</span>
               <div class="spacer"></div>
               <span class="badge badge-warn" x-show="growthDegraded('travel')||growthDegraded('buddy')">部分数据不可用</span>
             </div>
@@ -865,42 +888,32 @@ section[x-show]{animation:fadeUp .18s ease-out}
             </template>
             <template x-if="growth.buddy && growth.buddy.has && !growthDegraded('buddy')">
               <div>
-                <div class="row" style="gap:14px;margin-bottom:12px">
-                  <span style="font-size:28px">🐱</span>
-                  <div>
-                    <div class="checkin-val" x-text="growth.buddy.name||'喵喵'"></div>
-                    <span class="badge" :class="growth.travel&&growth.travel.state==='arrived'?'badge-ok':(growth.travel&&growth.travel.state==='traveling'?'badge-muted':'badge-muted')"
-                          x-text="{idle:'在家休息', traveling:'旅行中', arrived:'已到站'}[(growth.travel||{}).state]||'状态未知'"></span>
-                  </div>
+                <div class="row" style="gap:12px">
+                  <span style="font-size:24px;line-height:1">🐱</span>
+                  <span style="font-size:var(--fs-lg);font-weight:600" x-text="growth.buddy.name||'喵喵'"></span>
+                  <span class="badge" :class="growth.travel&&growth.travel.state==='arrived'?'badge-ok':(growth.travel&&growth.travel.state==='traveling'?'badge-warn':'badge-muted')"
+                        x-text="{idle:'在家休息', traveling:'旅行中', arrived:'已到站'}[(growth.travel||{}).state]||'状态未知'"></span>
+                  <span class="muted-xs" x-show="growth.travel&&growth.travel.state==='traveling'">到站后自动领奖</span>
+                  <span class="muted-xs" x-show="growth.travel&&growth.travel.state==='idle'&&growth.travel.daily_limit_reached">今日已派出，明日 9:00 自动领奖</span>
                 </div>
-                <template x-if="growth.travel">
-                  <div>
-                    <!-- arrived → 领奖 -->
-                    <template x-if="growth.travel.state==='arrived'">
-                      <button class="btn btn-sm" @click="runGrowthTravel()" :disabled="growthBusy"
-                              x-text="'领取旅行奖励'+(growth.travel.reward_credit>0?'（+'+growth.travel.reward_credit+' 积分）':'')"></button>
-                    </template>
-                    <!-- idle → 派出（未达日限） -->
-                    <template x-if="growth.travel.state==='idle' && !growth.travel.daily_limit_reached">
-                      <button class="btn btn-sm" @click="runGrowthTravel()" :disabled="growthBusy">派出旅行（收益见官方说明）</button>
-                    </template>
-                    <span class="muted-xs" x-show="growth.travel.state==='idle' && growth.travel.daily_limit_reached">今日已派出过，明日 9 点巡检自动领奖</span>
-                    <span class="muted-xs" x-show="growth.travel.state==='traveling'">旅行中，到站后巡检自动领奖</span>
-                  </div>
-                </template>
+                <div class="action-row">
+                  <!-- 单动作状态机：到站先领奖、空闲才派出；traveling/已达日限时后端 stepTravel
+                       直接返回 skip，故不再渲染会空转的「立即巡检」按钮 -->
+                  <button class="btn btn-sm" x-show="growth.travel && growth.travel.state==='arrived'" @click="runGrowthTravel()" :disabled="growthBusy"
+                          x-text="'领取旅行奖励'+(((growth.travel||{}).reward_credit>0)?'（+'+growth.travel.reward_credit+' 积分）':'')"></button>
+                  <button class="btn btn-sm" x-show="growth.travel && growth.travel.state==='idle' && !growth.travel.daily_limit_reached" @click="runGrowthTravel()" :disabled="growthBusy">派出旅行</button>
+                  <span class="muted-xs">到站领奖 · 空闲派出</span>
+                </div>
               </div>
             </template>
             <template x-if="growth.buddy && !growth.buddy.has && !growthDegraded('buddy')">
               <div class="empty" style="padding:20px 0">
                 <span class="ic ic-lg" x-html="ic('growth')"></span>
-                <p class="muted-xs" style="margin:0">还没有猫咪。领养前置：累计 5 次对话（今日上报 5 条即可达成）</p>
+                <p class="muted-xs" style="margin:0">领养前置：累计 5 次对话</p>
+                <p class="muted-xs" style="margin:0" x-show="(growth.today||{}).adopt_tried">今日已尝试领养（门槛未达），明日上报后自动重试</p>
                 <button class="btn btn-sm" @click="runGrowthAdopt()" :disabled="growthBusy">领养猫咪</button>
               </div>
             </template>
-            <div class="row" style="margin-top:12px">
-              <button class="btn btn-secondary btn-sm" @click="runGrowthTravel()" :disabled="growthBusy">立即巡检</button>
-              <span class="muted-xs">单动作状态机：到站先领奖，空闲才派出</span>
-            </div>
           </div>
         </div>
         </template>
@@ -1238,19 +1251,20 @@ function app(){
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{name:'',custom_key:''}, keyModal:false,
     resources:{accounts:[],loaded:false},
-    hideDepleted: localStorage.getItem('buddy2api:hideDepleted')==='1', // 默认 false = 全部显示
+    checkin:{loaded:false}, checkinOk:false, checkinErr:'', checkinPending:false,
     checkin:{loaded:false},
     /* ── 任务 ── */
     growth:{available:true, reason:'', loaded:false, streak:null, heatmap:null,
             buddy:null, travel:null, lottery:null, today:null, last_run:null,
             degraded:[], updated_at:0},
     growthErr:'',               // overview 请求失败信息（非空时视图整体空态 + 重试）
+    growthCenterUrl:'https://www.workbuddy.cn/profile/growth-center',  // 官网个人中心（成长中心）
     growthBusy:false,           // 上报/领养等长动作锁（与全局 loading 分开：上报要 10s）
     growthRunT:0,               // 总览防抖 timer
     settings:{}, pwForm:{old_password:'',new_password:''},
     models:{models:[],ids:[],state:null,loading:false},
     importModal:false, importForm:{access_token:'',refresh_token:'',domain:'',filename:''},
-    confirmBox:{open:false,title:'',message:'',onOk:null},
+    confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},
     oauth:{state:'',auth_url:'',poll_msg:'等待授权中…',_timer:null,_deadline:0},
     _chartGeom:null,
 
@@ -1683,22 +1697,45 @@ function app(){
     /* ── 签到 ── */
     checkinHint(){
       const s = this.settings || {};
-      if(!s.auto_checkin) return '可在「设置」中开启自动签到，支持定时或时间范围内随机执行';
-      if(s.checkin_mode==='random'){
-        const base = `每天 ${s.checkin_random_start}–${s.checkin_random_end} 内随机签到`;
-        return this.checkin.random_target ? `今日随机时刻 ${this.checkin.random_target}（${base}）` : base;
+      let base;
+      if(!s.auto_checkin){
+        base = '自动签到未开启';
+      }else if(s.checkin_mode==='random'){
+        base = this.checkin.random_target ? `今日 ${this.checkin.random_target} 签到` : `${s.checkin_random_start}–${s.checkin_random_end} 随机签到`;
+      }else{
+        base = `定时签到 ${s.checkin_cron}`;
       }
-      return `按 Cron 定时签到（${s.checkin_cron}）`;
+      // 活动未开启时手动领取必然失败，提前在提示里说明，避免用户点了才报错
+      return base + (this.checkinOk && !this.checkin.active ? ' · 活动未开启' : '');
     },
     async loadCheckin(){
+      this.checkinPending = true;
       try{
         const r = await this.api('/admin/checkin/status');
         const d = r.data && r.data.data ? r.data.data : (r.data||{});
         this.checkin = Object.assign({loaded:true, random_target:r.random_target||''}, d);
+        this.checkinOk = true; this.checkinErr = '';
       }catch(e){
-        // 国际版/未登录：签到卡片已随任务降级横幅隐藏，不重复 toast
-        if(!this.growth.loaded || this.growth.available) this.toast(e.message,'err');
+        // 国际版/未登录/上游异常：卡片自身降级为空态 + 重试，不额外 toast 刷屏。
+        // 标记 loaded=true 以区分「加载中」与「已失败」，否则首帧/请求在途会假报失败。
+        this.checkin = Object.assign({}, this.checkin, {loaded:true});
+        this.checkinOk = false; this.checkinErr = e.message;
+      }finally{
+        this.checkinPending = false;
       }
+    },
+    // 执行链内的签到一步：已签则跳过，失败只记结果不阻断整链
+    // 返回 state: ok=领到积分 | skip=已签到/不可领（正常态）| fail=请求失败（需提示）
+    async doCheckinStep(){
+      try{
+        const st = await this.api('/admin/checkin/status');
+        const d = st.data && st.data.data ? st.data.data : (st.data||{});
+        if(d.today_checked_in) return {state:'skip', detail:'今日已签到'};
+        const r = await this.api('/admin/checkin/claim',{method:'POST'});
+        const got = (r.data && r.data.data) || {};
+        if(got.credit > 0) return {state:'ok', detail:'+'+got.credit+' 积分'};
+        return {state:'skip', detail:'今日已签到或暂不可领取'};
+      }catch(e){ return {state:'fail', detail:e.message}; }
     },
     async claimCheckin(){
       this.busy(async()=>{
@@ -1743,15 +1780,20 @@ function app(){
       return (lr.steps||[]).map(s=>s.key+':'+s.status).join(' ');
     },
     growthTierSub(t){
-      const days = (this.growth.streak||{}).days || 0;
-      if(t.status==='locked') return '还差 '+Math.max(0,t.days-days)+' 天';
       if(t.status==='claimed') return '已领取';
-      return '可领取';
+      if(t.status==='available') return '可领取';
+      // locked：按本档所需天数与当前连登天数作差，不要拿 remaining_days（它只描述下一档）
+      const days = (this.growth.streak||{}).days || 0;
+      return '还差 '+Math.max(0, t.days-days)+' 天';
     },
     // 通用动作执行器：path + body + 自定义成功回调（缺省 toast detail）
-    async _growthAction(path, body, onDone){
-      if(this.growthBusy) return;
-      this.growthBusy = true;
+    // opts.locked=true：调用方已持有 growthBusy（组合动作，如「执行全部」先签到再跑链），
+    // 这里不再重复判断/加锁（否则会被开头的 busy 判断直接 return，后半段永远不执行）
+    async _growthAction(path, body, onDone, opts){
+      if(!(opts && opts.locked)){
+        if(this.growthBusy) return;
+        this.growthBusy = true;
+      }
       try{
         const r = await this.api(path, {method:'POST', body:JSON.stringify(body||{})});
         if(r.ok === false){
@@ -1766,16 +1808,35 @@ function app(){
       this.growthBusy = false;
     },
     runGrowthChain(){
-      this.askConfirm('执行任务链',
-        '将依次执行：活跃上报 → 连登自检 → 领养 → 礼包/补签 → 兑换 → 抽奖 → 旅行巡检，约需 15 秒，确认执行？',
-        ()=> this._growthAction('/admin/growth/run', {}, r=>
-          this.toast('任务链已执行（'+(((r.result||{}).steps)||[]).length+' 步）','ok')));
+      // 签到是国内版功能：overview 明确不可用（global / 未登录）时跳过，别发注定失败的上游调用
+      const skipCheckin = this.growth.loaded && !this.growth.available;
+      const steps = (skipCheckin ? '' : '签到 → ') +
+        '活跃上报 → 连登自检 → 领养 → 礼包/补签 → 兑换 → 抽奖 → 旅行巡检';
+      this.askConfirm('执行全部',
+        '将依次执行：'+steps+'，约需 15 秒，确认执行？',
+        async ()=>{
+          if(this.growthBusy) return;
+          this.growthBusy = true;   // 贯穿签到 + 任务链两段，防中途重复点击
+          try{
+            const ck = skipCheckin ? null : await this.doCheckinStep();
+            if(!skipCheckin) this.loadCheckin();
+            await this._growthAction('/admin/growth/run', {}, r=>{
+              const n = (((r.result||{}).steps)||[]).length;
+              this.toast('任务链已执行（'+n+' 步）'+(ck ? ' · 签到'+ck.detail : ''), 'ok');
+              if(ck && ck.state==='fail') this.toast('签到失败：'+ck.detail, 'err');
+            }, {locked:true});
+          }finally{ this.growthBusy = false; }
+        });
     },
     runGrowthReport(){
-      const n = (this.growth.today||{}).report_count || 5;
-      const done = (this.growth.today||{}).report_done;
+      const t = this.growth.today||{};
+      const done = t.report_done;
+      // 缺省 count 交由服务端按配置 + 波动数随机，前端文案按区间展示
+      const nDisp = t.report_jitter
+        ? (((+t.report_count||10)-(+t.report_jitter)) + '–' + ((+t.report_count||10)+(+t.report_jitter)))
+        : String(+t.report_count||10);
       this.askConfirm('立即上报',
-        '将向上游发送 '+n+' 条对话活跃上报（模拟同会话多轮，约 10 秒）。'+
+        '将向上游发送 '+nDisp+' 条对话活跃上报（模拟同会话多轮，约 10 秒）。'+
         (done?'今日已完成过上报，重复上报无额外收益。':'')+'确认执行？',
         ()=> this._growthAction('/admin/growth/report', {}, r=>{
           if(r.sent === r.total) this.toast('已上报 '+r.sent+' 条','ok');
@@ -1816,8 +1877,23 @@ function app(){
     },
     growthHint(){
       const s = this.settings||{};
-      if(!s.auto_growth) return '任务未开启自动执行，可在「设置」中开启，或使用下方按钮手动执行';
-      return '自动执行中：上报链 '+s.growth_report_cron+' · 旅行巡检 '+s.growth_travel_cron+' · 每日上报 '+(s.growth_report_count||5)+' 条';
+      if(!s.auto_growth) return '自动任务未开启';
+      return '自动任务：上报 '+s.growth_report_cron+' · 旅行 '+s.growth_travel_cron+' · '+this.growthCountText();
+    },
+    /** 上报条数区间文案：有波动显示 N±J（实际 a-b 条），无波动显示 N 条 */
+    growthCountText(){
+      const s = this.settings||{};
+      const n = Math.min(10, Math.max(1, +s.growth_report_count||10));
+      const j = Math.min(10, Math.max(0, +s.growth_report_jitter||0));
+      if(!j) return n+' 条';
+      return n+'±'+j+' 条（实际 '+(Math.max(1,n-j))+'-'+(Math.min(10,n+j))+' 条随机）';
+    },
+    growthCountHint(){
+      const s = this.settings||{};
+      const j = Math.min(10, Math.max(0, +s.growth_report_jitter||0));
+      return j
+        ? '上报 '+this.growthCountText()+'，每次执行在范围内随机取一个整数（更像真人，降低风控判定）；同会话多轮上报每条间隔 1.5 秒'
+        : '上报 '+this.growthCountText()+'（1-10 条，填 0 波动数则固定不变）；同会话多轮上报每条间隔 1.5 秒';
     },
 
     /* ── 日志 ── */
