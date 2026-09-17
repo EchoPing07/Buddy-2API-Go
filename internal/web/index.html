@@ -1017,6 +1017,11 @@ section[x-show]{animation:fadeUp .18s ease-out}
               <input class="input" type="number" min="1" max="3600" x-model.number="settings.chat_timeout_seconds">
               <p class="field-hint">上游自请求发出至开始响应的等待上限（1-3600 秒），超时即中止本次请求；流式连接建立后（含推理阶段）不再受超时约束。修改后需重启服务生效</p>
             </div>
+            <div class="form-row">
+              <label class="label">余额缓存（秒）</label>
+              <input class="input" type="number" x-model.number="settings.resource_cache_seconds">
+              <p class="field-hint">「余额」页额度数据缓存时长，缓存内重复访问不再请求上游</p>
+            </div>
           </div>
 
           <div class="card">
@@ -1026,80 +1031,6 @@ section[x-show]{animation:fadeUp .18s ease-out}
               <div class="form-row"><label class="label">新密码</label><input class="input" type="password" x-model="pwForm.new_password" autocomplete="new-password"></div>
             </div>
             <p class="field-hint">留空表示不修改密码；修改后下次登录使用新密码</p>
-          </div>
-          </div>
-
-          <div class="space">
-          <div class="card">
-            <div class="card-head"><h3>签到与缓存</h3></div>
-            <div class="switch-row">
-              <div>
-                <div class="sw-label">自动签到</div>
-                <p class="field-hint">由服务端定时执行签到</p>
-              </div>
-              <button type="button" class="switch" :class="{on:!!settings.auto_checkin}" @click="settings.auto_checkin=!settings.auto_checkin" aria-label="切换自动签到"></button>
-            </div>
-            <div class="form-row">
-              <label class="label">签到方式</label>
-              <select class="select" x-model="settings.checkin_mode">
-                <option value="fixed">定时（Cron 表达式）</option>
-                <option value="random">随机（时间范围内随机时刻）</option>
-              </select>
-            </div>
-            <div class="form-row" x-show="settings.checkin_mode!=='random'">
-              <label class="label">签到 Cron</label>
-              <input class="input" x-model="settings.checkin_cron" placeholder="0 0 9 * * *">
-              <p class="field-hint">含秒共 6 段，如 0 0 9 * * * 表示每天 9:00 执行</p>
-            </div>
-            <div class="form-grid c2" x-show="settings.checkin_mode==='random'">
-              <div class="form-row">
-                <label class="label">最早时间</label>
-                <input class="input" type="time" x-model="settings.checkin_random_start">
-              </div>
-              <div class="form-row">
-                <label class="label">最晚时间</label>
-                <input class="input" type="time" x-model="settings.checkin_random_end">
-                <p class="field-hint">每天在此范围内随机取一个时刻签到，最晚 23:30</p>
-              </div>
-            </div>
-            <div class="switch-row">
-              <div>
-                <div class="sw-label">末班兜底</div>
-                <p class="field-hint">当天没签成时：23:50 尝试，若失败 23:55 重试，再失败当天放弃</p>
-              </div>
-              <button type="button" class="switch" :class="{on:!!settings.checkin_fallback}" @click="settings.checkin_fallback=!settings.checkin_fallback" aria-label="切换末班兜底"></button>
-            </div>
-            <div class="form-row">
-              <label class="label">余额缓存（秒）</label>
-              <input class="input" type="number" x-model.number="settings.resource_cache_seconds">
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h3>任务</h3></div>
-            <div class="switch-row">
-              <div>
-                <div class="sw-label">自动任务</div>
-                <p class="field-hint">活跃上报点亮连登 + 领养 + 兑换/抽奖 + 猫猫旅行（仅国内版账号）</p>
-              </div>
-              <button type="button" class="switch" :class="{on:!!settings.auto_growth}" @click="settings.auto_growth=!settings.auto_growth" aria-label="切换自动任务"></button>
-            </div>
-            <div class="form-row">
-              <label class="label">上报链 Cron</label>
-              <input class="input" x-model="settings.growth_report_cron" placeholder="0 0 10 * * *">
-              <p class="field-hint">含秒共 6 段，如 0 0 10 * * * 表示每天 10:00 执行 上报→连登→领养→兑换→抽奖 链</p>
-            </div>
-            <div class="form-row">
-              <label class="label">旅行巡检 Cron</label>
-              <input class="input" x-model="settings.growth_travel_cron" placeholder="0 0 9,21 * * *">
-              <p class="field-hint">按状态机自动 领奖/派出，如 0 0 9,21 * * * 表示每天 9:00 与 21:00 巡检</p>
-            </div>
-            <div class="form-row">
-              <label class="label">每日上报条数</label>
-              <input class="input" type="number" min="1" max="10" x-model.number="settings.growth_report_count">
-              <p class="field-hint">1-10 条（领养前置 chat_5 需 5）；同会话多轮上报，每条间隔 1.5 秒防风控</p>
-            </div>
-            <p class="field-hint">错过当日上报时点，下次启动时自动补跑一次（22:00 前有效）；Docker 部署若 TZ 非 CST，cron 时点需自行换算</p>
           </div>
 
           <div class="card">
@@ -1114,8 +1045,90 @@ section[x-show]{animation:fadeUp .18s ease-out}
                 <input class="input" type="number" min="1" x-model.number="settings.log_max_size_mb">
               </div>
             </div>
-            <p class="field-hint">超限时自动删除最旧日志，与保留天数同时生效</p>
+            <p class="field-hint" style="margin-top:-6px">超限时自动删除最旧日志，与保留天数同时生效</p>
           </div>
+          </div>
+
+          <div class="space">
+          <div class="card">
+            <div class="card-head"><h3>签到</h3></div>
+            <div class="switch-row">
+              <div>
+                <div class="sw-label">自动签到</div>
+                <p class="field-hint" x-text="settings.auto_checkin ? '由服务端定时执行签到' : '开启后可选定时或时间范围内随机执行'"></p>
+              </div>
+              <button type="button" class="switch" :class="{on:!!settings.auto_checkin}" @click="settings.auto_checkin=!settings.auto_checkin" aria-label="切换自动签到"></button>
+            </div>
+            <div>
+              <div class="form-row">
+                <label class="label">签到方式</label>
+                <select class="select" x-model="settings.checkin_mode">
+                  <option value="fixed">定时（Cron 表达式）</option>
+                  <option value="random">随机（时间范围内随机时刻）</option>
+                </select>
+              </div>
+              <div class="form-row" x-show="settings.checkin_mode!=='random'">
+                <label class="label">签到 Cron</label>
+                <input class="input" x-model="settings.checkin_cron" placeholder="0 0 9 * * *">
+              </div>
+              <div class="form-grid c2" x-show="settings.checkin_mode==='random'">
+                <div class="form-row">
+                  <label class="label">最早时间</label>
+                  <input class="input" type="time" x-model="settings.checkin_random_start">
+                </div>
+                <div class="form-row">
+                  <label class="label">最晚时间</label>
+                  <input class="input" type="time" x-model="settings.checkin_random_end">
+                </div>
+              </div>
+              <p class="field-hint" style="margin-top:-6px"
+                 x-text="settings.checkin_mode==='random'
+                   ? '每天在此范围内随机取一个时刻签到，最晚 23:30'
+                   : '含秒共 6 段，如 0 0 9 * * * 表示每天 9:00 执行'"></p>
+              <div class="switch-row" style="padding-top:16px">
+                <div>
+                  <div class="sw-label">末班兜底</div>
+                  <p class="field-hint">当天没签成时：23:50 尝试，若失败 23:55 重试，再失败当天放弃</p>
+                </div>
+                <button type="button" class="switch" :class="{on:!!settings.checkin_fallback}" @click="settings.checkin_fallback=!settings.checkin_fallback" aria-label="切换末班兜底"></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>定时任务</h3></div>
+            <div class="switch-row">
+              <div>
+                <div class="sw-label">自动任务</div>
+                <p class="field-hint" x-text="settings.auto_growth ? '活跃上报点亮连登 + 领养 + 兑换/抽奖 + 猫猫旅行（仅国内版账号）' : '开启后自动跑活跃上报、领养、兑换抽奖与猫猫旅行（仅国内版账号）'"></p>
+              </div>
+              <button type="button" class="switch" :class="{on:!!settings.auto_growth}" @click="settings.auto_growth=!settings.auto_growth" aria-label="切换自动任务"></button>
+            </div>
+            <div>
+              <div class="form-row">
+                <label class="label">上报链 Cron</label>
+                <input class="input" x-model="settings.growth_report_cron" placeholder="0 0 10 * * *">
+              </div>
+              <div class="form-grid c2">
+                <div class="form-row">
+                  <label class="label">每日上报条数</label>
+                  <input class="input" type="number" min="1" max="10" x-model.number="settings.growth_report_count">
+                </div>
+                <div class="form-row">
+                  <label class="label">波动数（±）</label>
+                  <input class="input" type="number" min="0" max="10" x-model.number="settings.growth_report_jitter">
+                </div>
+              </div>
+              <div class="form-row" style="margin-top:-6px">
+                <label class="label">旅行巡检 Cron</label>
+                <input class="input" x-model="settings.growth_travel_cron" placeholder="0 0 9,21 * * *">
+              </div>
+              <p class="field-hint" style="margin-top:-6px">上报链按 上报→连登→领养→兑换→抽奖 执行；旅行巡检按状态机自动 领奖/派出</p>
+              <p class="field-hint" x-text="growthCountHint()" style="margin-top:2px"></p>
+              <p class="field-hint" style="margin-top:2px">错过当日上报时点，下次启动自动补跑一次（22:00 前有效）；Docker 部署若 TZ 非 CST，cron 时点需自行换算</p>
+            </div>
+          </div>
+
           </div>
         </div>
       </section>
@@ -1251,8 +1264,8 @@ function app(){
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{name:'',custom_key:''}, keyModal:false,
     resources:{accounts:[],loaded:false},
+    hideDepleted: localStorage.getItem('buddy2api:hideDepleted')==='1', // 默认 false = 全部显示
     checkin:{loaded:false}, checkinOk:false, checkinErr:'', checkinPending:false,
-    checkin:{loaded:false},
     /* ── 任务 ── */
     growth:{available:true, reason:'', loaded:false, streak:null, heatmap:null,
             buddy:null, travel:null, lottery:null, today:null, last_run:null,
@@ -1342,8 +1355,19 @@ function app(){
         catch(e){ this.toast(e.message,'err'); }
         finally{ this.loading=false; } };
     },
-    askConfirm(title, message, fn){
-      this.confirmBox = {open:true, title, message, onOk:()=>{ this.confirmBox.open=false; fn(); }};
+    /**
+     * 通用确认弹窗。
+     * opts.detail  次要说明（灰字，排在正文下方）
+     * opts.okText  主按钮文案，默认「确定」
+     * opts.danger  是否危险操作（默认 true，走 btn-danger；非破坏性操作传 false 走主色）
+     */
+    askConfirm(title, message, fn, opts){
+      const o = opts || {};
+      this.confirmBox = {
+        open:true, title, message,
+        detail:o.detail||'', okText:o.okText||'确定', danger:o.danger!==false,
+        onOk:()=>{ this.confirmBox.open=false; fn(); },
+      };
     },
     copy(text){
       navigator.clipboard.writeText(text).then(()=>this.toast('已复制到剪贴板','ok'));
@@ -1940,7 +1964,7 @@ function app(){
       finally{ this.models.loading = false; }
     },
     async loadSettings(){
-      try{ this.settings = await this.api('/admin/settings'); }catch(e){}
+      try{ this.settings = await this.api('/admin/settings'); this._savedSettings = Object.assign({}, this.settings); }catch(e){}
     },
     async refreshModels(){
       this.busy(async()=>{
@@ -1951,27 +1975,63 @@ function app(){
     },
     async saveSettings(){
       this.busy(async()=>{
-        const s = this.settings, body = {
+        const s = this.settings;
+        // 数字输入被清空时 Alpine 的 x-model.number 得到 null（+null === 0）。
+        // 后端对这些字段的语义分两种：>0 才写入（静默忽略 0）/ 硬校验 1..3600。
+        // 统一口径：留空 = 不下发该键（保持服务端原值），避免「发 0」导致静默丢弃或整单 400；
+        // chat_timeout 是硬校验字段，单独就地报错，不发必然 400 的请求。
+        const num = v => { const n = +v; return Number.isFinite(n) ? n : 0; };
+        const body = {
           listen:(s.listen||'').trim(),
           region:s.region, auto_checkin:!!s.auto_checkin,
-          checkin_cron:s.checkin_cron, checkin_mode:s.checkin_mode||'fixed',
-          checkin_random_start:s.checkin_random_start||'', checkin_random_end:s.checkin_random_end||'',
+          checkin_mode:s.checkin_mode||'fixed',
           checkin_fallback:!!s.checkin_fallback,
           auto_growth:!!s.auto_growth,
-          growth_report_cron:(s.growth_report_cron||'').trim(),
-          growth_travel_cron:(s.growth_travel_cron||'').trim(),
-          growth_report_count:+s.growth_report_count||5,
-          resource_cache_seconds:+s.resource_cache_seconds,
-          chat_timeout_seconds:+s.chat_timeout_seconds,
-          log_retention_days:+s.log_retention_days, log_max_size_mb:+s.log_max_size_mb,
+          growth_report_jitter:Math.min(10, Math.max(0, num(s.growth_report_jitter))),
         };
+        // cron/随机窗口仅在对应模式/开关下下发：存量非法值（常见来源是 env 写错）
+        // 不应阻断改密码/改日志等无关保存；关闭时不下发，后端会校验存量值并回落默认。
+        // 这样字段始终可见可改（x-show 而非 x-if），不会出现「改不了」的死锁。
+        if(s.auto_checkin && (s.checkin_mode||'fixed')!=='random'){
+          body.checkin_cron = (s.checkin_cron||'').trim();
+        }
+        if((s.checkin_mode||'fixed')==='random'){
+          body.checkin_random_start = s.checkin_random_start||'';
+          body.checkin_random_end = s.checkin_random_end||'';
+        }
+        if(s.auto_growth){
+          body.growth_report_cron = (s.growth_report_cron||'').trim();
+          body.growth_travel_cron = (s.growth_travel_cron||'').trim();
+        }
+        // 留空/非正不下发（后端这些字段是「>0 才写入」，发 0 会被静默忽略）
+        if(num(s.growth_report_count) > 0)    body.growth_report_count = num(s.growth_report_count);
+        if(num(s.resource_cache_seconds) > 0) body.resource_cache_seconds = num(s.resource_cache_seconds);
+        if(num(s.log_retention_days) > 0)     body.log_retention_days = num(s.log_retention_days);
+        if(num(s.log_max_size_mb) > 0)        body.log_max_size_mb = num(s.log_max_size_mb);
+        const cto = num(s.chat_timeout_seconds);
+        if(cto < 1 || cto > 3600){
+          this.toast('Chat 响应超时需在 1-3600 秒之间','err');
+          return;
+        }
+        body.chat_timeout_seconds = cto;
         if(this.pwForm.old_password || this.pwForm.new_password){
           body.old_password = this.pwForm.old_password;
           body.new_password = this.pwForm.new_password;
         }
-        this.settings = await this.api('/admin/settings',{method:'PUT',body:JSON.stringify(body)});
+        // 先取保存前的两份值用于变更提示：listen 改了才写「需重启」，其余情况不给误导性后缀
+        const prev = this._savedSettings || {};
+        try{
+          this.settings = await this.api('/admin/settings',{method:'PUT',body:JSON.stringify(body)});
+        }catch(e){
+          // 失败时回滚界面到服务端真实值，避免输入框残留导致下次仍失败；
+          // toast 交给外层 busy() 统一弹（此处不重复 toast，避免弹两条）
+          this.loadSettings();
+          throw e;
+        }
+        this._savedSettings = Object.assign({}, this.settings);
         this.pwForm = {old_password:'',new_password:''};
-        this.toast('设置已保存'+(body.listen?'，监听地址修改需手动重启服务生效':''),'ok');
+        const listenChanged = !!(prev.listen && body.listen && prev.listen !== body.listen);
+        this.toast('设置已保存'+(listenChanged?'，监听地址修改需手动重启服务生效':''),'ok');
         this.loadHealth();
       })();
     },
