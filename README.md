@@ -27,12 +27,12 @@
 | 单账号代理       | 一份凭证（`data/token.json`），OAuth 登录                        |
 | OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/models`、`/health` |
 | 多 API Key   | 随机 / 自定义 Key，支持备注、启停、使用量统计                              |
-| 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期 |
+| 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期，可一键隐藏已用完 / 已过期额度包 |
 | 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取（在「任务」页） |
 | 成长任务        | 活跃地图连登上报、连登奖励兑换/抽奖、补签卡、猫猫领养与旅行（仅国内版账号）；错过时点启动自动补跑，默认关闭 |
 | 仪表盘         | 请求量、Token、模型分布、Key 用量等聚合统计                              |
 | 模型倍率         | 模型列表展示当前实际倍率（如 `GLM-5.2 x0.50`），自动套用官方分时段折扣（夜间折扣 / 限时免费等，支持跨零点时段窗与时区） |
-| 自动刷新        | token 过期自动刷新，401 时刷新后重试一次                               |
+| 自动刷新        | token 过期自动刷新，401 时刷新后重试一次；模型列表每小时 01 分自动刷新（失败保留旧表） |
 | 指纹头         | 出站请求复刻官方 CLI 指纹头；chat 请求绝不携带 refresh_token              |
 
 ## 🚀 快速开始
@@ -122,7 +122,7 @@ go build -ldflags="-s -w -X buddy2api-go/internal/proxy.Version=v1.0.0" -o buddy
 1. 打开管理后台：本机部署访问 `http://127.0.0.1:10082`，Docker/局域网部署访问 `http://<服务器IP>:10082`，输入管理密码登录（默认 `password`）
 2. 「账号」页 → **登录**（OAuth 设备流，浏览器完成授权）
 3. 「密钥」页 → 创建 API Key（随机或自定义，支持备注/启停）
-4. （可选）「任务」页 → 每日签到与成长任务（活跃地图连登 / 连登奖励兑换与抽奖 / 猫猫旅行，仅国内版账号）；自动执行开关在「设置 → 任务」
+4. （可选）「任务」页 → 每日签到与成长任务（活跃地图连登 / 连登奖励兑换与抽奖 / 猫猫旅行，仅国内版账号）；自动执行开关在「设置 → 定时任务」
 5. 在任意 OpenAI 兼容客户端填入：
 
 ```
@@ -165,7 +165,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `GET /admin/resources` | 官方余额（带缓存，`?force=1` 强刷） |
 | `GET /admin/checkin/status` `POST /admin/checkin/claim` | 签到状态 / 领取 |
 | `GET /admin/growth/overview` | 成长任务总览（连登 / 热力格 / 猫猫 / 抽奖聚合，60s 缓存，`?force=1` 强刷） |
-| `POST /admin/growth/run` `POST /admin/growth/report` `POST /admin/growth/travel` | 手动执行完整任务链 / 活跃上报（`{count}` 缺省取配置，1-10）/ 旅行巡检 |
+| `POST /admin/growth/run` `POST /admin/growth/report` `POST /admin/growth/travel` | 手动执行完整任务链 / 活跃上报（`{count}` 显式指定 1-10，缺省交由服务端按「配置条数 + 波动数」随机）/ 旅行巡检 |
 | `POST /admin/growth/adopt` `POST /admin/growth/redeem` `POST /admin/growth/lottery` `POST /admin/growth/makeup` `POST /admin/growth/bonus` | 手动领养 / 兑换（`{tier}`=7d/14d/28d）/ 抽奖 / 补签（`{date}` 缺省昨日 CST）/ 领新手礼包与活动补偿 |
 | `GET /admin/api-keys` `POST /admin/api-keys` `PUT /admin/api-keys/{id}` `DELETE /admin/api-keys/{id}` | API Key 增删改查 |
 | `GET /admin/logs` | 请求日志（分页 + 筛选 model/key/status） |
@@ -233,7 +233,7 @@ Buddy-2API-Go/
 │   ├── proxy/             # /v1/chat/completions 代理（流式透传 + 非流式聚合）
 │   ├── apikey/            # OpenAI 端点 Key 管理（明文存储/随机/校验/限额）
 │   ├── admin/             # 管理后台 API（登录/账号/keys/日志/签到/余额/任务/设置）
-│   ├── scheduler/         # 定时任务（签到状态机 + 成长任务链 / 旅行巡检）
+│   ├── scheduler/         # 定时任务（签到状态机 + 成长任务链 / 旅行巡检 + 模型列表刷新 + 日志清理）
 │   └── web/               # 前端（go:embed 单 HTML，内嵌 Alpine.js）
 ├── Dockerfile
 ├── docker-compose.yml
