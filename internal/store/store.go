@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS checkin_cache (
   payload     TEXT,
   updated_at  INTEGER
 );
+CREATE TABLE IF NOT EXISTS growth_cache (
+  account_key TEXT PRIMARY KEY,
+  payload     TEXT,
+  updated_at  INTEGER
+);
 CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_logs_api_key ON logs(api_key_id);
 CREATE INDEX IF NOT EXISTS idx_logs_model   ON logs(model);
@@ -472,9 +477,10 @@ func (s *Store) CleanupLogsBySize(maxBytes int64) (int64, error) {
 var cacheTables = map[string]bool{
 	"resource_cache": true,
 	"checkin_cache":  true,
+	"growth_cache":   true,
 }
 
-// GetCache 读缓存（resource_cache / checkin_cache 共用），TTL 秒内有效。
+// GetCache 读缓存（resource_cache / checkin_cache / growth_cache 共用），TTL 秒内有效。
 func (s *Store) GetCache(table, key string, ttlSeconds int) (string, int64, bool) {
 	if !cacheTables[table] {
 		return "", 0, false

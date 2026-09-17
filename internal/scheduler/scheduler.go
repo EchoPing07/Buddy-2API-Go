@@ -40,11 +40,18 @@ type Scheduler struct {
 	st     *store.Store
 	tickID cron.EntryID
 	ck     checkinDay // 签到日内状态（mu 保护，跨日自动重置）
+	// 成长任务：growth 为链编排依赖的上游接口（生产为 client 本体，测试可注入 fake）
+	growthMu           sync.Mutex // 成长链互斥：cron 触发 vs 手动触发 vs 补跑，同一时刻只允许一条链在跑
+	growthState        growthDay  // 日内状态（growthMu 保护，跨 CST 日自动重置）
+	growth             growthClient
+	growthReportID     cron.EntryID // 上报+奖励链 cron entry
+	growthTravelID     cron.EntryID // 旅行巡检 cron entry
+	growthCatchupTimer *time.Timer  // 启动补跑 timer（s.mu 保护；Stop 时取消，重入重置不叠加）
 }
 
 // New 创建调度器并启动日志清理任务（每天 03:00）。
 func New(cfg *config.Manager, client *upstream.Client, st *store.Store) *Scheduler {
-	s := &Scheduler{c: cron.New(cron.WithParser(secondsParser), cron.WithChain()), cfg: cfg, client: client, st: st}
+	s := &Scheduler{c: cron.New(cron.WithParser(secondsParser), cron.WithChain()), cfg: cfg, client: client, st: st, growth: client}
 	if _, err := s.c.AddFunc("0 0 3 * * *", s.cleanupLogs); err != nil {
 		slog.Error("注册日志清理任务失败", "error", err)
 	}
@@ -53,34 +60,69 @@ func New(cfg *config.Manager, client *upstream.Client, st *store.Store) *Schedul
 	return s
 }
 
-// Reconfigure 按配置重装配签到任务：仅当 auto_checkin 开启注册分钟 tick；日内状态下次 tick 重建。
+// Reconfigure 按配置重装配定时任务：签到（auto_checkin）+ 成长任务（auto_growth）。
+// 日内状态下次 tick 重建。
 func (s *Scheduler) Reconfigure() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 先摘旧 entry（签到 + 成长），再按开关重挂
 	if s.tickID != 0 {
 		s.c.Remove(s.tickID)
 		s.tickID = 0
 	}
 	s.ck = checkinDay{}
+	if s.growthReportID != 0 {
+		s.c.Remove(s.growthReportID)
+		s.growthReportID = 0
+	}
+	if s.growthTravelID != 0 {
+		s.c.Remove(s.growthTravelID)
+		s.growthTravelID = 0
+	}
+
 	cfg := s.cfg.Get()
-	if !cfg.AutoCheckin {
-		return
+	if cfg.AutoCheckin {
+		id, err := s.c.AddFunc(checkinTickSpec, s.tickCheckin)
+		if err != nil {
+			slog.Error("注册签到任务失败", "error", err)
+		} else {
+			s.tickID = id
+			mode := cfg.CheckinMode
+			if mode == "random" {
+				mode += " " + cfg.CheckinRandomStart + "~" + cfg.CheckinRandomEnd
+			}
+			slog.Info("自动签到已开启", "mode", mode, "fallback", cfg.CheckinFallback)
+		}
 	}
-	id, err := s.c.AddFunc(checkinTickSpec, s.tickCheckin)
-	if err != nil {
-		slog.Error("注册签到任务失败", "error", err)
-		return
+	if cfg.AutoGrowth {
+		if id, err := s.c.AddFunc(cfg.GrowthReportCron, s.tickGrowthChain); err != nil {
+			slog.Error("注册成长任务链失败", "error", err, "cron", cfg.GrowthReportCron)
+		} else {
+			s.growthReportID = id
+		}
+		if id, err := s.c.AddFunc(cfg.GrowthTravelCron, s.tickTravel); err != nil {
+			slog.Error("注册旅行巡检失败", "error", err, "cron", cfg.GrowthTravelCron)
+		} else {
+			s.growthTravelID = id
+		}
+		slog.Info("成长任务已开启", "report_cron", cfg.GrowthReportCron,
+			"travel_cron", cfg.GrowthTravelCron, "count", cfg.GrowthReportCount)
+		// 启动补跑：当日已过上报时点且未上报 → 30s 后补跑一次。
+		// 判定同步完成（仅一条 SQLite 读）；timer 由 s.mu 保护并在 Stop 取消。
+		s.scheduleGrowthCatchup(cfg)
 	}
-	s.tickID = id
-	mode := cfg.CheckinMode
-	if mode == "random" {
-		mode += " " + cfg.CheckinRandomStart + "~" + cfg.CheckinRandomEnd
-	}
-	slog.Info("自动签到已开启", "mode", mode, "fallback", cfg.CheckinFallback)
 }
 
-// Stop 停止调度器。
-func (s *Scheduler) Stop() { <-s.c.Stop().Done() }
+// Stop 停止调度器（含取消未触发的成长补跑 timer）。
+func (s *Scheduler) Stop() {
+	s.mu.Lock()
+	if s.growthCatchupTimer != nil {
+		s.growthCatchupTimer.Stop()
+		s.growthCatchupTimer = nil
+	}
+	s.mu.Unlock()
+	<-s.c.Stop().Done()
+}
 
 // ── 签到状态机 ──
 
@@ -152,7 +194,7 @@ func (s *Scheduler) rollDayLocked(now time.Time, cfg config.Config) {
 		s.ck.mainAt = s.randomMainAt(now, cfg)
 		return
 	}
-	s.ck.mainAt = fixedMainAt(cfg.CheckinCron, now)
+	s.ck.mainAt = fixedMainAt("签到", cfg.CheckinCron, now)
 	if s.ck.mainAt.IsZero() {
 		slog.Warn("签到 cron 当日无触发时刻", "cron", cfg.CheckinCron)
 	}
@@ -221,10 +263,11 @@ func (s *Scheduler) attemptCheckin(label string) bool {
 }
 
 // fixedMainAt 取 cron 当日触发时刻；表达式非法或当日无触发（如仅工作日）返回零值。
-func fixedMainAt(cronExpr string, now time.Time) time.Time {
+// label 用于非法表达式时的日志前缀（签到/成长上报等）。
+func fixedMainAt(label, cronExpr string, now time.Time) time.Time {
 	sched, err := secondsParser.Parse(cronExpr)
 	if err != nil {
-		slog.Error("签到 cron 非法，今日仅剩末班兜底", "error", err, "cron", cronExpr)
+		slog.Error(label+" cron 非法，当日无触发时刻", "error", err, "cron", cronExpr)
 		return time.Time{}
 	}
 	day := now.Format("2006-01-02")

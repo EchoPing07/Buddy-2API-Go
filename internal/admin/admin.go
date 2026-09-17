@@ -16,12 +16,20 @@ import (
 	"buddy2api-go/internal/apikey"
 	"buddy2api-go/internal/auth"
 	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/scheduler"
 	"buddy2api-go/internal/store"
 	"buddy2api-go/internal/upstream"
 )
 
-// Reconfigurable 由 scheduler 实现，设置变更后重新装配定时任务。
-type Reconfigurable interface{ Reconfigure() }
+// SchedulerControl 由 scheduler 实现：设置变更后重装配定时任务 + 成长任务链手动触发。
+type SchedulerControl interface {
+	Reconfigure()
+	RunGrowthChain() scheduler.GrowthChainResult
+	RunTravelTick() scheduler.TravelTickResult
+	RunActivityReports(count int) scheduler.ActivityReportResult
+	RunGrowthAdopt() scheduler.GrowthAdoptResult
+	RunGrowthRedeem(tier string) scheduler.GrowthRedeemActionResult
+}
 
 // Handler 管理后台 API 处理器。
 type Handler struct {
@@ -29,16 +37,17 @@ type Handler struct {
 	st      *store.Store
 	toks    *auth.TokenStore
 	client  *upstream.Client
+	growth  growthAPI // 成长端点依赖（生产为 client 本体；测试可注入 fake）
 	models  *upstream.ModelCache
 	keys    *apikey.Manager
-	sched   Reconfigurable
+	sched   SchedulerControl
 	session *Session
 }
 
 // New 创建处理器。
 func New(cfg *config.Manager, st *store.Store, toks *auth.TokenStore, client *upstream.Client,
-	models *upstream.ModelCache, keys *apikey.Manager, sched Reconfigurable, session *Session) *Handler {
-	return &Handler{cfg: cfg, st: st, toks: toks, client: client, models: models, keys: keys, sched: sched, session: session}
+	models *upstream.ModelCache, keys *apikey.Manager, sched SchedulerControl, session *Session) *Handler {
+	return &Handler{cfg: cfg, st: st, toks: toks, client: client, growth: client, models: models, keys: keys, sched: sched, session: session}
 }
 
 // Routes 挂载 /admin 路由。
@@ -62,6 +71,16 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Get("/resources", h.resources)
 			r.Get("/checkin/status", h.checkinStatus)
 			r.Post("/checkin/claim", h.checkinClaim)
+
+			r.Get("/growth/overview", h.growthOverview)
+			r.Post("/growth/run", h.growthRun)
+			r.Post("/growth/report", h.growthReport)
+			r.Post("/growth/adopt", h.growthAdopt)
+			r.Post("/growth/travel", h.growthTravel)
+			r.Post("/growth/redeem", h.growthRedeem)
+			r.Post("/growth/lottery", h.growthLottery)
+			r.Post("/growth/makeup", h.growthMakeup)
+			r.Post("/growth/bonus", h.growthBonus)
 
 			r.Get("/api-keys", h.listKeys)
 			r.Post("/api-keys", h.createKey)
@@ -630,6 +649,10 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		"checkin_random_start":   cfg.CheckinRandomStart,
 		"checkin_random_end":     cfg.CheckinRandomEnd,
 		"checkin_fallback":       cfg.CheckinFallback,
+		"auto_growth":            cfg.AutoGrowth,
+		"growth_report_cron":     cfg.GrowthReportCron,
+		"growth_travel_cron":     cfg.GrowthTravelCron,
+		"growth_report_count":    cfg.GrowthReportCount,
 		"resource_cache_seconds": cfg.ResourceCacheSeconds,
 		"log_retention_days":     cfg.LogRetentionDays,
 		"log_max_size_mb":        cfg.LogMaxSizeMB,
@@ -649,6 +672,10 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		CheckinRandomStart   *string `json:"checkin_random_start"`
 		CheckinRandomEnd     *string `json:"checkin_random_end"`
 		CheckinFallback      *bool   `json:"checkin_fallback"`
+		AutoGrowth           *bool   `json:"auto_growth"`
+		GrowthReportCron     *string `json:"growth_report_cron"`
+		GrowthTravelCron     *string `json:"growth_travel_cron"`
+		GrowthReportCount    *int    `json:"growth_report_count"`
 		ResourceCacheSeconds *int    `json:"resource_cache_seconds"`
 		LogRetentionDays     *int    `json:"log_retention_days"`
 		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
@@ -728,6 +755,31 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.CheckinFallback != nil {
 			c.CheckinFallback = *req.CheckinFallback
+		}
+		if req.AutoGrowth != nil {
+			c.AutoGrowth = *req.AutoGrowth
+		}
+		if req.GrowthReportCron != nil {
+			if !validCron(*req.GrowthReportCron) {
+				return fmt.Errorf("上报链 cron 表达式非法（需 6 段含秒，如 0 0 10 * * *）")
+			}
+			c.GrowthReportCron = strings.TrimSpace(*req.GrowthReportCron)
+		}
+		if req.GrowthTravelCron != nil {
+			if !validCron(*req.GrowthTravelCron) {
+				return fmt.Errorf("旅行巡检 cron 表达式非法（需 6 段含秒，如 0 0 9,21 * * *）")
+			}
+			c.GrowthTravelCron = strings.TrimSpace(*req.GrowthTravelCron)
+		}
+		if req.GrowthReportCount != nil {
+			n := *req.GrowthReportCount
+			if n < 1 {
+				n = 1
+			}
+			if n > 10 {
+				n = 10 // 钳制防风控，不报错（与 Normalize 口径一致）
+			}
+			c.GrowthReportCount = n
 		}
 		if req.ResourceCacheSeconds != nil && *req.ResourceCacheSeconds > 0 {
 			c.ResourceCacheSeconds = *req.ResourceCacheSeconds

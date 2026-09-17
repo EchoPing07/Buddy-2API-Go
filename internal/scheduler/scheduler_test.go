@@ -77,19 +77,19 @@ func TestCheckinDayDecide(t *testing.T) {
 // TestFixedMainAt 验证 fixed 模式当日主时刻推算：取 cron 当日触发、无触发/非法表达式返回零值。
 func TestFixedMainAt(t *testing.T) {
 	// 每天 9 点：即使当前已过 9 点，也返回今日 9 点（供补签判断）
-	if got := fixedMainAt("0 0 9 * * *", at(12, 0)); got != at(9, 0) {
+	if got := fixedMainAt("签到", "0 0 9 * * *", at(12, 0)); got != at(9, 0) {
 		t.Errorf("每日 cron 应返回今日 09:00，得到 %v", got)
 	}
 	// 仅周一：2026-08-22 是周六，当日无触发
-	if got := fixedMainAt("0 0 9 * * 1", at(12, 0)); !got.IsZero() {
+	if got := fixedMainAt("签到", "0 0 9 * * 1", at(12, 0)); !got.IsZero() {
 		t.Errorf("周六用仅周一 cron 应返回零值，得到 %v", got)
 	}
 	// 仅周六：当日有触发
-	if got := fixedMainAt("0 0 9 * * 6", at(8, 0)); got != at(9, 0) {
+	if got := fixedMainAt("签到", "0 0 9 * * 6", at(8, 0)); got != at(9, 0) {
 		t.Errorf("周六用仅周六 cron 应返回今日 09:00，得到 %v", got)
 	}
 	// 非法表达式
-	if got := fixedMainAt("not-a-cron", at(12, 0)); !got.IsZero() {
+	if got := fixedMainAt("签到", "not-a-cron", at(12, 0)); !got.IsZero() {
 		t.Errorf("非法 cron 应返回零值，得到 %v", got)
 	}
 }

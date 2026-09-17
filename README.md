@@ -9,15 +9,16 @@
 
 - `POST /v1/chat/completions` —— OpenAI 兼容对话（流式透传 / 非流式聚合）
 - `GET /v1/models` —— 实时模型列表（从上游 `/v3/config` 动态拉取并缓存，cn / global 两套端点自动适配）
-- 内置 Web 管理后台 —— OAuth 登录、API Key 管理、官方余额、每日签到、请求日志、仪表盘等
+- 内置 Web 管理后台 —— OAuth 登录、API Key 管理、官方余额、每日签到、成长任务、请求日志、仪表盘等
 - 默认中国端点（`copilot.tencent.com`），可切换国际端点（`www.codebuddy.ai`）
 
 ## ⚠️ 声明
 
 - **本项目仅用于学习与研究目的**，请勿用于任何违法违规用途，不要干坏事。使用者需自行承担一切后果，作者不对任何滥用行为负责。
-- 本项目的代码参考了 wicm84266964/Buddy2api、Sliverkiss/CodeBuddy2api、cyl2361341082-alt/Buddy2api、ShouZhuo0413/codebuddy2api 等项目，Web 管理面板的 UI 设计参考了 [grok2api](https://github.com/EchoPing07/grok2api)（详见 [致谢与参考](#-致谢与参考)）。
+- 本项目的代码参考了 wicm84266964/Buddy2api、Sliverkiss/CodeBuddy2api、cyl2361341082-alt/Buddy2api、ShouZhuo0413/codebuddy2api、Sliverkiss/workbuddy2api 等项目，Web 管理面板的 UI 设计参考了 [grok2api](https://github.com/EchoPing07/grok2api)（详见 [致谢与参考](#-致谢与参考)）。
 - **本项目定位为个人单账号使用，明确不接受“号池”（多账号池 / 多凭证轮询）相关的建议与提交，相关需求请勿提 Issue 或 PR。**
 - 本项目**不存储对话内容**，数据库仅保存元信息（模型、token 数、耗时、状态码等）。
+- **成长任务（活跃地图上报 / 连登奖励 / 猫猫旅行等）默认关闭，属可选实验性功能**：其实现为模拟官方客户端事件的活跃上报，可能不符合上游服务条款，存在触发风控、账号受限等风险，是否开启及其后果由使用者自行评估承担。
 
 ## ✨ 功能特性
 
@@ -27,7 +28,8 @@
 | OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/models`、`/health` |
 | 多 API Key   | 随机 / 自定义 Key，支持备注、启停、使用量统计                              |
 | 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期 |
-| 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取     |
+| 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取（在「任务」页） |
+| 成长任务        | 活跃地图连登上报、连登奖励兑换/抽奖、补签卡、猫猫领养与旅行（仅国内版账号）；错过时点启动自动补跑，默认关闭 |
 | 仪表盘         | 请求量、Token、模型分布、Key 用量等聚合统计                              |
 | 模型倍率         | 模型列表展示当前实际倍率（如 `GLM-5.2 x0.50`），自动套用官方分时段折扣（夜间折扣 / 限时免费等，支持跨零点时段窗与时区） |
 | 自动刷新        | token 过期自动刷新，401 时刷新后重试一次                               |
@@ -120,7 +122,8 @@ go build -ldflags="-s -w -X buddy2api-go/internal/proxy.Version=v1.0.0" -o buddy
 1. 打开管理后台：本机部署访问 `http://127.0.0.1:10082`，Docker/局域网部署访问 `http://<服务器IP>:10082`，输入管理密码登录（默认 `password`）
 2. 「账号」页 → **登录**（OAuth 设备流，浏览器完成授权）
 3. 「密钥」页 → 创建 API Key（随机或自定义，支持备注/启停）
-4. 在任意 OpenAI 兼容客户端填入：
+4. （可选）「任务」页 → 每日签到与成长任务（活跃地图连登 / 连登奖励兑换与抽奖 / 猫猫旅行，仅国内版账号）；自动执行开关在「设置 → 任务」
+5. 在任意 OpenAI 兼容客户端填入：
 
 ```
 Base URL: http://127.0.0.1:10082/v1
@@ -161,6 +164,9 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `POST /admin/account/refresh` `POST /admin/account/test` `DELETE /admin/account` | 手动刷新 / 测试凭证 / 清空凭证 |
 | `GET /admin/resources` | 官方余额（带缓存，`?force=1` 强刷） |
 | `GET /admin/checkin/status` `POST /admin/checkin/claim` | 签到状态 / 领取 |
+| `GET /admin/growth/overview` | 成长任务总览（连登 / 热力格 / 猫猫 / 抽奖聚合，60s 缓存，`?force=1` 强刷） |
+| `POST /admin/growth/run` `POST /admin/growth/report` `POST /admin/growth/travel` | 手动执行完整任务链 / 活跃上报（`{count}` 缺省取配置，1-10）/ 旅行巡检 |
+| `POST /admin/growth/adopt` `POST /admin/growth/redeem` `POST /admin/growth/lottery` `POST /admin/growth/makeup` `POST /admin/growth/bonus` | 手动领养 / 兑换（`{tier}`=7d/14d/28d）/ 抽奖 / 补签（`{date}` 缺省昨日 CST）/ 领新手礼包与活动补偿 |
 | `GET /admin/api-keys` `POST /admin/api-keys` `PUT /admin/api-keys/{id}` `DELETE /admin/api-keys/{id}` | API Key 增删改查 |
 | `GET /admin/logs` | 请求日志（分页 + 筛选 model/key/status） |
 | `GET /admin/stats` | 仪表盘聚合 |
@@ -171,7 +177,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 
 | 端点 | 说明 |
 |---|---|
-| `GET /` | Web 管理面板（go:embed 单 HTML，内嵌 Alpine.js + 手写 SVG 图表，无外部依赖），含 统计 / 账号 / 密钥 / 余额 / 日志 / 设置 六个页面 |
+| `GET /` | Web 管理面板（go:embed 单 HTML，内嵌 Alpine.js + 手写 SVG 图表，无外部依赖），含 统计 / 账号 / 密钥 / 余额 / 任务 / 日志 / 设置 七个页面 |
 
 ## ⚙️ 配置
 
@@ -187,6 +193,10 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `BUDDY2API_CHECKIN_CRON` | `fixed` 模式签到 cron，6 段含秒（默认 `0 0 9 * * *`） |
 | `BUDDY2API_CHECKIN_RANDOM_START` / `BUDDY2API_CHECKIN_RANDOM_END` | `random` 模式时间范围 `HH:MM`（默认 `09:00` / `18:00`，结束最晚 `23:30`） |
 | `BUDDY2API_CHECKIN_FALLBACK` | 末班兜底（默认开启）：当天没签成时 23:50 尝试，若失败 23:55 重试，再失败当天放弃 |
+| `BUDDY2API_AUTO_GROWTH` | 自动成长任务开关（默认关闭，仅国内版账号可用） |
+| `BUDDY2API_GROWTH_REPORT_CRON` | 上报+奖励链 cron，6 段含秒（默认 `0 0 10 * * *`） |
+| `BUDDY2API_GROWTH_TRAVEL_CRON` | 猫猫旅行巡检 cron（默认 `0 0 9,21 * * *`） |
+| `BUDDY2API_GROWTH_REPORT_COUNT` | 每日活跃上报条数 1-10（默认 5；领养前置 `chat_5` 需 5 条，同会话多轮、每条间隔 1.5 秒） |
 | `BUDDY2API_RESOURCE_CACHE_SECONDS` | 余额缓存秒数（默认 300） |
 | `BUDDY2API_LOG_RETENTION_DAYS` | 日志保留天数（默认 90） |
 | `BUDDY2API_LOG_MAX_SIZE_MB` | 日志表容量上限 MB（默认 50） |
@@ -194,6 +204,8 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `BUDDY2API_DATA_DIR` | 数据目录（默认 `./data`） |
 
 指纹头伪装另有 `CB_GATEWAY_USER_AGENT` / `CB_GATEWAY_STAINLESS_OS` 等可选 env（一般无需修改），完整变量见 [.env.example](.env.example)。
+
+> 成长任务的 cron 时点为**进程本地时区**（Docker 部署若容器 `TZ` 非 `Asia/Shanghai`，时点需自行换算）；错过当日上报时点时，下次启动 30 秒后会自动补跑一次（当日 22:00 前有效）。
 
 ## 💾 数据与安全
 
@@ -217,11 +229,11 @@ Buddy-2API-Go/
 │   ├── config/            # 配置加载（config.json + env 覆盖）
 │   ├── store/             # SQLite 数据层（API Keys / 日志 / 缓存）
 │   ├── auth/              # 凭证：token.json 读写、JWT 解析、OAuth 设备流
-│   ├── upstream/          # 上游客户端：chat 转发、billing、checkin、指纹头
+│   ├── upstream/          # 上游客户端：chat 转发、billing、checkin、growth（成长任务）、指纹头
 │   ├── proxy/             # /v1/chat/completions 代理（流式透传 + 非流式聚合）
 │   ├── apikey/            # OpenAI 端点 Key 管理（明文存储/随机/校验/限额）
-│   ├── admin/             # 管理后台 API（登录/账号/keys/日志/签到/余额/设置）
-│   ├── scheduler/         # 签到定时任务
+│   ├── admin/             # 管理后台 API（登录/账号/keys/日志/签到/余额/任务/设置）
+│   ├── scheduler/         # 定时任务（签到状态机 + 成长任务链 / 旅行巡检）
 │   └── web/               # 前端（go:embed 单 HTML，内嵌 Alpine.js）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -245,6 +257,7 @@ Go 1.25+ · chi · modernc.org/sqlite（纯 Go，无 cgo） · robfig/cron/v3 ·
   - [Sliverkiss/CodeBuddy2api](https://github.com/Sliverkiss/CodeBuddy2api) —— OAuth 设备流、Web 管理面板结构
   - [cyl2361341082-alt/Buddy2api](https://github.com/cyl2361341082-alt/Buddy2api) —— 非流式聚合、finish_reason 修正等实现思路
   - [ShouZhuo0413/codebuddy2api](https://github.com/ShouZhuo0413/codebuddy2api) —— 部分实现思路
+  - [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) —— 成长任务体系（活跃地图上报、连登奖励兑换与抽奖、补签卡、猫猫领养与旅行）的接口契约与状态机，本项目在其基础上做了单账号化与持久化防抖改造
 - 实时模型列表接口（`GET /v3/config`）参考了 [kuops/opencode-codebuddy-auth](https://github.com/kuops/opencode-codebuddy-auth)。
 - Web 管理面板的 UI 设计参考了 [chenyme/grok2api](https://github.com/chenyme/grok2api)。
 

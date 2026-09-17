@@ -60,6 +60,10 @@ type Config struct {
 	CheckinRandomStart   string `json:"checkin_random_start"` // random 模式窗口起 "HH:MM"
 	CheckinRandomEnd     string `json:"checkin_random_end"`   // random 模式窗口止 "HH:MM"
 	CheckinFallback      bool   `json:"checkin_fallback"`     // 末班兜底：23:50/23:55 各再试一次
+	AutoGrowth           bool   `json:"auto_growth"`          // 成长任务总开关（活跃地图/连登奖励/猫猫旅行）
+	GrowthReportCron     string `json:"growth_report_cron"`   // 上报+奖励链 cron（6 段含秒）
+	GrowthTravelCron     string `json:"growth_travel_cron"`   // 旅行巡检 cron
+	GrowthReportCount    int    `json:"growth_report_count"`  // 每日上报条数（1-10；领养前置 chat_5 需 5）
 	ResourceCacheSeconds int    `json:"resource_cache_seconds"`
 	LogRetentionDays     int    `json:"log_retention_days"`
 	LogMaxSizeMB         int    `json:"log_max_size_mb"`
@@ -76,6 +80,10 @@ func defaults() Config {
 		CheckinRandomStart:   "09:00",
 		CheckinRandomEnd:     "18:00",
 		CheckinFallback:      true,
+		AutoGrowth:           false,
+		GrowthReportCron:     "0 0 10 * * *",
+		GrowthTravelCron:     "0 0 9,21 * * *",
+		GrowthReportCount:    5,
 		ResourceCacheSeconds: 300,
 		LogRetentionDays:     90,
 		LogMaxSizeMB:         50,
@@ -101,6 +109,20 @@ func (c *Config) Normalize() {
 	if err := ValidateCheckinWindow(c.CheckinRandomStart, c.CheckinRandomEnd); err != nil {
 		c.CheckinRandomStart = d.CheckinRandomStart
 		c.CheckinRandomEnd = d.CheckinRandomEnd
+	}
+	// 成长任务：cron 空回落默认（合法性校验在 admin putSettings / scheduler 注册时做，
+	// 与 checkin_cron 同策略）；上报条数钳 1..10（防风控）
+	if strings.TrimSpace(c.GrowthReportCron) == "" {
+		c.GrowthReportCron = d.GrowthReportCron
+	}
+	if strings.TrimSpace(c.GrowthTravelCron) == "" {
+		c.GrowthTravelCron = d.GrowthTravelCron
+	}
+	if c.GrowthReportCount <= 0 {
+		c.GrowthReportCount = 1
+	}
+	if c.GrowthReportCount > 10 {
+		c.GrowthReportCount = 10
 	}
 	if c.ResourceCacheSeconds <= 0 {
 		c.ResourceCacheSeconds = d.ResourceCacheSeconds
@@ -210,6 +232,10 @@ func Load(dataDir string) (*Manager, error) {
 	envStr("BUDDY2API_CHECKIN_RANDOM_END", "checkin_random_end", &cfg.CheckinRandomEnd)
 	envBool("BUDDY2API_CHECKIN_FALLBACK", "checkin_fallback", &cfg.CheckinFallback)
 	envBool("BUDDY2API_AUTO_CHECKIN", "auto_checkin", &cfg.AutoCheckin)
+	envBool("BUDDY2API_AUTO_GROWTH", "auto_growth", &cfg.AutoGrowth)
+	envStr("BUDDY2API_GROWTH_REPORT_CRON", "growth_report_cron", &cfg.GrowthReportCron)
+	envStr("BUDDY2API_GROWTH_TRAVEL_CRON", "growth_travel_cron", &cfg.GrowthTravelCron)
+	envInt("BUDDY2API_GROWTH_REPORT_COUNT", "growth_report_count", &cfg.GrowthReportCount)
 	envInt("BUDDY2API_RESOURCE_CACHE_SECONDS", "resource_cache_seconds", &cfg.ResourceCacheSeconds)
 	envInt("BUDDY2API_LOG_RETENTION_DAYS", "log_retention_days", &cfg.LogRetentionDays)
 	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
@@ -218,6 +244,10 @@ func Load(dataDir string) (*Manager, error) {
 	// 防止 Duration 换算溢出为负导致所有 chat 请求立即超时并被落盘
 	if cfg.ChatTimeoutSeconds > MaxChatTimeoutSeconds {
 		cfg.ChatTimeoutSeconds = MaxChatTimeoutSeconds
+	}
+	// growth 上报条数同理：env 超界在 Normalize 后重钳（envInt 只挡 <=0）
+	if cfg.GrowthReportCount > 10 {
+		cfg.GrowthReportCount = 10
 	}
 
 	// 默认管理密码：env > 文件 hash > 内置 "password"（生产请尽快修改）。
@@ -299,6 +329,18 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["checkin_fallback"] {
 		nc.CheckinFallback = m.cfg.CheckinFallback
+	}
+	if m.envSets["auto_growth"] {
+		nc.AutoGrowth = m.cfg.AutoGrowth
+	}
+	if m.envSets["growth_report_cron"] {
+		nc.GrowthReportCron = m.cfg.GrowthReportCron
+	}
+	if m.envSets["growth_travel_cron"] {
+		nc.GrowthTravelCron = m.cfg.GrowthTravelCron
+	}
+	if m.envSets["growth_report_count"] {
+		nc.GrowthReportCount = m.cfg.GrowthReportCount
 	}
 	if m.envSets["resource_cache_seconds"] {
 		nc.ResourceCacheSeconds = m.cfg.ResourceCacheSeconds
