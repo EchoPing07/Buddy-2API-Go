@@ -95,10 +95,11 @@ type growthOverviewLottery struct {
 }
 
 type growthOverviewToday struct {
-	ReportDone  bool `json:"report_done"`
-	AdoptTried  bool `json:"adopt_tried"`
-	RewardDone  bool `json:"reward_done"`
-	ReportCount int  `json:"report_count"`
+	ReportDone   bool `json:"report_done"`
+	AdoptTried   bool `json:"adopt_tried"`
+	RewardDone   bool `json:"reward_done"`
+	ReportCount  int  `json:"report_count"`  // 配置基准条数
+	ReportJitter int  `json:"report_jitter"` // 波动幅度 ±N（0=固定）
 }
 
 // growthOverview 成长总览响应（前端「任务」视图唯一数据入口）。
@@ -118,10 +119,11 @@ type growthOverview struct {
 }
 
 // buildGrowthOverview 聚合各上游切片为总览（纯函数，便于单测）。
+// reportCount 为配置基准条数，reportJitter 为波动幅度（供前端展示区间，不参与取数）。
 // info 为 nil、cellsOK/buddyOK 为 false、chances 为 nil 分别表示对应上游 GET 失败
 // （计入 degraded）。buddyOK=false 与「真无猫」（buddyOK=true 且 buddy==nil）严格区分：
 // 查询失败不得呈现为无猫空态，否则前端会诱导用户点击注定失败的领养写操作。
-func buildGrowthOverview(now time.Time, reportCount int,
+func buildGrowthOverview(now time.Time, reportCount, reportJitter int,
 	info *upstream.GrowthStreakInfo, cells []upstream.HeatmapCell, cellsOK bool,
 	buddy *upstream.Buddy, buddyOK bool, ts *upstream.TravelState, chances *int,
 	reportDone, adoptTried, rewardDone bool, lastRun *scheduler.GrowthChainResult) growthOverview {
@@ -131,7 +133,7 @@ func buildGrowthOverview(now time.Time, reportCount int,
 		UpdatedAt: now.Unix(),
 		Today: growthOverviewToday{
 			ReportDone: reportDone, AdoptTried: adoptTried,
-			RewardDone: rewardDone, ReportCount: reportCount,
+			RewardDone: rewardDone, ReportCount: reportCount, ReportJitter: reportJitter,
 		},
 		LastRun:  lastRun,
 		Degraded: []string{},
@@ -265,7 +267,7 @@ func (h *Handler) growthOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ov := buildGrowthOverview(now, cfg.GrowthReportCount, info, cells, cellsErr == nil,
+	ov := buildGrowthOverview(now, cfg.GrowthReportCount, cfg.GrowthReportJitter, info, cells, cellsErr == nil,
 		buddy, buddyErr == nil, ts, chancesPtr(chances, chancesErr),
 		flag(growthKeyReportDay), flag(growthKeyAdoptDay), flag(growthKeyRewardDay), lastRun)
 
@@ -321,11 +323,8 @@ func (h *Handler) growthReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	count := req.Count
-	if count <= 0 {
-		count = h.cfg.Get().GrowthReportCount
-	}
 	if count > 10 {
-		count = 10 // 钳制防风控
+		count = 10 // 钳制防风控；0/缺省交由 scheduler 按配置+jitter 波动
 	}
 	h.growthInvalidateOverview()
 	res := h.sched.RunActivityReports(count)

@@ -27,6 +27,7 @@ type fakeSched struct {
 	adoptN       int
 	redeemN      int
 	lastTier     string
+	lastCount    int
 }
 
 func (f *fakeSched) Reconfigure() { f.reconfigureN++ }
@@ -40,6 +41,7 @@ func (f *fakeSched) RunTravelTick() scheduler.TravelTickResult {
 }
 func (f *fakeSched) RunActivityReports(count int) scheduler.ActivityReportResult {
 	f.reportN++
+	f.lastCount = count
 	return scheduler.ActivityReportResult{Ran: true, Sent: count, Total: count}
 }
 func (f *fakeSched) RunGrowthAdopt() scheduler.GrowthAdoptResult {
@@ -178,7 +180,7 @@ func TestBuildGrowthOverview(t *testing.T) {
 	chances := 2
 	lastRun := &scheduler.GrowthChainResult{Day: "2026-01-16", Ran: true}
 
-	ov := buildGrowthOverview(now, 5, info, cells, true, buddy, true, ts, &chances, true, false, false, lastRun)
+	ov := buildGrowthOverview(now, 5, 0, info, cells, true, buddy, true, ts, &chances, true, false, false, lastRun)
 
 	if !ov.Available || ov.Streak == nil || ov.Streak.Days != 7 {
 		t.Fatalf("streak 聚合异常: %+v", ov.Streak)
@@ -198,7 +200,7 @@ func TestBuildGrowthOverview(t *testing.T) {
 	info2 := &upstream.GrowthStreakInfo{}
 	info2.Streak.Days = 20
 	info2.Redemption.Tiers = info.Redemption.Tiers
-	ov2 := buildGrowthOverview(now, 5, info2, nil, false, nil, true, nil, &chances, false, false, false, nil)
+	ov2 := buildGrowthOverview(now, 5, 0, info2, nil, false, nil, true, nil, &chances, false, false, false, nil)
 	if ov2.Streak.Tiers[1].Status != "available" || ov2.Streak.Tiers[2].Status != "locked" {
 		t.Errorf("days=20 时 14d 应 available、28d 应 locked，得到 %s/%s",
 			ov2.Streak.Tiers[1].Status, ov2.Streak.Tiers[2].Status)
@@ -230,7 +232,7 @@ func TestBuildGrowthOverview(t *testing.T) {
 
 	// degraded：streak/heatmap/lottery 失败计入；无猫时 travel 不算降级
 	var nilChances *int
-	ov3 := buildGrowthOverview(now, 5, nil, nil, false, nil, true, nil, nilChances, false, false, false, nil)
+	ov3 := buildGrowthOverview(now, 5, 0, nil, nil, false, nil, true, nil, nilChances, false, false, false, nil)
 	if ov3.Streak != nil || ov3.Heatmap != nil || ov3.Lottery != nil {
 		t.Error("失败切片应为 nil")
 	}
@@ -251,7 +253,7 @@ func TestBuildGrowthOverview(t *testing.T) {
 		}
 	}
 	// 有猫但 travel 查询失败 → degraded 含 travel
-	ov4 := buildGrowthOverview(now, 5, nil, nil, false, buddy, true, nil, nilChances, false, false, false, nil)
+	ov4 := buildGrowthOverview(now, 5, 0, nil, nil, false, buddy, true, nil, nilChances, false, false, false, nil)
 	travelDegraded := false
 	for _, got := range ov4.Degraded {
 		if got == "travel" {
@@ -263,7 +265,7 @@ func TestBuildGrowthOverview(t *testing.T) {
 	}
 	// buddy 查询失败（buddyOK=false）→ degraded 含 buddy 且 has=false（≠真无猫，
 	// 前端不得因此展示领养空态诱导写操作）
-	ov5 := buildGrowthOverview(now, 5, nil, nil, false, nil, false, nil, nilChances, false, false, false, nil)
+	ov5 := buildGrowthOverview(now, 5, 0, nil, nil, false, nil, false, nil, nilChances, false, false, false, nil)
 	buddyDegraded := false
 	for _, got := range ov5.Degraded {
 		if got == "buddy" {
@@ -373,18 +375,25 @@ func TestGrowthActionInvalidatesOverview(t *testing.T) {
 	}
 }
 
-// 手动上报 count 缺省取配置、超界钳 10。
+// 手动上报：显式 count 透传并在 admin 层钳 10；缺省（0）交由 scheduler 按配置+jitter 波动。
 func TestGrowthReportCountClamp(t *testing.T) {
 	h, _, fs := newGrowthTestHandler(t, "cn", true, &fakeGrowthAPI{})
-	// 缺省 → 配置值 5
+	// 缺省 → 透传 0，由 scheduler 侧解析（配置+jitter）
 	req := httptest.NewRequest(http.MethodPost, "/admin/growth/report", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	h.growthReport(rec, req)
 	if fs.reportN != 1 {
 		t.Fatal("应触达 scheduler")
 	}
-	if !strings.Contains(rec.Body.String(), `"total":5`) {
-		t.Errorf("缺省 count 应取配置 5，得到 %s", rec.Body.String())
+	if fs.lastCount != 0 {
+		t.Errorf("缺省 count 应透传 0 交由 scheduler 解析，得到 %d", fs.lastCount)
+	}
+	// 显式 count 透传
+	req1 := httptest.NewRequest(http.MethodPost, "/admin/growth/report", strings.NewReader(`{"count":3}`))
+	rec1 := httptest.NewRecorder()
+	h.growthReport(rec1, req1)
+	if !strings.Contains(rec1.Body.String(), `"total":3`) {
+		t.Errorf("显式 count=3 应透传，得到 %s", rec1.Body.String())
 	}
 	// 超界 → 钳 10
 	req2 := httptest.NewRequest(http.MethodPost, "/admin/growth/report", strings.NewReader(`{"count":99}`))

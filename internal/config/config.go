@@ -64,26 +64,35 @@ type Config struct {
 	GrowthReportCron     string `json:"growth_report_cron"`   // 上报+奖励链 cron（6 段含秒）
 	GrowthTravelCron     string `json:"growth_travel_cron"`   // 旅行巡检 cron
 	GrowthReportCount    int    `json:"growth_report_count"`  // 每日上报条数（1-10；领养前置 chat_5 需 5）
+	GrowthReportJitter   int    `json:"growth_report_jitter"` // 每日上报条数随机波动 ±N（0=固定不波动，上限 GrowthReportJitterMax）
 	ResourceCacheSeconds int    `json:"resource_cache_seconds"`
 	LogRetentionDays     int    `json:"log_retention_days"`
 	LogMaxSizeMB         int    `json:"log_max_size_mb"`
 	ChatTimeoutSeconds   int    `json:"chat_timeout_seconds"`
 }
 
+// 默认 cron 表达式（defaults() 与 admin 存量兜底共用，避免字面量两处漂移）。
+const (
+	DefaultCheckinCron      = "0 0 9 * * *"
+	DefaultGrowthReportCron = "0 0 10 * * *"
+	DefaultGrowthTravelCron = "0 0 9,21 * * *"
+)
+
 func defaults() Config {
 	return Config{
 		Listen:               "127.0.0.1:10082",
 		Region:               "cn",
 		AutoCheckin:          false,
-		CheckinCron:          "0 0 9 * * *",
+		CheckinCron:          DefaultCheckinCron,
 		CheckinMode:          "fixed",
 		CheckinRandomStart:   "09:00",
 		CheckinRandomEnd:     "18:00",
 		CheckinFallback:      true,
 		AutoGrowth:           false,
-		GrowthReportCron:     "0 0 10 * * *",
-		GrowthTravelCron:     "0 0 9,21 * * *",
-		GrowthReportCount:    5,
+		GrowthReportCron:     DefaultGrowthReportCron,
+		GrowthTravelCron:     DefaultGrowthTravelCron,
+		GrowthReportCount:    10,
+		GrowthReportJitter:   0,
 		ResourceCacheSeconds: 300,
 		LogRetentionDays:     90,
 		LogMaxSizeMB:         50,
@@ -121,8 +130,14 @@ func (c *Config) Normalize() {
 	if c.GrowthReportCount <= 0 {
 		c.GrowthReportCount = 1
 	}
-	if c.GrowthReportCount > 10 {
-		c.GrowthReportCount = 10
+	if c.GrowthReportCount > GrowthReportCountMax {
+		c.GrowthReportCount = GrowthReportCountMax
+	}
+	if c.GrowthReportJitter < 0 {
+		c.GrowthReportJitter = 0
+	}
+	if c.GrowthReportJitter > GrowthReportJitterMax {
+		c.GrowthReportJitter = GrowthReportJitterMax
 	}
 	if c.ResourceCacheSeconds <= 0 {
 		c.ResourceCacheSeconds = d.ResourceCacheSeconds
@@ -148,6 +163,45 @@ const MaxCheckinWindowEnd = "23:30"
 // 更关键的是过大的秒数在 time.Duration 秒→纳秒换算时会溢出为负，令 Transport 对所有
 // chat 请求立即判超时，且该值会持久化到 config.json 无法自愈。
 const MaxChatTimeoutSeconds = 3600
+
+// GrowthReportCountMax 每日上报条数上限（防风控：同会话连发过多易被判机器人）。
+const GrowthReportCountMax = 10
+
+// GrowthReportJitterMax 上报条数波动幅度上限。±N 后仍受 1..GrowthReportCountMax 钳制，
+// 故配置层的合法区间与条数一致即可，实际取值在运行时钳。
+const GrowthReportJitterMax = GrowthReportCountMax
+
+// RollReportCount 计算本次实际上报条数：base ± jitter 内均匀取一个整数。
+// jitter<=0 → 固定 base；结果钳 1..GrowthReportCountMax（防风控，且保证至少 1 条）。
+// 纯函数（随机源由调用方传入），便于单测注入确定性序列。
+func RollReportCount(base, jitter, rnd int) int {
+	if base <= 0 {
+		base = 1
+	}
+	if base > GrowthReportCountMax {
+		base = GrowthReportCountMax
+	}
+	if jitter <= 0 {
+		return base
+	}
+	if jitter > GrowthReportJitterMax {
+		jitter = GrowthReportJitterMax
+	}
+	// rnd 视为 [0, 2*jitter+1) 的均匀整数偏移，映射到 [-jitter, +jitter]
+	span := 2*jitter + 1
+	off := rnd % span
+	if off < 0 {
+		off += span
+	}
+	n := base - jitter + off
+	if n < 1 {
+		return 1
+	}
+	if n > GrowthReportCountMax {
+		return GrowthReportCountMax
+	}
+	return n
+}
 
 // ParseHHMM 把 "HH:MM" 解析为当日分钟数（0-1439），格式非法返回 ok=false。
 func ParseHHMM(s string) (minutes int, ok bool) {
@@ -236,6 +290,7 @@ func Load(dataDir string) (*Manager, error) {
 	envStr("BUDDY2API_GROWTH_REPORT_CRON", "growth_report_cron", &cfg.GrowthReportCron)
 	envStr("BUDDY2API_GROWTH_TRAVEL_CRON", "growth_travel_cron", &cfg.GrowthTravelCron)
 	envInt("BUDDY2API_GROWTH_REPORT_COUNT", "growth_report_count", &cfg.GrowthReportCount)
+	envInt("BUDDY2API_GROWTH_REPORT_JITTER", "growth_report_jitter", &cfg.GrowthReportJitter)
 	envInt("BUDDY2API_RESOURCE_CACHE_SECONDS", "resource_cache_seconds", &cfg.ResourceCacheSeconds)
 	envInt("BUDDY2API_LOG_RETENTION_DAYS", "log_retention_days", &cfg.LogRetentionDays)
 	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
@@ -246,8 +301,11 @@ func Load(dataDir string) (*Manager, error) {
 		cfg.ChatTimeoutSeconds = MaxChatTimeoutSeconds
 	}
 	// growth 上报条数同理：env 超界在 Normalize 后重钳（envInt 只挡 <=0）
-	if cfg.GrowthReportCount > 10 {
-		cfg.GrowthReportCount = 10
+	if cfg.GrowthReportCount > GrowthReportCountMax {
+		cfg.GrowthReportCount = GrowthReportCountMax
+	}
+	if cfg.GrowthReportJitter > GrowthReportJitterMax {
+		cfg.GrowthReportJitter = GrowthReportJitterMax
 	}
 
 	// 默认管理密码：env > 文件 hash > 内置 "password"（生产请尽快修改）。
@@ -341,6 +399,9 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["growth_report_count"] {
 		nc.GrowthReportCount = m.cfg.GrowthReportCount
+	}
+	if m.envSets["growth_report_jitter"] {
+		nc.GrowthReportJitter = m.cfg.GrowthReportJitter
 	}
 	if m.envSets["resource_cache_seconds"] {
 		nc.ResourceCacheSeconds = m.cfg.ResourceCacheSeconds

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"buddy2api-go/internal/auth"
@@ -27,7 +28,7 @@ const (
 	// growthCatchupWindowEndMin 补跑窗口下限（22:00）：深夜不打扰。
 	growthCatchupWindowEndMin = 22 * 60
 	// growthReportCountMax 每日上报条数上限（防风控）。
-	growthReportCountMax = 10
+	growthReportCountMax = config.GrowthReportCountMax
 )
 
 // growthReportGap 同账号内 N 条上报间隔：5 连发模拟同一会话多轮对话，
@@ -211,9 +212,13 @@ func (s *Scheduler) RunGrowthChain() GrowthChainResult {
 		}
 	}()
 
-	count := s.cfg.Get().GrowthReportCount
+	cfg := s.cfg.Get()
+	count := config.RollReportCount(cfg.GrowthReportCount, cfg.GrowthReportJitter, rand.Int())
 	if count <= 0 || count > growthReportCountMax {
 		count = 5 // Normalize 已钳制，双保险
+	}
+	if jitter := cfg.GrowthReportJitter; jitter > 0 {
+		slog.Info("growth 上报条数波动", "base", cfg.GrowthReportCount, "jitter", jitter, "actual", count)
 	}
 	_, reported := s.stepReports(&res, count, false)
 	var info *upstream.GrowthStreakInfo
@@ -228,13 +233,15 @@ func (s *Scheduler) RunGrowthChain() GrowthChainResult {
 }
 
 // RunActivityReports 手动活跃上报：不查 reportDone（用户显式意图），发满置 report_day。
-// count 钳 1..10；growthMu 互斥（与自动链防并发秒发）。
+// count<=0 时取配置条数并按 jitter 波动一次；显式 count 尊重用户指定，不波动。
+// 结果钳 1..10；growthMu 互斥（与自动链防并发秒发）。
 func (s *Scheduler) RunActivityReports(count int) ActivityReportResult {
 	if reason := s.growthPrecondition(); reason != "" {
 		return ActivityReportResult{Ran: false, Reason: reason}
 	}
 	if count <= 0 {
-		count = s.cfg.Get().GrowthReportCount
+		cfg := s.cfg.Get()
+		count = config.RollReportCount(cfg.GrowthReportCount, cfg.GrowthReportJitter, rand.Int())
 	}
 	if count > growthReportCountMax {
 		count = growthReportCountMax

@@ -151,8 +151,8 @@ func TestNormalizeGrowth(t *testing.T) {
 	if c.GrowthReportCount != 1 {
 		t.Errorf("零值 count 应钳为 1，得到 %d", c.GrowthReportCount)
 	}
-	if d := defaults(); d.GrowthReportCount != 5 || d.AutoGrowth {
-		t.Errorf("defaults 应为 count=5 且开关关，得到 %+v", d)
+	if d := defaults(); d.GrowthReportCount != 10 || d.GrowthReportJitter != 0 || d.AutoGrowth {
+		t.Errorf("defaults 应为 count=10、jitter=0 且开关关，得到 %+v", d)
 	}
 	// 条数钳制：<=0 → 1；>10 → 10；合法值保留
 	c = Config{GrowthReportCount: 0}
@@ -175,6 +175,61 @@ func TestNormalizeGrowth(t *testing.T) {
 	c.Normalize()
 	if c.GrowthReportCron != "0 0 10 * * *" || c.GrowthTravelCron != "0 0 9,21 * * *" {
 		t.Errorf("空白 cron 应回落默认，得到 %q / %q", c.GrowthReportCron, c.GrowthTravelCron)
+	}
+	// 波动数钳制：负值 → 0；超界 → GrowthReportJitterMax；合法值保留
+	c = Config{GrowthReportJitter: -3}
+	c.Normalize()
+	if c.GrowthReportJitter != 0 {
+		t.Errorf("负 jitter 应钳为 0，得到 %d", c.GrowthReportJitter)
+	}
+	c = Config{GrowthReportJitter: 99}
+	c.Normalize()
+	if c.GrowthReportJitter != GrowthReportJitterMax {
+		t.Errorf("jitter=99 应钳为 %d，得到 %d", GrowthReportJitterMax, c.GrowthReportJitter)
+	}
+	c = Config{GrowthReportCount: 7, GrowthReportJitter: 2}
+	c.Normalize()
+	if c.GrowthReportCount != 7 || c.GrowthReportJitter != 2 {
+		t.Errorf("合法 count/jitter 不应被改: %d / %d", c.GrowthReportCount, c.GrowthReportJitter)
+	}
+}
+
+// TestRollReportCount 波动函数：jitter=0 固定；有 jitter 时落 [base-jitter, base+jitter]
+// 且始终钳在 1..GrowthReportCountMax（防风控且至少发 1 条）。
+func TestRollReportCount(t *testing.T) {
+	if got := RollReportCount(7, 0, 12345); got != 7 {
+		t.Errorf("jitter=0 应恒返回 base=7，得到 %d", got)
+	}
+	const base, jit = 8, 2
+	seen := map[int]bool{}
+	for i := 0; i < 500; i++ {
+		got := RollReportCount(base, jit, i)
+		if got < base-jit || got > base+jit {
+			t.Fatalf("波动越界: %d 不在 [%d,%d]", got, base-jit, base+jit)
+		}
+		seen[got] = true
+	}
+	if len(seen) != 2*jit+1 {
+		t.Errorf("应能取到区间内全部 %d 个值，实际 %d 个: %v", 2*jit+1, len(seen), seen)
+	}
+	// 下溢钳 1：base=1,jitter=3 → 不低于 1
+	for i := 0; i < 200; i++ {
+		if got := RollReportCount(1, 3, i); got < 1 || got > GrowthReportCountMax {
+			t.Fatalf("下溢应钳为 1，得到 %d", got)
+		}
+	}
+	// 上溢钳 Max：base=10,jitter=10 → 不超上限
+	for i := 0; i < 200; i++ {
+		if got := RollReportCount(10, 10, i); got > GrowthReportCountMax {
+			t.Fatalf("上溢应钳 %d，得到 %d", GrowthReportCountMax, got)
+		}
+	}
+	// base 非法值兜底
+	if got := RollReportCount(0, 0, 0); got != 1 {
+		t.Errorf("base=0 应兜底为 1，得到 %d", got)
+	}
+	if got := RollReportCount(99, 0, 0); got != GrowthReportCountMax {
+		t.Errorf("base 超界应钳 %d，得到 %d", GrowthReportCountMax, got)
 	}
 }
 

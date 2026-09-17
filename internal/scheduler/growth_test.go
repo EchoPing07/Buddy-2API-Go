@@ -648,6 +648,58 @@ func TestRunActivityReportsManual(t *testing.T) {
 	}
 }
 
+// TestReportCountJitter 波动数生效：count<=0 时实际发送条数应在 base±jitter 内浮动，
+// 且多次执行会出现不同值（证明真的在随机，而非固定取 base）。
+func TestReportCountJitter(t *testing.T) {
+	origGap := growthReportGap
+	growthReportGap = 0
+	t.Cleanup(func() { growthReportGap = origGap })
+
+	s, _, cfg := newTestScheduler(t, "cn", &fakeGrowth{})
+	if err := cfg.Update(func(c *config.Config) error {
+		c.GrowthReportCount = 8
+		c.GrowthReportJitter = 2
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int]int{}
+	for i := 0; i < 60; i++ {
+		s.growthState.reportDone = false // 每轮重置日标志，模拟不同日期
+		res := s.RunActivityReports(0)
+		if !res.Ran {
+			t.Fatalf("第 %d 轮未执行: %+v", i, res)
+		}
+		if res.Sent != res.Total {
+			t.Errorf("sent(%d) 应等于 total(%d)", res.Sent, res.Total)
+		}
+		if res.Total < 6 || res.Total > 10 {
+			t.Fatalf("应在 8±2 即 [6,10] 内，得到 %d", res.Total)
+		}
+		seen[res.Total]++
+	}
+	if len(seen) < 2 {
+		t.Errorf("波动应产出多个不同条数，实际分布: %v", seen)
+	}
+
+	// jitter=0 → 固定 base，多轮恒等
+	if err := cfg.Update(func(c *config.Config) error { c.GrowthReportJitter = 0; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		s.growthState.reportDone = false
+		if got := s.RunActivityReports(0).Total; got != 8 {
+			t.Fatalf("jitter=0 应恒为 8，得到 %d", got)
+		}
+	}
+
+	// 显式 count 不受波动影响
+	s.growthState.reportDone = false
+	if got := s.RunActivityReports(3).Total; got != 3 {
+		t.Errorf("显式 count 应尊重 3，得到 %d", got)
+	}
+}
+
 // TestRunGrowthRedeemManual 手动兑换：成功置 reward_day；已领 skip 不置。
 func TestRunGrowthRedeemManual(t *testing.T) {
 	fake := &fakeGrowth{}
