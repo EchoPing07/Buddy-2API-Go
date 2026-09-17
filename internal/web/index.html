@@ -7,9 +7,6 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='4 7 4 4 20 4 20 7'/%3E%3Cline x1='9' x2='15' y1='20' y2='20'/%3E%3Cline x1='12' x2='12' y1='4' y2='20'/%3E%3C/svg%3E">
 <script defer src="/assets/alpine.js"></script>
 <style>
-/* ═══════════════════════════════════════════════════════════════
-   设计令牌（参考 grok2api / shadcn · 极简黑白 · oklch）
-   ═══════════════════════════════════════════════════════════════ */
 :root{
   --radius:8px;
   /* 字号阶梯：11 / 12 / 13 / 14 / 16 / 20 / 24 / 28（禁止使用阶梯外尺寸） */
@@ -77,6 +74,8 @@
 *::-webkit-scrollbar{width:5px;height:5px}
 *::-webkit-scrollbar-thumb{border-radius:5px;background:var(--border)}
 *::-webkit-scrollbar-track{background:transparent}
+/* 滚动条槽位恒定：避免内容高度跨临界值时 scrollbar 出现/消失导致居中内容左右跳动 */
+html{scrollbar-gutter:stable}
 html,body{min-height:100%}
 body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--fg);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 a{color:inherit;text-decoration:none}
@@ -84,7 +83,6 @@ a{color:inherit;text-decoration:none}
 :focus-visible{outline:2px solid color-mix(in oklab,var(--fg) 55%,transparent);outline-offset:2px}
 [x-cloak]{display:none!important}
 .mono,code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;font-size:var(--fs-xs)}
-.muted{color:var(--muted-fg)}
 .muted-xs{font-size:var(--fs-2xs);color:var(--muted-fg)}
 .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .spacer{flex:1}
@@ -110,9 +108,15 @@ a{color:inherit;text-decoration:none}
 .btn-outline:hover{background:var(--secondary);color:var(--fg);opacity:1}
 .btn-danger{background:transparent;color:var(--destructive);border-color:color-mix(in oklab,var(--destructive) 32%,transparent)}
 .btn-danger:hover{background:var(--err-bg);opacity:1}
+/* 警示主色按钮（amber 填充）：深色文字保证对比度，不用白字 */
+.btn-warn{background:var(--bar-fill);color:oklch(.24 .05 75)}
+.btn-warn:hover{opacity:.9}
 .btn-sm{height:28px;padding:0 10px;font-size:var(--fs-xs);border-radius:7px}
 .btn-icon{width:32px;padding:0}
 .btn-sm.btn-icon{width:28px}
+/* 开关型按钮开启态（页面工具栏）：选中时填充主色，与常规按钮状态一致 */
+.btn.is-active{background:var(--primary);color:var(--primary-fg);border-color:var(--primary)}
+.btn.is-active:hover{opacity:.9}
 
 /* ── 表单 ── */
 .label{display:block;font-size:var(--fs-xs);font-weight:500;color:var(--muted-fg);margin-bottom:6px}
@@ -279,10 +283,13 @@ textarea.input{height:auto;padding:8px 11px;line-height:1.5}
 .oauth-url a:hover{text-decoration:underline}
 .row-center{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}
 .center-card{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:34px 20px}
-.checkin-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-@media(max-width:640px){.checkin-grid{grid-template-columns:1fr}}
-.checkin-item{display:flex;flex-direction:column;gap:3px}
-.checkin-val{font-size:var(--fs-lg);font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+/* 统计块：标签 12px 灰 → 值 16px 半粗 → 备注 11px 灰（三级层次，全站统一） */
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px 16px}
+@media(max-width:640px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+.stat{display:flex;flex-direction:column;gap:3px;min-width:0}
+.stat-v{font-size:var(--fs-lg);font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 动作行：卡片底部独立一行，与统计/表格区用分隔线隔开，避免按钮混进信息堆 */
+.action-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid color-mix(in oklab,var(--border) 55%,transparent)}
 
 /* ── 任务 ── */
 .hm-cells{display:flex;flex-wrap:wrap;gap:3px;padding:2px 0;max-height:150px;overflow-y:auto}
@@ -290,21 +297,27 @@ textarea.input{height:auto;padding:8px 11px;line-height:1.5}
 .hm-cell.hm-on{background:var(--ok-fg)}
 .hm-cell.hm-today{outline:2px solid var(--fg);outline-offset:1px}
 .hm-cell.hm-miss{outline:2px solid var(--bar-fill);outline-offset:1px}
+.legend-row{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:10px;font-size:var(--fs-2xs);color:var(--muted-fg)}
+.dot{width:10px;height:10px;border-radius:3px;flex-shrink:0;background:color-mix(in oklab,var(--muted-fg) 22%,transparent)}
+.dot.on{background:var(--ok-fg)}
+.dot.ring{outline:2px solid var(--fg);outline-offset:-2px}
+.dot.ring-miss{outline:2px solid var(--bar-fill);outline-offset:-2px}
 .tier-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 @media(max-width:640px){.tier-grid{grid-template-columns:1fr}}
 .tier-card{border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:3px;font-size:var(--fs-xs);line-height:1.6}
 .tier-card.available{border-color:color-mix(in oklab,var(--ok-fg) 45%,transparent);cursor:pointer;transition:filter .15s}
 .tier-card.available:hover{filter:brightness(1.06)}
 .tier-card.claimed{opacity:.55}
-.tier-head{display:flex;align-items:center;justify-content:space-between;font-size:var(--fs-sm);font-weight:600}
-.growth-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 0;font-size:var(--fs-sm)}
-.growth-row+.growth-row{border-top:1px solid color-mix(in oklab,var(--border) 45%,transparent)}
+.tier-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:var(--fs-sm);font-weight:600}
+.tier-row{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+.tier-row .v{font-variant-numeric:tabular-nums}
 
 /* ── 弹窗 ── */
 .overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(8,10,14,.4);backdrop-filter:blur(3px)}
 .modal{width:100%;max-width:420px;background:var(--popover);border:1px solid color-mix(in oklab,var(--border) 80%,transparent);border-radius:14px;padding:22px;box-shadow:0 24px 60px rgba(0,0,0,.28);animation:pop .16s ease-out}
 .modal-title{font-size:var(--fs-lg);font-weight:600;margin-bottom:6px}
 .modal-msg{font-size:var(--fs-sm);color:var(--muted-fg);line-height:1.65;margin-bottom:18px}
+.modal-detail{font-size:var(--fs-2xs);color:var(--muted-fg);line-height:1.6;background:var(--secondary);border-radius:8px;padding:9px 11px;margin:-8px 0 16px}
 .modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
 @keyframes pop{from{opacity:0;transform:scale(.97) translateY(6px)}to{opacity:1}}
 
@@ -1145,9 +1158,10 @@ section[x-show]{animation:fadeUp .18s ease-out}
     <div class="modal" role="alertdialog" style="max-width:380px">
       <div class="modal-title" x-text="confirmBox.title"></div>
       <p class="modal-msg" x-text="confirmBox.message"></p>
+      <p class="modal-detail" x-show="confirmBox.detail" x-text="confirmBox.detail"></p>
       <div class="modal-foot">
         <button class="btn btn-secondary btn-sm" @click="confirmBox.open=false">取消</button>
-        <button class="btn btn-danger btn-sm" @click="confirmBox.onOk && confirmBox.onOk()">确定</button>
+        <button class="btn btn-sm" :class="confirmBox.danger?'btn-danger':''" @click="confirmBox.onOk && confirmBox.onOk()" x-text="confirmBox.okText"></button>
       </div>
     </div>
   </div>
@@ -1192,10 +1206,12 @@ const ICONS = {
   alert:'<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
   dollar:'<circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 6v2m0 8v2"/>',
   flame:'<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',
-  growth:'<path d="M12 20h.01"/><path d="M12 20v-8"/><path d="M12 12c-4 0-8-2-8-6 2 0 4 .5 5.5 1.5C10 4 11 2 12 2s2 2 2.5 5.5C16 6.5 18 6 20 6c0 4-4 6-8 6z"/>',
+  growth:'<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>',
   download:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
   upload:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
   shield:'<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+  eye:'<path d="M2.06 12.35a1 1 0 0 1 0-.7 10.75 10.75 0 0 1 19.88 0 1 1 0 0 1 0 .7 10.75 10.75 0 0 1-19.88 0"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff:'<path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.5 13.5 0 0 0 2 12s3 7 10 7a9.75 9.75 0 0 0 5.39-1.61"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="m2 2 20 20"/>',
   box:'<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
 };
 
