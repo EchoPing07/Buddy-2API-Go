@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"sort"
@@ -653,6 +654,7 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		"growth_report_cron":     cfg.GrowthReportCron,
 		"growth_travel_cron":     cfg.GrowthTravelCron,
 		"growth_report_count":    cfg.GrowthReportCount,
+		"growth_report_jitter":   cfg.GrowthReportJitter,
 		"resource_cache_seconds": cfg.ResourceCacheSeconds,
 		"log_retention_days":     cfg.LogRetentionDays,
 		"log_max_size_mb":        cfg.LogMaxSizeMB,
@@ -676,6 +678,7 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		GrowthReportCron     *string `json:"growth_report_cron"`
 		GrowthTravelCron     *string `json:"growth_travel_cron"`
 		GrowthReportCount    *int    `json:"growth_report_count"`
+		GrowthReportJitter   *int    `json:"growth_report_jitter"`
 		ResourceCacheSeconds *int    `json:"resource_cache_seconds"`
 		LogRetentionDays     *int    `json:"log_retention_days"`
 		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
@@ -776,10 +779,20 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 			if n < 1 {
 				n = 1
 			}
-			if n > 10 {
-				n = 10 // 钳制防风控，不报错（与 Normalize 口径一致）
+			if n > config.GrowthReportCountMax {
+				n = config.GrowthReportCountMax // 钳制防风控，不报错（与 Normalize 口径一致）
 			}
 			c.GrowthReportCount = n
+		}
+		if req.GrowthReportJitter != nil {
+			n := *req.GrowthReportJitter
+			if n < 0 {
+				n = 0
+			}
+			if n > config.GrowthReportJitterMax {
+				n = config.GrowthReportJitterMax
+			}
+			c.GrowthReportJitter = n
 		}
 		if req.ResourceCacheSeconds != nil && *req.ResourceCacheSeconds > 0 {
 			c.ResourceCacheSeconds = *req.ResourceCacheSeconds
@@ -796,6 +809,21 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			c.ChatTimeoutSeconds = *req.ChatTimeoutSeconds
+		}
+		// 存量 cron 兜底：请求未携带该字段时（前端在功能关闭时不下发），
+		// 校验存量值；非法（常见来源是 env 写错位数）则回落默认，
+		// 避免一条用户看不见/改不了的非法 cron 永久阻断无关设置保存。
+		if req.CheckinCron == nil && !validCron(c.CheckinCron) {
+			slog.Warn("存量 checkin_cron 非法，回落默认", "value", c.CheckinCron)
+			c.CheckinCron = config.DefaultCheckinCron
+		}
+		if req.GrowthReportCron == nil && !validCron(c.GrowthReportCron) {
+			slog.Warn("存量 growth_report_cron 非法，回落默认", "value", c.GrowthReportCron)
+			c.GrowthReportCron = config.DefaultGrowthReportCron
+		}
+		if req.GrowthTravelCron == nil && !validCron(c.GrowthTravelCron) {
+			slog.Warn("存量 growth_travel_cron 非法，回落默认", "value", c.GrowthTravelCron)
+			c.GrowthTravelCron = config.DefaultGrowthTravelCron
 		}
 		return nil
 	})
