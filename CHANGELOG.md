@@ -41,6 +41,7 @@
 - **HTTPS 部署下会话 cookie 被浏览器丢弃**：`Secure` 改为按链路判定（直连 TLS，或反代声明 `X-Forwarded-Proto: https`，多段取最后一段），`Clear` 与 `Issue` 同口径。
 - **额度包卡片内容错位**：关闭「隐藏已用完」过滤后 Alpine 按数组下标复用 DOM 导致串位；新增额度包稳定 key（展示字段内容指纹）供 `x-for` 使用。
 - **仪表盘模型列表被截断**：去掉 `by_model` 的 `LIMIT 10` 与前端二次截断，模型行改为滚动容器，`maxReq` 改用 `reduce` 以避免模型数增长触达 `Math.max` 参数上限。
+- **折扣活动时区随部署环境漂移**：`schedule.timezone` 为空或无法识别时，`schedLoc` 原回退 `time.Local`，而上游 `modelPromotions` 的时段窗是北京时间口径——容器 `TZ=UTC` 等非 +8 部署下，`23:00-07:50` 这类窗口整体偏移 8 小时，夜间折扣会在白天生效、夜间反而消失。现统一回退北京时间（CST），与 `billingTZ` / `cstShanghai` 口径一致；显式 IANA 时区仍照常尊重。该缺陷同时导致 v0.2.0 发布门禁在 UTC runner 上失败（本机 CST 下不可复现），已补与环境时区无关的回归用例 `TestSchedLocFallsBackToCST`。
 
 ### ♻️ 重构
 
@@ -54,6 +55,7 @@
 ### 🧪 工程与文档
 
 - 发布流水线新增**门禁作业**：先跑 `go vet ./...` + `go test ./...`（含需要 `node` 的前端行为测试），不通过则不产出任何制品；二进制与 Docker 作业依赖该门禁。
+- 发布附件的挂载条件由 `github.event_name == 'release'` 改为 `startsWith(github.ref, 'refs/tags/')` 并显式传 `tag_name`：原条件下列按注释用 `workflow_dispatch` 「补跑」永远不产出 Release 附件（手触发时事件名不是 `release`），门禁失败后无法用文档写明的方式补挂制品。现在选中 tag 触发即可补挂，在分支上触发仅产出工作流产物，不会误建/误改 Release。
 - 测试函数由 26 个增至 118 个（含 `TestFrontendInitialLoad` 等前端行为回归），新增 `internal/web/web_test.go`、`main_test.go`、`internal/upstream/growth_test.go`、`internal/scheduler/growth_test.go`、`internal/admin/growth_test.go`、`internal/admin/settings_test.go` 等，覆盖路由与 405 / Etag / gzip、cookie Secure、余额聚合回归、任务链编排与跨日边界、错误分类器等。
 - README 重写 Web 与成长任务章节、补 5 个新 env、补 `Sliverkiss/workbuddy2api` 致谢与实验性功能风险声明；`.env.example` 补成长任务配置块；新增本文件。
 - 统计：44 个文件变更，+8732 / −1594。

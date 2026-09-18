@@ -222,14 +222,21 @@ func promoActive(s *PromoSchedule, now time.Time) bool {
 	return false
 }
 
+// schedLoc 解析折扣活动的时区；空值或无法识别的时区名一律回退 CST（北京时间）。
+//
+// 上游 modelPromotions 的时段窗是北京时间口径（实测 schedule.timezone 恒为
+// Asia/Shanghai），故绝不能退回 time.Local：容器 TZ 非 +8 时（README 明确支持
+// -e TZ=UTC 等覆盖），23:00-07:50 这类窗口会整体偏移 8 小时，同一活动在 UI 上
+// 会提前/延后 8 小时生效。与 admin.billingTZ、upstream.cstShanghai 同为「上游
+// 时间恒按北京时间解析、不看部署时区」的口径；FixedZone 不依赖 tzdata。
 func schedLoc(tz string) *time.Location {
-	if strings.TrimSpace(tz) == "" {
-		return time.Local
+	if s := strings.TrimSpace(tz); s != "" {
+		if loc, err := time.LoadLocation(s); err == nil {
+			return loc
+		}
+		slog.Warn("折扣活动时区无法识别，已回退北京时间", "timezone", tz)
 	}
-	if loc, err := time.LoadLocation(tz); err == nil {
-		return loc
-	}
-	return time.Local
+	return cstShanghai
 }
 
 func parseHM(s string) (int, bool) {

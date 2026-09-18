@@ -385,7 +385,7 @@ type ModelPromotion struct {
 
 // PromoSchedule 活动生效时间：绝对起止（RFC3339，可空）+ 每日时段窗（可空 = 不限时段）。
 type PromoSchedule struct {
-	Timezone   string        `json:"timezone"` // 如 Asia/Shanghai；空则按本地时间
+	Timezone   string        `json:"timezone"` // 如 Asia/Shanghai；空或无法识别则按北京时间（CST）
 	Daily      []DailyWindow `json:"daily"`
 	ValidFrom  string        `json:"validFrom"`
 	ValidUntil string        `json:"validUntil"`

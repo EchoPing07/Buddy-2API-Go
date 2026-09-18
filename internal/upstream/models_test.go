@@ -106,6 +106,61 @@ func TestPromoActiveDailyAndValidity(t *testing.T) {
 	}
 }
 
+// TestSchedLocFallsBackToCST 守住折扣时区的回退口径：schedule.timezone 为空（或
+// 无法识别的时区名）时必须回退北京时间，绝不能回退 time.Local。
+//
+// 回归背景：上游 modelPromotions 的时段窗为北京时间口径，但早期实现把空时区当成
+// 「部署本地时间」。开发机（CST）与 CI runner（UTC）因此结论相反——v0.2.0 发布流水线
+// 的测试门禁正是在 UTC runner 上失败（night: rate=0.79 want 0.50，白天窗反向命中）。
+// 故本用例显式改写 time.Local 后断言结果不变，不依赖运行环境时区。
+func TestSchedLocFallsBackToCST(t *testing.T) {
+	orig := time.Local
+	t.Cleanup(func() { time.Local = orig })
+
+	for _, env := range []struct {
+		name string
+		loc  *time.Location
+	}{
+		{"UTC", time.UTC},
+		{"America/New_York", mustLoc(t, "America/New_York")},
+		{"Asia/Tokyo", mustLoc(t, "Asia/Tokyo")},
+	} {
+		time.Local = env.loc
+
+		// 空时区与非法时区名均须回退 CST（UTC+8），不得随 time.Local 漂移。
+		for _, tz := range []string{"", "   ", "Nowhere/Invalid"} {
+			got := schedLoc(tz)
+			if _, off := time.Date(2026, 8, 25, 12, 0, 0, 0, got).Zone(); off != 8*60*60 {
+				t.Errorf("time.Local=%s: schedLoc(%q) 偏移 = %d 秒，期望 28800（CST）", env.name, tz, off)
+			}
+		}
+
+		// 显式 IANA 时区仍应被尊重（不被 CST 覆盖）。
+		if _, off := time.Date(2026, 8, 25, 12, 0, 0, 0, schedLoc("Asia/Tokyo")).Zone(); off != 9*60*60 {
+			t.Errorf("time.Local=%s: schedLoc(Asia/Tokyo) 偏移 = %d 秒，期望 32400", env.name, off)
+		}
+
+		// 折扣判定结果须与环境时区无关：01:00 CST 命中夜间窗，12:00 CST 不命中。
+		// 用 UTC 时刻构造，等价于 UTC 17:00（= CST 次日 01:00）与 UTC 04:00（= CST 12:00）。
+		sched := &PromoSchedule{Daily: []DailyWindow{{Start: "23:00", End: "7:50"}}} // 无 timezone 字段
+		if !promoActive(sched, time.Date(2026, 8, 24, 17, 0, 0, 0, time.UTC)) {
+			t.Errorf("time.Local=%s: UTC 17:00（CST 01:00）应命中夜间折扣", env.name)
+		}
+		if promoActive(sched, time.Date(2026, 8, 25, 4, 0, 0, 0, time.UTC)) {
+			t.Errorf("time.Local=%s: UTC 04:00（CST 12:00）不应命中夜间折扣", env.name)
+		}
+	}
+}
+
+func mustLoc(t *testing.T, name string) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatalf("加载时区 %s 失败: %v", name, err)
+	}
+	return loc
+}
+
 func TestEffectiveRatePriorityAndFallback(t *testing.T) {
 	loc := mustCN(t)
 	night := time.Date(2026, 8, 25, 1, 0, 0, 0, loc)
