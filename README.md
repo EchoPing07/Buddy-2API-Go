@@ -221,7 +221,8 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `BUDDY2API_AUTO_GROWTH` | 自动成长任务开关（默认关闭，仅国内版账号可用） |
 | `BUDDY2API_GROWTH_REPORT_CRON` | 上报+奖励链 cron，6 段含秒（默认 `0 0 10 * * *`） |
 | `BUDDY2API_GROWTH_TRAVEL_CRON` | 猫猫旅行巡检 cron（默认 `0 0 9,21 * * *`） |
-| `BUDDY2API_GROWTH_REPORT_COUNT` | 每日活跃上报条数 1-10（默认 5；领养前置 `chat_5` 需 5 条，同会话多轮、每条间隔 1.5 秒） |
+| `BUDDY2API_GROWTH_REPORT_COUNT` | 每日活跃上报条数 1-10（默认 10；领养前置 `chat_5` 需 5 条，同会话多轮、每条间隔 1.5 秒） |
+| `BUDDY2API_GROWTH_REPORT_JITTER` | 上报条数随机波动 ±N（默认 0=固定不波动，上限 10），每次执行在「条数 ±N」内随机取整，更像真人以降低风控判定 |
 | `BUDDY2API_RESOURCE_CACHE_SECONDS` | 余额缓存秒数（默认 300） |
 | `BUDDY2API_LOG_RETENTION_DAYS` | 日志保留天数（默认 90） |
 | `BUDDY2API_LOG_MAX_SIZE_MB` | 日志表容量上限 MB（默认 50） |
@@ -290,3 +291,5 @@ Go 1.25+ · chi · modernc.org/sqlite（纯 Go，无 cgo） · robfig/cron/v3 ·
 ## 📄 License
 
 本项目采用 [MIT](LICENSE.txt) 协议开源，仅供学习研究使用。
+
+各版本变更见 [CHANGELOG.md](CHANGELOG.md)。
