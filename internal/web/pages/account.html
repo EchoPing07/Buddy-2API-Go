@@ -1,0 +1,93 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>账号</h1>
+          <div class="page-actions">
+            <button class="btn btn-secondary btn-sm" @click="exportAccount()" :disabled="loading"><span class="ic" x-html="ic('upload')"></span>导出凭证</button>
+            <button class="btn btn-secondary btn-sm" @click="importModal=true"><span class="ic" x-html="ic('download')"></span>导入凭证</button>
+            <template x-if="account.logged_in">
+              <button class="btn btn-secondary btn-sm" @click="refreshToken()" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新 Token</button>
+            </template>
+            <template x-if="account.logged_in">
+              <button class="btn btn-secondary btn-sm" @click="testAccount()" :disabled="loading"><span class="ic" x-html="ic('shield')"></span>测试连通</button>
+            </template>
+            <template x-if="account.logged_in">
+              <button class="btn btn-danger btn-sm" @click="deleteAccount()" :disabled="loading"><span class="ic" x-html="ic('logout')"></span>退出登录</button>
+            </template>
+          </div>
+        </header>
+
+        <template x-if="account.logged_in">
+          <div class="card">
+            <div class="card-head">
+              <h3>OAuth 凭证</h3>
+              <span class="badge" :class="account.expired?'badge-err':'badge-ok'" x-text="account.expired?'已过期':'正常'"></span>
+              <span class="badge" :class="account.region_match?'badge-muted':'badge-warn'" x-text="account.region_match?'与当前端点匹配':'凭证属于另一端点'"></span>
+              <div class="spacer"></div>
+              <span class="muted-xs" x-text="'uid '+(account.uid||'—')"></span>
+            </div>
+            <div class="kv-grid">
+              <div class="kv"><span class="k">昵称</span><span class="v" x-text="account.nickname||'—'"></span></div>
+              <div class="kv"><span class="k">enterprise_id</span><span class="v" x-text="account.enterprise_id||'（个人账号）'"></span></div>
+              <div class="kv"><span class="k">domain</span><span class="v" x-text="account.domain||'—'"></span></div>
+              <div class="kv"><span class="k">access_token</span><span class="v mono" x-text="account.access_token"></span></div>
+              <div class="kv"><span class="k">refresh_token</span><span class="v" x-text="account.has_refresh?'已保存':'无'"></span></div>
+              <div class="kv"><span class="k">过期时间</span><span class="v" x-text="account.expires_human+(account.expires_at?'（'+ts(account.expires_at)+'）':'')"></span></div>
+            </div>
+          </div>
+        </template>
+
+        <div class="card">
+          <div class="card-head"><h3 x-text="account.logged_in?'重新登录':'登录'"></h3></div>
+          <template x-if="!oauth.state">
+            <div>
+              <p class="oauth-desc">点击开始后，在打开的浏览器页面中完成授权登录。凭证仅保存在本地 data 目录。</p>
+              <button class="btn" @click="oauthStart()" :disabled="loading"><span class="ic" x-html="ic('external')"></span>开始登录</button>
+            </div>
+          </template>
+          <template x-if="oauth.state">
+            <div class="oauth-box">
+              <p>请在浏览器中打开以下链接完成授权：</p>
+              <div class="oauth-url"><a :href="oauth.auth_url" target="_blank" rel="noreferrer" x-text="oauth.auth_url"></a></div>
+              <div class="row-center">
+                <a :href="oauth.auth_url" target="_blank" rel="noreferrer"><button class="btn btn-secondary btn-sm"><span class="ic" x-html="ic('external')"></span>打开授权页面</button></a>
+                <button class="btn btn-ghost btn-sm" @click="copy(oauth.auth_url)"><span class="ic" x-html="ic('copy')"></span>复制链接</button>
+                <span class="muted-xs" x-text="oauth.poll_msg"></span>
+                <button class="btn btn-ghost btn-sm" @click="oauthCancel()">取消</button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </section>
+
+<!-- ═══ 导入凭证弹窗 ═══ -->
+<template x-if="importModal">
+  <div class="overlay" @click.self="importModal=false">
+    <form class="modal" style="max-width:560px" @submit.prevent="importAccount()">
+      <div class="modal-title">导入凭证</div>
+      <p class="modal-msg">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。</p>
+      <div class="form-row">
+        <label class="label">从文件导入</label>
+        <div class="row">
+          <input x-ref="importFileInput" type="file" accept=".json,application/json" style="display:none" @change="onImportFile($event)">
+          <button type="button" class="btn btn-secondary btn-sm" @click="$refs.importFileInput.click()"><span class="ic" x-html="ic('download')"></span>选择文件</button>
+        </div>
+        <p class="field-hint" x-show="importForm.filename" x-text="'已选择：'+importForm.filename"></p>
+      </div>
+      <div class="form-row">
+        <label class="label">access_token</label>
+        <textarea class="input" rows="3" x-model="importForm.access_token" placeholder="eyJhbGciOi..." style="height:auto;resize:vertical;font-size:var(--fs-2xs)"></textarea>
+      </div>
+      <div class="form-grid c2">
+        <div class="form-row"><label class="label">refresh_token（可选）</label><input class="input mono" x-model="importForm.refresh_token" style="font-size:var(--fs-2xs)"></div>
+        <div class="form-row"><label class="label">domain（可选）</label><input class="input" x-model="importForm.domain" placeholder="留空按当前端点"></div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-secondary btn-sm" @click="importModal=false">取消</button>
+        <button type="submit" class="btn btn-sm" :disabled="loading">
+          <span class="spin" x-show="loading"></span>
+          <span x-show="!loading">导入</span>
+        </button>
+      </div>
+    </form>
+  </div>
+</template>

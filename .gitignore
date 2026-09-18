@@ -13,6 +13,9 @@ tests/
 *.dll
 *.so
 *.dylib
+# 无扩展名的构建产物（Linux/macOS 或 git-bash 下 go build 的默认输出）
+/buddy2api
+/buddy2api-go
 
 # 测试二进制
 *.test

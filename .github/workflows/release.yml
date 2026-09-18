@@ -1,4 +1,5 @@
 # Release（打 tag）自动发布流水线：
+#   0. 测试与静态检查（test 作业，其余作业依赖它；不通过则不发布）
 #   1. 交叉编译主流平台二进制：Linux / Windows / macOS × amd64 / arm64 / armv7 / riscv64
 #   2. 压缩归档（windows=zip，其余=tar.gz），上传到 Release 附件，附 SHA256 校验和
 #   3. 构建多架构 Docker 镜像（linux/amd64 + linux/arm64）并推送到 GHCR（ghcr.io/<owner>/<repo>）
@@ -21,9 +22,38 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # ─────────────── 0. 测试与静态检查（发布前门禁） ───────────────
+  # 单独作业而非放入矩阵：矩阵有 8 个组合，无需重复测试。
+  # 需安装 node：TestFrontendInitialLoad 由 node 驱动真实 app.js，缺失时 t.Skip
+  #（会静默跳过前端行为回归）。
+  test:
+    name: 测试与 vet
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
   # ───────────────────────── 1. 交叉编译二进制 ─────────────────────────
   build-binaries:
     name: 构建 ${{ matrix.label }}
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -143,6 +173,7 @@ jobs:
   # ───────────────────────── 3. Docker 镜像 ─────────────────────────
   docker:
     name: Docker 镜像（amd64 + arm64）
+    needs: build-binaries
     runs-on: ubuntu-latest
     permissions:
       contents: read

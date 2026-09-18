@@ -1,0 +1,233 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>任务</h1>
+          <div class="page-actions">
+            <span class="muted-xs" x-show="growthLastRunText()"
+                  :title="growthLastRunTitle()" x-text="'上次执行 '+growthLastRunText()"></span>
+            <button class="btn btn-sm" @click="runGrowthChain()" :disabled="growthBusy">
+              <span class="spin" x-show="growthBusy"></span>
+              <span class="ic" x-show="!growthBusy" x-html="ic('growth')"></span>执行全部
+            </button>
+            <button class="btn btn-secondary btn-sm" @click="loadGrowth(true); loadCheckin()" :disabled="loading">
+              <span class="ic" x-html="ic('refresh')"></span>刷新
+            </button>
+            <a :href="growthCenterUrl" target="_blank" rel="noreferrer" title="在新窗口打开个人中心">
+              <button class="btn btn-secondary btn-sm" type="button">
+                <span class="ic" x-html="ic('external')"></span>个人中心
+              </button>
+            </a>
+          </div>
+        </header>
+
+        <!-- 每日签到（国内版功能）：仅 overview 明确返回 available:false 时随不可用横幅隐藏，
+             overview 未就绪或请求失败时仍展示；签到接口失败由卡内降级与重试处理 -->
+        <div class="card" x-show="!growth.loaded || growth.available">
+          <div class="card-head">
+            <h3>每日签到</h3>
+            <div class="spacer"></div>
+            <span class="badge" x-show="checkinOk" :class="checkin.today_checked_in?'badge-ok':'badge-muted'" x-text="checkin.today_checked_in?'今日已签到':'未签到'"></span>
+          </div>
+          <template x-if="checkinOk && !checkinPending">
+            <div>
+              <div class="stat-grid">
+                <div class="stat"><span class="metric-label">今日积分</span><span class="stat-v" x-text="checkin.today_credit ?? '—'"></span></div>
+                <div class="stat"><span class="metric-label">连续签到</span><span class="stat-v" x-text="(checkin.streak_days ?? 0)+' 天'"></span></div>
+                <div class="stat"><span class="metric-label">活动状态</span><span class="stat-v" x-text="checkin.active?'进行中':'未开启'"></span></div>
+              </div>
+              <div class="action-row">
+                <button class="btn btn-sm" :class="checkin.today_checked_in?'btn-secondary':''" @click="claimCheckin()" :disabled="loading||checkin.today_checked_in">
+                  <span class="ic" x-html="ic(checkin.today_checked_in?'check':'checkin')"></span>
+                  <span x-text="checkin.today_checked_in?'今日已签到':'立即签到'"></span>
+                </button>
+                <span class="muted-xs" x-text="checkinHint()"></span>
+              </div>
+            </div>
+          </template>
+          <div class="empty" style="padding:24px 0" x-show="checkinPending || !checkin.loaded">
+            <span class="spin" style="width:18px;height:18px"></span>加载中…
+          </div>
+          <div class="empty" style="padding:24px 0" x-show="checkin.loaded && !checkinOk && !checkinPending">
+            <span class="ic ic-lg" x-html="ic('checkin')"></span>
+            <p class="muted-xs" style="margin:0" x-text="'签到状态加载失败：'+(checkinErr||'未知错误')"></p>
+            <button class="btn btn-secondary btn-sm" @click="loadCheckin()">重试</button>
+          </div>
+        </div>
+
+        <!-- 不可用横幅（region=global / 未登录） -->
+        <div class="card" x-show="growth.loaded && !growth.available">
+          <div class="center-card">
+            <span class="ic ic-lg" x-html="ic('growth')"></span>
+            <p class="oauth-desc" style="margin:0"
+               x-text="growth.reason==='region_global' ? '国际版账号无任务体系（签到/任务/猫猫均为国内版功能）' : '尚未登录，请先在「账号」页完成 OAuth 登录'"></p>
+            <button class="btn btn-secondary btn-sm" x-show="growth.reason==='not_logged_in'" @click="go('account')">前往登录</button>
+          </div>
+        </div>
+
+        <template x-if="growth.available && !growthErr">
+        <div class="space" style="gap:16px">
+          <p class="field-hint" style="margin:0" x-text="growthHint()"></p>
+
+          <!-- 卡片A：连登与奖励 -->
+          <div class="card">
+            <div class="card-head">
+              <h3>连登与奖励</h3>
+              <div class="spacer"></div>
+              <span class="badge" :class="growth.streak&&growth.streak.days>0?'badge-ok':'badge-muted'"
+                    x-show="!growthDegraded('streak')">
+                <span class="ic ic-sm" x-html="ic('flame')"></span>连登 <span x-text="(growth.streak||{}).days ?? 0"></span> 天
+              </span>
+              <span class="badge badge-warn" x-show="growthDegraded('streak')">部分数据不可用</span>
+            </div>
+            <template x-if="!growthDegraded('streak') && growth.streak">
+              <div>
+                <div class="stat-grid">
+                  <div class="stat">
+                    <span class="metric-label">距下一档</span>
+                    <span class="stat-v" x-text="growth.streak.remaining_days>0 ? '还差 '+growth.streak.remaining_days+' 天' : '已到最高档'"></span>
+                  </div>
+                  <div class="stat">
+                    <span class="metric-label">补签卡</span>
+                    <span class="stat-v" x-text="growth.streak.makeup_cards.balance+' / '+growth.streak.makeup_cards.max+' 张'"></span>
+                  </div>
+                  <div class="stat">
+                    <span class="metric-label">抽奖次数</span>
+                    <span class="stat-v" x-text="growthDegraded('lottery') ? '—（暂不可用）' : ((growth.lottery||{}).chances ?? '—')"></span>
+                  </div>
+                </div>
+                <div class="tier-grid" style="margin-top:14px">
+                  <template x-for="t in (growth.streak.tiers||[])" :key="t.tier">
+                    <div class="tier-card" :class="t.status"
+                         :tabindex="t.status==='available'?0:null"
+                         :role="t.status==='available'?'button':null"
+                         :aria-disabled="t.status!=='available'"
+                         :aria-label="t.status==='available' ? ('兑换 '+t.tier+' 档奖励') : null"
+                         @click="t.status==='available' && runGrowthRedeem(t.tier)"
+                         @keydown.enter.prevent="t.status==='available' && runGrowthRedeem(t.tier)"
+                         @keydown.space.prevent="t.status==='available' && runGrowthRedeem(t.tier)">
+                      <div class="tier-head">
+                        <span x-text="t.tier"></span>
+                        <span class="badge" :class="t.status==='claimed'?'badge-muted':(t.status==='available'?'badge-ok':'badge-muted')" x-text="growthTierSub(t)"></span>
+                      </div>
+                      <div class="tier-row"><span class="metric-label">奖励</span><span class="v" x-text="'+'+t.credit+' 积分 · +'+t.energy+' 能量'"></span></div>
+                      <div class="tier-row"><span class="v" x-text="'+'+t.cards+' 补签卡 · +'+t.chances+' 抽奖'"></span></div>
+                    </div>
+                  </template>
+                </div>
+                <div class="action-row">
+                  <!-- 昨日漏签且有余卡（growthMakeupReady()）时才渲染，其余情况不占位 -->
+                  <button class="btn btn-warn btn-sm" x-show="growthMakeupReady()"
+                          @click="runGrowthMakeup()" :disabled="growthBusy"
+                          x-text="'补签 '+(((growth.heatmap||{}).yesterday||{}).date||'')+'（连登保住）'"></button>
+                  <button class="btn btn-secondary btn-sm" @click="runGrowthLottery()" :disabled="growthBusy || !(growth.lottery&&growth.lottery.chances>0)"
+                          :title="growthDegraded('lottery')?'抽奖次数查询失败，请刷新后重试':''">抽奖一次</button>
+                  <button class="btn btn-secondary btn-sm" @click="runGrowthBonus()" :disabled="growthBusy">领取新手礼包 / 活动补偿</button>
+                </div>
+              </div>
+            </template>
+            <div class="empty" x-show="growthDegraded('streak')">
+              <span class="ic ic-lg" x-html="ic('flame')"></span>连登数据暂不可用
+            </div>
+          </div>
+
+          <!-- 卡片B：活跃地图 + 今日上报 -->
+          <div class="card">
+            <div class="card-head">
+              <h3>活跃地图</h3>
+              <span class="muted-xs" x-show="((growth.heatmap||{}).cells||[]).length">近 <span x-text="((growth.heatmap||{}).cells||[]).length"></span> 天</span>
+              <div class="spacer"></div>
+              <span class="badge" :class="(growth.today||{}).report_done?'badge-ok':'badge-muted'"
+                    x-show="!growthDegraded('heatmap')"
+                    x-text="(growth.today||{}).report_done?'今日已上报':'今日未上报'"></span>
+              <span class="badge badge-warn" x-show="growthDegraded('heatmap')">部分数据不可用</span>
+            </div>
+            <template x-if="!growthDegraded('heatmap') && growth.heatmap">
+              <div>
+                <div class="hm-cells" x-show="((growth.heatmap||{}).cells||[]).length">
+                  <!-- :key 取 cell.date 而非下标：cells 为按天序列，前缀变化（日期滚动、后端只返回部分天数）时
+                       下标会与节点错位（Alpine 按 key 复用 DOM） -->
+                  <template x-for="cell in (growth.heatmap.cells||[])" :key="cell.date">
+                    <span class="hm-cell"
+                          :class="{ 'hm-on':cell.score>0,
+                                    'hm-today':cell.date===((growth.heatmap.today||{}).date),
+                                    'hm-miss':cell.date===((growth.heatmap.yesterday||{}).date)&&cell.score===0 }"
+                          :title="cell.date+(cell.score>0?' 活跃':' 漏签')"></span>
+                  </template>
+                </div>
+                <p class="muted-xs" x-show="!((growth.heatmap||{}).cells||[]).length">暂无活跃地图数据</p>
+                <div class="legend-row" x-show="((growth.heatmap||{}).cells||[]).length">
+                  <span class="lg"><i class="dot on"></i>活跃</span>
+                  <span class="lg"><i class="dot"></i>漏签</span>
+                  <span class="lg"><i class="dot ring"></i>今日</span>
+                  <span class="lg"><i class="dot ring-miss"></i>昨日漏签（可补）</span>
+                </div>
+              </div>
+            </template>
+            <div class="empty" x-show="growthDegraded('heatmap')">
+              <span class="ic ic-lg" x-html="ic('growth')"></span>热力图暂不可用
+            </div>
+            <!-- 上报为写操作（POST），不随只读的 heatmap 降级隐藏：读取失败时上报通常仍可用，
+                 实际不可用由 POST 返回的错误信息兜底 -->
+            <div class="action-row">
+              <button class="btn btn-sm" @click="runGrowthReport()" :disabled="growthBusy">
+                <span class="spin" x-show="growthBusy"></span>
+                <span x-text="growthBusy?'上报中…':'立即上报'"></span>
+              </button>
+              <span class="muted-xs">上报对话活跃，点亮连登天数</span>
+            </div>
+          </div>
+
+          <!-- 卡片C：猫猫旅行 -->
+          <div class="card">
+            <div class="card-head">
+              <h3>猫猫旅行</h3>
+              <span class="muted-xs" x-show="growth.buddy&&growth.buddy.has">每日 1 次</span>
+              <div class="spacer"></div>
+              <span class="badge badge-warn" x-show="growthDegraded('travel')||growthDegraded('buddy')">部分数据不可用</span>
+            </div>
+            <template x-if="growthDegraded('buddy')">
+              <div class="empty" style="padding:20px 0">
+                <span class="ic ic-lg" x-html="ic('growth')"></span>猫档案数据暂不可用
+              </div>
+            </template>
+            <template x-if="growth.buddy && growth.buddy.has && !growthDegraded('buddy')">
+              <div>
+                <div class="row" style="gap:12px">
+                  <span style="font-size:24px;line-height:1">🐱</span>
+                  <span style="font-size:var(--fs-lg);font-weight:600" x-text="growth.buddy.name||'喵喵'"></span>
+                  <span class="badge" :class="growth.travel&&growth.travel.state==='arrived'?'badge-ok':(growth.travel&&growth.travel.state==='traveling'?'badge-warn':'badge-muted')"
+                        x-text="{idle:'在家休息', traveling:'旅行中', arrived:'已到站'}[(growth.travel||{}).state]||'状态未知'"></span>
+                  <span class="muted-xs" x-show="growth.travel&&growth.travel.state==='traveling'">到站后自动领奖</span>
+                  <span class="muted-xs" x-show="growth.travel&&growth.travel.state==='idle'&&growth.travel.daily_limit_reached">今日已派出，明日 9:00 自动领奖</span>
+                </div>
+                <div class="action-row">
+                  <!-- 单动作状态机：到站渲染领奖、空闲渲染派出；traveling 与已达日限时 stepTravel
+                       返回 skip，故不渲染空转的巡检按钮 -->
+                  <button class="btn btn-sm" x-show="growth.travel && growth.travel.state==='arrived'" @click="runGrowthTravel()" :disabled="growthBusy"
+                          x-text="'领取旅行奖励'+(((growth.travel||{}).reward_credit>0)?'（+'+growth.travel.reward_credit+' 积分）':'')"></button>
+                  <button class="btn btn-sm" x-show="growth.travel && growth.travel.state==='idle' && !growth.travel.daily_limit_reached" @click="runGrowthTravel()" :disabled="growthBusy">派出旅行</button>
+                  <span class="muted-xs">到站领奖 · 空闲派出</span>
+                </div>
+              </div>
+            </template>
+            <template x-if="growth.buddy && !growth.buddy.has && !growthDegraded('buddy')">
+              <div class="empty" style="padding:20px 0">
+                <span class="ic ic-lg" x-html="ic('growth')"></span>
+                <p class="muted-xs" style="margin:0">领养前置：累计 5 次对话</p>
+                <p class="muted-xs" style="margin:0" x-show="(growth.today||{}).adopt_tried">今日已尝试领养（门槛未达），明日上报后自动重试</p>
+                <button class="btn btn-sm" @click="runGrowthAdopt()" :disabled="growthBusy">领养猫咪</button>
+              </div>
+            </template>
+          </div>
+        </div>
+        </template>
+
+        <div class="empty" x-show="!growth.loaded && !growthErr"><span class="spin" style="width:18px;height:18px"></span>加载中…</div>
+        <div class="card" x-show="growthErr">
+          <div class="center-card">
+            <span class="ic ic-lg" x-html="ic('alert')"></span>
+            <p class="oauth-desc" style="margin:0" x-text="'总览加载失败：'+growthErr"></p>
+            <button class="btn btn-secondary btn-sm" @click="loadGrowth(true)">重试</button>
+          </div>
+        </div>
+      </section>
+

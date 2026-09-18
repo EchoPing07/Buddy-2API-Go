@@ -1,0 +1,111 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>统计</h1>
+          <div class="page-actions">
+            <button class="btn btn-secondary btn-sm" @click="loadStats()" :disabled="loading">
+              <span class="ic" x-html="ic('refresh')"></span>刷新统计
+            </button>
+          </div>
+        </header>
+
+        <div class="grid metrics-4">
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">总请求</span><span class="ic" x-html="ic('activity')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.total_requests)"></div>
+            <p class="metric-detail" x-text="'今日 '+fmt(stats.today_requests)+' · 日均 '+compact(avg14)"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">Tokens 用量</span><span class="ic" x-html="ic('type')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.total_tokens)"></div>
+            <p class="metric-detail" x-text="'今日 '+fmt(stats.today_tokens)"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">错误数</span><span class="ic" x-html="ic('alert')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.error_count)"></div>
+            <p class="metric-detail" x-text="successRate!==null ? '成功率 '+successRate+'%' : '—'"></p>
+          </article>
+          <article class="metric">
+            <header class="metric-head"><span class="metric-label">Credits 消耗</span><span class="ic" x-html="ic('dollar')"></span></header>
+            <div class="metric-value" x-text="fmt(stats.total_credit)"></div>
+            <p class="metric-detail" x-text="keys.length+' 个 Key · '+(stats.by_model||[]).length+' 个模型'"></p>
+          </article>
+        </div>
+
+        <div class="grid charts">
+          <div class="card">
+            <div class="card-head">
+              <h3>近 14 天用量</h3>
+              <div class="spacer"></div>
+              <div class="legend">
+                <span class="lg lg-bar"><i></i>Tokens 用量</span>
+                <span class="lg lg-line"><i></i>请求数</span>
+              </div>
+            </div>
+            <div id="chartDaily" class="chart-box"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h3>模型请求数</h3>
+              <div class="spacer"></div>
+              <span class="muted-xs" x-text="(stats.by_model||[]).length+' 个模型 · 按请求数排序'"></span>
+            </div>
+            <div class="model-rows" x-show="(stats.by_model||[]).length">
+              <template x-for="m in (stats.by_model||[])" :key="m.model">
+                <div class="model-row">
+                  <span class="model-name" :title="(m.model||'未知')+' · '+fmt(m.tokens)+' tokens'" x-text="m.model||'未知'"></span>
+                  <div class="model-track"><div class="model-fill" :style="'width:'+Math.max(2,m.requests/maxReq*100)+'%'"></div></div>
+                  <span class="model-count" x-text="fmt(m.requests)"></span>
+                </div>
+              </template>
+            </div>
+            <div class="empty" x-show="!(stats.by_model||[]).length"><span class="ic ic-lg" x-html="ic('box')"></span>暂无调用数据</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>模型列表</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-show="models.state" x-text="modelsStateText"></span>
+            <button class="btn btn-secondary btn-sm" @click="refreshModels()" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新</button>
+          </div>
+          <div x-show="!models.loading && modelChips.length">
+            <div class="model-chips">
+              <template x-for="m in modelChips" :key="m.id">
+                <span class="model-chip" :title="m.id + (m.promo ? ' · ' + m.promo : '')">
+                  <span class="model-chip-name" x-text="m.disp"></span>
+                  <span class="model-chip-rate" x-show="m.credits" x-text="m.credits"></span>
+                </span>
+              </template>
+            </div>
+          </div>
+          <div class="empty" x-show="!models.loading && !modelChips.length">
+            <span class="ic ic-lg" x-html="ic('box')"></span>暂无模型
+          </div>
+          <div class="empty" x-show="models.loading"><span class="spin" style="width:18px;height:18px"></span>加载中…</div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>近期错误</h3></div>
+          <div class="table-wrap" x-show="(stats.recent_errors||[]).length">
+            <table>
+              <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>状态码</th><th>错误信息</th></tr></thead>
+              <tbody>
+                <template x-for="l in (stats.recent_errors||[])" :key="l.id">
+                  <tr>
+                    <td class="muted-xs" x-text="ts(l.created_at)"></td>
+                    <td x-text="l.model||'—'"></td>
+                    <td class="muted-xs" x-text="l.api_key_name||'—'"></td>
+                    <td><span class="badge badge-err" x-text="l.status_code"></span></td>
+                    <td class="muted-xs wrap" style="max-width:340px" x-text="l.error_msg"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!(stats.recent_errors||[]).length">
+            <span class="ic ic-lg" x-html="ic('shield')"></span>运行正常，暂无错误
+          </div>
+        </div>
+      </section>
+

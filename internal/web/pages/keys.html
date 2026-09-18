@@ -1,0 +1,60 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>密钥</h1>
+          <div class="page-actions">
+            <button class="btn btn-sm" @click="keyModal=true"><span class="ic" x-html="ic('plus')"></span>创建 Key</button>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="table-wrap" x-show="keys.length">
+            <table>
+              <thead><tr><th>Key</th><th>备注</th><th>请求数</th><th>Tokens</th><th>状态</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="k in keys" :key="k.id">
+                  <tr>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <code class="key-chip" :title="k.key_plain" x-text="k.key_plain"></code>
+                        <button class="btn btn-ghost btn-sm" @click="copy(k.key_plain)">复制</button>
+                      </div>
+                    </td>
+                    <td><input class="cell-edit" x-model="k.name" placeholder="备注" @change="updateKey(k,{name:k.name})"></td>
+                    <td x-text="fmt(k.total_requests)"></td>
+                    <td x-text="fmt(k.total_tokens)"></td>
+                    <td>
+                      <button class="badge clickable" :class="k.status==='active'?'badge-ok':'badge-muted'"
+                              @click="updateKey(k,{status:k.status==='active'?'disabled':'active'})"
+                              x-text="k.status==='active'?'启用':'停用'"></button>
+                    </td>
+                    <td><button class="btn btn-ghost btn-sm" style="color:var(--destructive)" @click="deleteKey(k)">删除</button></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!keys.length">
+            <span class="ic ic-lg" x-html="ic('keys')"></span>
+            还没有 Key，点击右上角创建
+          </div>
+        </div>
+      </section>
+
+<!-- ═══ 创建 Key 弹窗 ═══ -->
+<template x-if="keyModal">
+  <div class="overlay" @click.self="keyModal=false">
+    <form class="modal" @submit.prevent="createKey()">
+      <div class="modal-title">创建 Key</div>
+      <p class="modal-msg">生成的 Key 可用于调用 /v1/chat/completions 等接口。</p>
+      <div class="form-row"><label class="label">备注</label><input class="input" x-model="keyForm.name" placeholder="例如：Cherry Studio"></div>
+      <div class="form-row"><label class="label">自定义 Key（留空随机生成）</label><input class="input mono" x-model="keyForm.custom_key" placeholder="sk-..."></div>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-secondary btn-sm" @click="keyModal=false">取消</button>
+        <button type="submit" class="btn btn-sm" :disabled="loading">
+          <span class="spin" x-show="loading"></span>
+          <span x-show="!loading">创建</span>
+        </button>
+      </div>
+    </form>
+  </div>
+</template>

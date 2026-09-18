@@ -1,6 +1,9 @@
 package admin
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -151,12 +154,12 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusUnauthorized, "密码错误")
 		return
 	}
-	h.session.Issue(w)
+	h.session.Issue(w, r)
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
-	h.session.Clear(w)
+	h.session.Clear(w, r)
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -359,14 +362,56 @@ type resourceAccount struct {
 	DaysLeft       *int    `json:"days_left"` // nil = 未知
 	Expired        bool    `json:"expired"`
 	Warn           string  `json:"warn"` // "7d" | "30d" | ""
+
+	// Key 稳定标识，供前端 x-for 的 :key 使用。上游无可靠 id 字段，同名同类额度包可并存，
+	// 故以内容指纹为键（内容相同的包渲染等价，允许重复）。不可用数组下标：
+	// 前端「隐藏已用完」过滤数组后，Alpine 会按下标复用 DOM 节点，导致卡片内容错位。
+	Key string `json:"key"`
 }
+
+// resourceAccountKey 由额度包展示字段计算稳定指纹，用作前端 x-for 的 :key。
+// 取 sha256 摘要前 8 字节：包名可含任意字符，指纹与额度包在数组中的顺序无关。
+func resourceAccountKey(a resourceAccount) string {
+	h := sha256.New()
+	// 用长度前缀而非分隔符：上游字段可含任意字节（含 \x00），
+	// 分隔符拼接会使 ("a\x00b","c") 与 ("a","b\x00c") 碰撞。
+	writeField := func(s string) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+		h.Write(n[:])
+		h.Write([]byte(s))
+	}
+	writeNum := func(f float64) {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], math.Float64bits(f))
+		h.Write(b[:])
+	}
+	writeField(a.PackageName)
+	writeField(a.ProductName)
+	writeNum(a.CapacityRemain)
+	writeNum(a.CapacitySize)
+	writeNum(a.CapacityUsed)
+	writeField(a.ExpireTime)
+	if a.Expired {
+		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// resourceCacheKey 余额缓存键版本：缓存内容为加工后结构，新增或修改字段必须提升版本，
+// 否则会命中旧行、向前端返回缺字段的数据。历史变更：v1→v2 total_dosage 改为本地聚合
+// （旧口径按账户级 Remain 统计）；v2→v3 每个额度包新增稳定标识 key（前端 x-for 的 :key）。
+const resourceCacheKey = "default_v3"
+
+// resourceCacheStaleKeys 升级时一并清理的旧缓存键；缓存表无清理任务，不删除则永久残留（删除操作幂等）。
+var resourceCacheStaleKeys = []string{"default", "default_v2"}
 
 func (h *Handler) resources(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Get()
 	force := r.URL.Query().Get("force") == "1"
-	// v2：total_dosage 由透传上游 TotalDosage 改为本地聚合，旧缓存 key 的加工值
-	// 仍含幻影额度，换 key 使其立即失效（旧行残留在表内无害）
-	table, key := "resource_cache", "default_v2"
+	table, key := "resource_cache", resourceCacheKey
 
 	if !force {
 		if payload, updatedAt, ok := h.st.GetCache(table, key, cfg.ResourceCacheSeconds); ok {
@@ -386,8 +431,9 @@ func (h *Handler) resources(w http.ResponseWriter, r *http.Request) {
 	if raw, err := json.Marshal(processed); err == nil {
 		_ = h.st.SetCache(table, key, string(raw))
 	}
-	// 清理 v1 遗留 key（total_dosage 旧口径加工值）：缓存表无清理任务，不删则永久残留；幂等
-	_ = h.st.DeleteCacheKey(table, "default")
+	for _, stale := range resourceCacheStaleKeys {
+		_ = h.st.DeleteCacheKey(table, stale)
+	}
 	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "data": processed})
 }
 
@@ -463,6 +509,10 @@ func processResources(raw json.RawMessage) map[string]any {
 			}
 			accounts = append(accounts, a)
 		}
+	}
+	// 内容指纹（见 resourceAccount.Key）须在全部字段赋值完成后计算，故单独遍历一轮。
+	for i := range accounts {
+		accounts[i].Key = resourceAccountKey(accounts[i])
 	}
 	// 可用额度 total_dosage = Σ 未过期包的有效剩余（capacity_remain，周期优先口径），
 	// 与包卡片「剩余」合计一致；到期未知（days_left == nil）的包视为有效，纳入累计。

@@ -1,0 +1,62 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>余额</h1>
+          <div class="page-actions">
+            <span class="muted-xs" x-show="resources.updated_at" x-text="'更新于 '+ts(resources.updated_at)"></span>
+            <button type="button" class="btn btn-secondary btn-sm" :class="{'is-active':hideDepleted}"
+                    :aria-pressed="hideDepleted?'true':'false'"
+                    :title="(hideDepleted?'已开启：隐藏剩余额度为 0 或已过期的额度包':'隐藏剩余额度为 0 或已过期的额度包')"
+                    @click="toggleHideDepleted()">
+              <span class="ic" x-html="ic(hideDepleted?'eyeOff':'eye')"></span>
+              <span x-text="hideDepleted?'已隐藏用完':'隐藏已用完'"></span>
+            </button>
+            <button class="btn btn-secondary btn-sm" @click="loadResources(true)" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新</button>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="row" style="gap:20px">
+            <div>
+              <p class="metric-label">可用额度</p>
+              <div class="total-num" x-text="fmtDosage(resources.total_dosage)"></div>
+              <!-- 官方 TotalDosage 按账户级剩余聚合，含周期外/已过期额度；与本地聚合一致、或上游字段缺失/为 0 时隐藏 -->
+              <p class="muted-xs" style="margin-top:4px"
+                 x-show="resources.upstream_total_dosage>0 && resources.upstream_total_dosage!=resources.total_dosage"
+                 title="官方 TotalDosage 按账户级剩余聚合，包含周期外/已过期额度，仅供参考"
+                 x-text="'官方 TotalDosage：'+fmtDosage(resources.upstream_total_dosage)"></p>
+            </div>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-text="resourceCountText()"></span>
+          </div>
+        </div>
+
+        <div class="grid g2">
+          <template x-for="a in resourceAccounts" :key="a.key">
+            <div class="card">
+              <div class="card-head">
+                <h3 class="truncate" x-text="a.package_name||'额度包'"></h3>
+                <div class="spacer"></div>
+                <span class="badge" :class="quotaBadge(a)" x-text="quotaBadgeText(a)"></span>
+              </div>
+              <div class="bar"><div :class="quotaBarClass(a)" :style="'width:'+pct(a)+'%'"></div></div>
+              <div class="row muted-xs" style="margin-top:10px;gap:14px">
+                <span x-text="'剩余 '+fmtDosage(a.capacity_remain)"></span>
+                <span x-text="'总量 '+fmtDosage(a.capacity_size)"></span>
+                <span x-text="'已用 '+fmtDosage(a.capacity_used)"></span>
+                <span x-show="a.capacity_unit" x-text="a.capacity_unit"></span>
+              </div>
+              <p class="muted-xs" style="margin-top:6px" x-text="'到期：'+quotaExpire(a)"></p>
+            </div>
+          </template>
+        </div>
+        <div class="empty" x-show="resources.loaded && !(resources.accounts||[]).length">
+          <span class="ic ic-lg" x-html="ic('wallet')"></span>暂无额度包数据（若持续为空，请检查凭证后刷新）
+        </div>
+        <div class="empty" x-show="resources.loaded && resourceAccounts.length===0 && resourceHiddenCount>0">
+          <span class="ic ic-lg" x-html="ic('wallet')"></span>
+          <span x-text="resourceHiddenCount+' 个额度包已用完，当前被隐藏'"></span>
+          <button class="btn btn-secondary btn-sm" @click="toggleHideDepleted()"><span class="ic" x-html="ic('eye')"></span>显示全部</button>
+        </div>
+        <div class="empty" x-show="!resources.loaded"><span class="spin" style="width:18px;height:18px"></span>加载中…</div>
+      </section>
+

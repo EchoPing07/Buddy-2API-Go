@@ -45,8 +45,10 @@ func NewSession(dataDir string) (*Session, error) {
 	return s, nil
 }
 
-// Issue 下发 HttpOnly 会话 cookie。
-func (s *Session) Issue(w http.ResponseWriter) {
+// Issue 下发 HttpOnly 会话 cookie。Secure 按请求判定：本服务自身只监听明文 HTTP，
+// 无条件置 Secure 会被浏览器丢弃 cookie；位于 TLS 终结反代（nginx/Caddy/Cloudflare）
+// 之后时应置上。判据为 r.TLS 或反代声明的 X-Forwarded-Proto: https。
+func (s *Session) Issue(w http.ResponseWriter, r *http.Request) {
 	expiry := time.Now().Add(s.ttl).Unix()
 	nonce := randHex(8)
 	payload := fmt.Sprintf("%d|%s", expiry, nonce)
@@ -58,18 +60,37 @@ func (s *Session) Issue(w http.ResponseWriter) {
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Now().Add(s.ttl),
 	})
 }
 
-// Clear 清除会话 cookie。
-func (s *Session) Clear(w http.ResponseWriter) {
+// isHTTPS 判断请求链路是否为 HTTPS（直连 TLS 或反代声明）。
+func isHTTPS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	// 多段时取最后一段：反代以追加方式书写时，客户端可伪造的段在前、
+	// 反代写入的真实 scheme 在后；覆盖写法只有一段，取最后与取第一等价。
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if i := strings.LastIndexByte(proto, ','); i >= 0 {
+		proto = proto[i+1:]
+	}
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
+}
+
+// Clear 清除会话 cookie；Secure 与 Issue 同口径，否则 HTTPS 下无法清除。
+func (s *Session) Clear(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.name,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})

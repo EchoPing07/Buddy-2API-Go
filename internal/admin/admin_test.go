@@ -365,3 +365,96 @@ func TestNumField(t *testing.T) {
 		}
 	}
 }
+
+// TestResourceAccountKeyStable 校验额度包 key：内容相同则相同、内容不同则不同，且与数组顺序无关。
+// key 用作前端 x-for 的 :key；以数组下标代替会在过滤数组后导致 DOM 复用错位。
+// 断言针对上述性质而非具体哈希值（算法可替换）。
+func TestResourceAccountKeyStable(t *testing.T) {
+	base := resourceAccount{
+		PackageName: "体验版", ProductName: "腾讯云代码助手",
+		CapacityRemain: 499.06, CapacitySize: 500, CapacityUsed: 0.94,
+		ExpireTime: "2026-10-01", Expired: false,
+	}
+
+	// 1) 内容相同则 key 相同：重复渲染不应更换 key
+	a := base
+	a.Key = resourceAccountKey(a)
+	b := base
+	b.Key = resourceAccountKey(b)
+	if a.Key != b.Key {
+		t.Errorf("同内容 key 不一致: %q vs %q", a.Key, b.Key)
+	}
+	if a.Key == "" {
+		t.Error("key 不应为空（空 key 会让 Alpine 报 x-for key 无效）")
+	}
+
+	// 2) 任一展示字段变化则 key 变化：否则内容更新后 DOM 被复用，仍显示旧值
+	mutate := map[string]func(*resourceAccount){
+		"PackageName":    func(x *resourceAccount) { x.PackageName = "裂变包" },
+		"ProductName":    func(x *resourceAccount) { x.ProductName = "别的产品" },
+		"CapacityRemain": func(x *resourceAccount) { x.CapacityRemain = 0 },
+		"CapacitySize":   func(x *resourceAccount) { x.CapacitySize = 1000 },
+		"CapacityUsed":   func(x *resourceAccount) { x.CapacityUsed = 500 },
+		"ExpireTime":     func(x *resourceAccount) { x.ExpireTime = "2026-11-01" },
+		"Expired":        func(x *resourceAccount) { x.Expired = true },
+	}
+	for name, fn := range mutate {
+		x := base
+		fn(&x)
+		if got := resourceAccountKey(x); got == a.Key {
+			t.Errorf("字段 %s 变化后 key 未变（内容变了却复用 DOM）", name)
+		}
+	}
+
+	// 3) 字段含空字节时不得产生歧义碰撞（\x00 边界用例）
+	x := resourceAccount{PackageName: "a\x00b", ProductName: "c"}
+	y := resourceAccount{PackageName: "a", ProductName: "b\x00c"}
+	if resourceAccountKey(x) == resourceAccountKey(y) {
+		t.Error("字段边界不可区分：'a\x00b'/'c' 与 'a'/'b\x00c' 碰撞")
+	}
+}
+
+// TestResourceAccountsHaveKey 校验 processResources 为每个额度包填充 key（前端以其作为 x-for 的 :key）。
+func TestResourceAccountsHaveKey(t *testing.T) {
+	out := processResources(buildEnvelope(time.Now()))
+	accs, ok := out["accounts"].([]resourceAccount)
+	if !ok || len(accs) == 0 {
+		t.Fatalf("accounts 解析异常: ok=%v len=%v", ok, len(accs))
+	}
+	seen := map[string]string{}
+	for _, a := range accs {
+		if a.Key == "" {
+			t.Errorf("%s: key 为空", a.PackageName)
+			continue
+		}
+		// 不同额度包（此处包名互异）必须取得不同 key
+		if prev, dup := seen[a.Key]; dup && prev != a.PackageName {
+			t.Errorf("不同额度包共用 key %q: %q 与 %q", a.Key, prev, a.PackageName)
+		}
+		seen[a.Key] = a.PackageName
+	}
+}
+
+// TestResourceCacheVersionBumped 校验余额缓存键版本随「加工后结构」变更同步提升。
+//
+// 缓存存储加工结果：本版新增额度包 key 字段，若沿用 default_v2 会命中旧行，
+// 前端获得缺 key 的数据（x-for 的 :key 为 undefined，Alpine 报 key 无效或复用错节点）。
+func TestResourceCacheVersionBumped(t *testing.T) {
+	if resourceCacheKey == "default_v2" || resourceCacheKey == "default" {
+		t.Fatalf("resourceCacheKey = %q，新增字段后必须跳版本（否则命中旧结构缓存）", resourceCacheKey)
+	}
+	// 旧版本必须列入清理清单，否则旧行永久残留
+	stale := map[string]bool{}
+	for _, k := range resourceCacheStaleKeys {
+		stale[k] = true
+	}
+	for _, old := range []string{"default", "default_v2"} {
+		if !stale[old] {
+			t.Errorf("旧缓存键 %q 不在 resourceCacheStaleKeys 中（不会被清理）", old)
+		}
+	}
+	// 当前键不得出现在清理清单中，否则写入后即被删除，缓存永久失效
+	if stale[resourceCacheKey] {
+		t.Errorf("当前键 %q 出现在清理清单里，会被自己删掉", resourceCacheKey)
+	}
+}

@@ -70,6 +70,42 @@ func TestGetStatsDailyTokensAndCredit(t *testing.T) {
 	fmt.Println("daily:", got) // 调试输出便于失败时定位
 }
 
+// TestGetStatsByModelNoTruncate 校验模型数超过原截断值时仍全量返回，且按请求数降序。
+func TestGetStatsByModelNoTruncate(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	defer s.Close()
+
+	const n = 12 // 大于原查询的 LIMIT 10
+	for i := 0; i < n; i++ {
+		model := fmt.Sprintf("model-%02d", i)
+		// 请求数递减，model-00 最多，便于同时校验排序
+		for j := 0; j <= n-i; j++ {
+			if err := s.InsertLog(&LogEntry{Model: model, StatusCode: 200, TotalTokens: 10}); err != nil {
+				t.Fatalf("插入日志失败: %v", err)
+			}
+		}
+	}
+
+	st, err := s.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats 失败: %v", err)
+	}
+	if len(st.ByModel) != n {
+		t.Fatalf("ByModel 条数 = %d, want %d（截断回归？）", len(st.ByModel), n)
+	}
+	if st.ByModel[0].Model != "model-00" {
+		t.Errorf("首行模型 = %q, want model-00（应按请求数降序）", st.ByModel[0].Model)
+	}
+	for i := 1; i < len(st.ByModel); i++ {
+		if st.ByModel[i-1].Requests < st.ByModel[i].Requests {
+			t.Errorf("第 %d/%d 行未降序: %d < %d", i, i+1, st.ByModel[i-1].Requests, st.ByModel[i].Requests)
+		}
+	}
+}
+
 // TestCacheDeleteKey 验证缓存行的写入、读取与指定 key 删除（幂等、不影响其他 key、非法表拒绝）。
 // 用于换缓存 key 后清理遗留旧行，避免永久残留。
 func TestCacheDeleteKey(t *testing.T) {

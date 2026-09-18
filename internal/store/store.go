@@ -309,7 +309,6 @@ type Stats struct {
 	TodayTokens   int64       `json:"today_tokens"`
 	Daily         []DailyStat `json:"daily"`
 	ByModel       []ModelStat `json:"by_model"`
-	ByKey         []KeyStat   `json:"by_key"`
 	RecentErrors  []LogEntry  `json:"recent_errors"`
 }
 
@@ -326,14 +325,6 @@ type ModelStat struct {
 	Model    string `json:"model"`
 	Requests int64  `json:"requests"`
 	Tokens   int64  `json:"tokens"`
-}
-
-// KeyStat 按 key 聚合。
-type KeyStat struct {
-	APIKeyID   int64  `json:"api_key_id"`
-	APIKeyName string `json:"api_key_name"`
-	Requests   int64  `json:"requests"`
-	Tokens     int64  `json:"tokens"`
 }
 
 // GetStats 仪表盘聚合查询。
@@ -370,9 +361,9 @@ func (s *Store) GetStats() (*Stats, error) {
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		// 按模型 top10
+		// 按模型聚合，不截断：模型集合由 /v3/config 下发、数量有限，截断会使返回条数少于实际模型数
 		rows2, err := s.db.Query(`SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(total_tokens),0)
-			FROM logs GROUP BY model ORDER BY COUNT(*) DESC LIMIT 10`)
+			FROM logs GROUP BY model ORDER BY COUNT(*) DESC`)
 		if err != nil {
 			return err
 		}
@@ -383,20 +374,6 @@ func (s *Store) GetStats() (*Stats, error) {
 				return err
 			}
 			st.ByModel = append(st.ByModel, m)
-		}
-		// 按 key
-		rows3, err := s.db.Query(`SELECT COALESCE(api_key_id,0), COALESCE(api_key_name,''), COUNT(*), COALESCE(SUM(total_tokens),0)
-			FROM logs GROUP BY api_key_id, api_key_name ORDER BY COUNT(*) DESC LIMIT 10`)
-		if err != nil {
-			return err
-		}
-		defer rows3.Close()
-		for rows3.Next() {
-			var k KeyStat
-			if err := rows3.Scan(&k.APIKeyID, &k.APIKeyName, &k.Requests, &k.Tokens); err != nil {
-				return err
-			}
-			st.ByKey = append(st.ByKey, k)
 		}
 		// 近期错误
 		rows4, err := s.db.Query(`SELECT id, api_key_id, COALESCE(api_key_name,''), COALESCE(model,''), stream, COALESCE(prompt_tokens,0),
