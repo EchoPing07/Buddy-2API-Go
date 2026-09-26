@@ -131,6 +131,41 @@ func (s *Scheduler) Stop() {
 	<-s.c.Stop().Done()
 }
 
+// ResetAccountState 换账号时丢弃日内状态（签到/成长）与成长日标志镜像，由 admin.invalidateAccountCaches 调用。
+//
+// 为什么必须在这里做：两套状态都按自然日分片（day 字段），与账号无关 —— 旧账号的
+// 「今日已签到/已上报」会让新账号当天全部定时任务静默跳过。日标志镜像由成长链在 growthMu 内写，
+// 交给调用方在锁外删会被在跑的链收尾时写回，所以必须持锁删；内存态与镜像在同一临界区内清，
+// 读镜像回填内存的 rollGrowthDayLocked 也持同一把锁，中间不会插进来回填。两把锁分开取，顺序无所谓。
+//
+// 刻意不动 checkin_cache：random_target 是本地调度决策（与账号无关），status 是 admin 侧的 60s 展示缓存。
+//
+// 用阻塞 Lock 而非 TryLock：只在用户显式换账号时调用，宁可等也不能静默跳过；
+// 代价是 HTTP 处理器会被一起堵住，最坏需等一条在跑的成长链发完 N 条上报（可能拖到几分钟）。
+func (s *Scheduler) ResetAccountState() {
+	s.mu.Lock()
+	s.ck = checkinDay{}
+	s.mu.Unlock()
+
+	s.growthMu.Lock()
+	s.growthState = growthDay{}
+	// 日标志（值 = CST 日期串）与 last_run 按账号口径有意义，保留只会让「今日已完成」继续成立；
+	// 清掉后由链自己重新判定并写新值。
+	for _, k := range growthAccountScopedKeys {
+		_ = s.st.DeleteCacheKey(growthCacheTable, k)
+	}
+	s.growthMu.Unlock()
+}
+
+// growthAccountScopedKeys 换账号后必须清掉的账号口径缓存键（不含 admin 侧的 overview 展示缓存）。
+// 单独列出是给测试共用的：测试直接遍历本切片，新增日标志时不会实现改了测试没改而静默漂移。
+var growthAccountScopedKeys = []string{
+	growthKeyReportDay,
+	growthKeyAdoptDay,
+	growthKeyRewardDay,
+	growthKeyLastRun,
+}
+
 // ── 签到状态机 ──
 
 // checkinDay 一日内的签到状态与决策（纯逻辑，便于单测）。

@@ -15,19 +15,23 @@ PAGE('growth', {
     return base + (this.checkinOk && !this.checkin.active ? ' · 活动未开启' : '');
   },
   async loadCheckin(){
+    const gen = this._accountGen;   // 捕获代次：换账号/删凭证后本响应作废
     this.checkinPending = true;
     try{
       const r = await this.api('/admin/checkin/status');
+      if(gen !== this._accountGen) return;   // 期间已换代：旧的签到状态不得写回
       const d = r.data && r.data.data ? r.data.data : (r.data||{});
       this.checkin = Object.assign({loaded:true, random_target:r.random_target||''}, d);
       this.checkinOk = true; this.checkinErr = '';
     }catch(e){
+      if(gen !== this._accountGen) return;   // 旧请求的失败不该再降级/报错
       // 国际版/未登录/上游异常：卡片自身降级为空态 + 重试，不额外 toast 刷屏。
       // 标记 loaded=true 以区分「加载中」与「已失败」，否则首帧/请求在途会假报失败。
       this.checkin = Object.assign({}, this.checkin, {loaded:true});
       this.checkinOk = false; this.checkinErr = e.message;
     }finally{
-      this.checkinPending = false;
+      // 只在未换代时清：换代后新请求会自己置位/清位，此处不应误清新请求的 pending
+      if(gen === this._accountGen) this.checkinPending = false;
     }
   },
   // 执行链内的签到一步：已签则跳过，失败只记结果不阻断整链
@@ -55,11 +59,14 @@ PAGE('growth', {
 
     /* ── 任务 ── */
   async loadGrowth(force){
+    const gen = this._accountGen;   // 捕获代次：换账号/删凭证后本响应作废
     this.growthErr='';
     try{
       const r = await this.api('/admin/growth/overview'+(force?'?force=1':''));
+      if(gen !== this._accountGen) return;   // 期间已换代：旧账号的总览不得写回
       this.growth = Object.assign(this.growth, r, {loaded:true});
     }catch(e){
+      if(gen !== this._accountGen) return;   // 旧请求的失败不该再弹错/写空态
       // 整体空态 + 重试；不置 loaded，避免卡片以空数据渲染误导
       this.growthErr = e.message;
       this.toast(e.message,'err');

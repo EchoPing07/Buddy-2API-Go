@@ -8,7 +8,7 @@
 
 ## [v0.2.0] - 2026-09-19
 
-> 两条主线：**成长任务体系**移植与**前端多页重构**，另含 5 项修复。
+> 两条主线：**成长任务体系**移植与**前端多页重构**，另含 6 项修复。
 > 对比：[v0.1.8...v0.2.0](https://github.com/EchoPing07/Buddy-2API-Go/compare/v0.1.8...v0.2.0)
 
 ### ⚠️ 升级注意
@@ -42,6 +42,7 @@
 - **额度包卡片内容错位**：关闭「隐藏已用完」过滤后 Alpine 按数组下标复用 DOM 导致串位；新增额度包稳定 key（展示字段内容指纹）供 `x-for` 使用。
 - **仪表盘模型列表被截断**：去掉 `by_model` 的 `LIMIT 10` 与前端二次截断，模型行改为滚动容器，`maxReq` 改用 `reduce` 以避免模型数增长触达 `Math.max` 参数上限。
 - **折扣活动时区随部署环境漂移**：`schedule.timezone` 为空或无法识别时，`schedLoc` 原回退 `time.Local`，而上游 `modelPromotions` 的时段窗是北京时间口径——容器 `TZ=UTC` 等非 +8 部署下，`23:00-07:50` 这类窗口整体偏移 8 小时，夜间折扣会在白天生效、夜间反而消失。现统一回退北京时间（CST），与 `billingTZ` / `cstShanghai` 口径一致；显式 IANA 时区仍照常尊重。该缺陷同时导致 v0.2.0 发布门禁在 UTC runner 上失败（本机 CST 下不可复现），已补与环境时区无关的回归用例 `TestSchedLocFallsBackToCST`。
+- **换账号后旧账号数据残留、当天定时任务被静默跳过**：余额 / 签到 / 成长缓存键都是固定字串（单账号设计），凭证变更后旧账号数据会在整个 TTL（最长 14 天）内继续命中；更严重的是 scheduler 的日内状态（今日已签到 / 已上报）按自然日而非按账号分片，新账号继承旧账号的「今天已完成」，签到、上报、奖励链当天全部静默跳过。现在真的换账号时（`accountSwitched` 比对 JWT `sub`；旧凭证缺失或任一侧 UID 为空时按「换了」处理）清掉账号口径缓存（余额 `default_v3` + 历史残留键、签到 `status`、成长 `overview_v1`；成长日标志与 `last_run` 由 `scheduler.ResetAccountState()` 在 `growthMu` 内删，否则在跑的链收尾时会把旧标志写回）并复位内存日内状态，随后 `Reconfigure()` 补排一次当日成长补跑（`ResetAccountState` 先清掉 `report_day`，`growthCatchupDue` 才会判定需要补跑，顺序颠倒就排不上，新账号要等到次日 cron，白丢一天连登）；`checkin_cache/random_target`（当日随机签到时刻，与账号无关）刻意保留，避免同一天重摇。**同账号重导 / 续期刻意不清**（补传过期 `token.json`、重扫同一账号是最常见的恢复路径）：清了会让当天重新上报一轮，而新 conversation id 在上游看是新会话，活跃上报直接翻倍，正是 1.5s/条限速要避免的；`accountRefresh` 同样不触发失效。前端导入 / 扫码登录成功后同步强刷余额、签到与任务（`refreshAccountData()`，`force=1`），删除凭证则就地清空账号口径状态并撤销保活（`resetAccountData()`，此刻无凭证不能再强刷），两者都会递增账号代次，使在途的旧账号响应落地时被丢弃，不再覆盖新数据（否则换账号时旧响应后落地会把新账号数据显示回旧值）。回归用例：`TestCredentialChangeInvalidatesAccountCaches`、`TestAccountImportSameAccountKeepsDayState`、`TestAccountImportSwitchInvalidatesAndRearms`、`TestInvalidateOrderingResetBeforeReconfigure`、`TestAccountRefreshNeverInvalidates`、`TestResetAccountStateDropsDayState` / `TestResetAccountStateWaitsForRunningChain`、harness 第 10~12 组断言。
 
 ### ♻️ 重构
 

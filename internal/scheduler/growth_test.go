@@ -484,6 +484,102 @@ func TestGrowthChainRestartRestore(t *testing.T) {
 	}
 }
 
+// TestResetAccountStateDropsDayState 换账号后日内状态与日标志镜像必须一并复位。
+//
+// 状态都按自然日分片而不按账号：不清的话新旧账号的「今日已签到/已上报」会被继承，当天定时任务全部跳过。
+// 镜像必须在 growthMu 内删，否则在跑的链会在收尾时写回（见 TestResetAccountStateWaitsForRunningChain）。
+func TestResetAccountStateDropsDayState(t *testing.T) {
+	fake := &fakeGrowth{}
+	s, st, cfg := newTestScheduler(t, "cn", fake)
+	checkinDay0 := time.Now().Format("2006-01-02") // 与 rollDayLocked 同为本地时区
+	growthDay0 := mustDay(t)                       // 成长口径为 CST
+
+	// 旧账号当日已全部完成（内存 + SQLite 镜像都在，模拟运行中的进程）
+	s.mu.Lock()
+	s.ck = checkinDay{day: checkinDay0, mainHit: true, fbHit: true, secured: true}
+	s.mu.Unlock()
+	s.growthMu.Lock()
+	s.growthState = growthDay{day: growthDay0, reportDone: true, adoptTried: true, rewardDone: true}
+	s.growthMu.Unlock()
+	for _, k := range growthAccountScopedKeys {
+		if k == growthKeyLastRun {
+			continue // last_run 存整段链结果 JSON，单独写以贴近真实形状
+		}
+		if err := st.SetCache(growthCacheTable, k, growthDay0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.SetCache(growthCacheTable, growthKeyLastRun, `{"day":"`+growthDay0+`"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	s.ResetAccountState()
+
+	if s.ck != (checkinDay{}) {
+		t.Errorf("签到日内状态应清零，得到 %+v", s.ck)
+	}
+	if s.growthState != (growthDay{}) {
+		t.Errorf("成长日内状态应清零，得到 %+v", s.growthState)
+	}
+	// 遍历实现同源的 growthAccountScopedKeys，新增日标志时测试不会漏跟
+	for _, k := range growthAccountScopedKeys {
+		if payload, _, ok := st.GetCache(growthCacheTable, k, 0); ok && payload != "" {
+			t.Errorf("%s 镜像应随换账号清除，仍存在: %s", k, payload)
+		}
+	}
+
+	// 重置后重新滚动：不得从旧镜像回填「今日已完成」
+	s.mu.Lock()
+	s.rollDayLocked(time.Now(), cfg.Get())
+	s.mu.Unlock()
+	if s.ck.day != checkinDay0 || s.ck.secured || s.ck.mainHit {
+		t.Errorf("复位后应作为新账号重新签到，得到 %+v", s.ck)
+	}
+	s.growthMu.Lock()
+	s.rollGrowthDayLocked(time.Now())
+	s.growthMu.Unlock()
+	if s.growthState.day != growthDay0 {
+		t.Errorf("复位后应重新滚到今日，得到 %q", s.growthState.day)
+	}
+	if s.growthState.reportDone || s.growthState.adoptTried || s.growthState.rewardDone {
+		t.Errorf("复位后不应回填旧账号的今日完成标志，得到 %+v", s.growthState)
+	}
+}
+
+// TestResetAccountStateWaitsForRunningChain 复位必须等正在跑的成长链收尾（阻塞 Lock）：
+// 否则链的收尾会把旧账号的日标志写回镜像，新账号当天又不上报了。
+func TestResetAccountStateWaitsForRunningChain(t *testing.T) {
+	fake := &fakeGrowth{}
+	s, st, _ := newTestScheduler(t, "cn", fake)
+
+	s.growthMu.Lock() // 模拟正在跑的一条链（真实链会在收尾写入日标志）
+	done := make(chan struct{})
+	go func() {
+		s.ResetAccountState()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("链在跑时 ResetAccountState 不应立即返回（否则旧标志会被链写回）")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// 链收尾：写入今日标志，然后放锁
+	if err := st.SetCache(growthCacheTable, growthKeyReportDay, mustDay(t)); err != nil {
+		t.Fatal(err)
+	}
+	s.growthMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("放锁后 ResetAccountState 应立即完成")
+	}
+	// 复位在链之后执行 → 链刚写回的旧标志被清掉
+	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyReportDay, 0); ok && payload != "" {
+		t.Errorf("复位应清掉链刚写回的旧账号日标志，仍存在: %s", payload)
+	}
+}
+
 // TestTravelStateMachine 旅行状态机各分支。
 func TestTravelStateMachine(t *testing.T) {
 	mk := func(state string, limit bool, record int64, reward int64) *fakeGrowth {

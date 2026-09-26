@@ -28,6 +28,10 @@ import (
 // SchedulerControl 由 scheduler 实现：设置变更后重装配定时任务 + 成长任务链手动触发。
 type SchedulerControl interface {
 	Reconfigure()
+	// ResetAccountState 换账号后复位日内状态（内存 + 成长日标志/last_run 镜像）。
+	// 这些状态按日分片而非按账号，不清的话新账号会继承旧账号的「今日已完成」而当天静默跳过；
+	// 镜像必须在 scheduler 内持锁删（原因见 scheduler.ResetAccountState 注释）。
+	ResetAccountState()
 	RunGrowthChain() scheduler.GrowthChainResult
 	RunTravelTick() scheduler.TravelTickResult
 	RunActivityReports(count int) scheduler.ActivityReportResult
@@ -169,6 +173,51 @@ func (h *Handler) sessionCheck(w http.ResponseWriter, r *http.Request) {
 
 // ── 账号 ──
 
+// invalidateAccountCaches 凭证变更（导入 / 登出 / OAuth 登录）后清掉旧账号的缓存与日内状态。
+//
+// 缓存键都是固定字串（单账号设计），换账号后旧账号的余额/签到/成长会在 TTL 内继续命中，
+// 前端显示上一账号的数据；scheduler 的日内状态还会让新账号继承「今日已完成」而当天跳过定时任务。
+//
+// 只清 admin 自己服务的展示缓存；成长日标志与 last_run 归 scheduler.ResetAccountState()（须持锁删）。
+// checkin_cache/random_target 刻意保留：那是当日随机签到时刻，与账号无关，删了会在同一天重摇。
+//
+// 调用方须先确认真的换了账号（accountSwitched），否则同账号重导当天会重新签到、重报一轮。
+func (h *Handler) invalidateAccountCaches() {
+	// 清缓存失败不阻断换账号（凭证已落盘），但要留痕：静默失败会让新账号读到旧数据。
+	del := func(table, key string) {
+		if err := h.st.DeleteCacheKey(table, key); err != nil {
+			slog.Warn("换账号清理缓存失败", "table", table, "key", key, "error", err)
+		}
+	}
+	// 余额：当前键 + 历史残留键
+	for _, k := range append([]string{resourceCacheKey}, resourceCacheStaleKeys...) {
+		del("resource_cache", k)
+	}
+	// 签到状态（60s 展示缓存，决定前端「今日已签到」；random_target 保留）
+	del("checkin_cache", "status")
+	// 成长总览（60s 展示缓存；日标志 / last_run 见下）
+	del(growthCacheTable, growthKeyOverview)
+	// 内存日内状态 + 成长日标志/last_run 镜像
+	if h.sched != nil {
+		h.sched.ResetAccountState()
+		// 复位后重装配：ResetAccountState 已清掉 report_day，growthCatchupDue 才会判定
+		// 「今日未上报」并排 30s 后的补跑。顺序不可颠倒，否则补跑排不上。
+		h.sched.Reconfigure()
+	}
+}
+
+// accountSwitched 判定本次凭证写入是否真的换了账号。
+//
+// 补传过期 token.json、重扫同一账号是最常见的恢复路径，此时清日标志会让当天重新上报一轮
+// （上游按新会话计，活跃上报翻倍），所以只在账号真的变了时才失效。
+// 判不准（旧凭证缺失 / 任一侧 UID 为空）时按「换了」处理：宁可多失效一次，也别让新账号整天静默跳过。
+func accountSwitched(prev, next *auth.Token) bool {
+	if prev == nil || next == nil || prev.UID == "" || next.UID == "" {
+		return true
+	}
+	return prev.UID != next.UID
+}
+
 func maskToken(s string) string {
 	if len(s) <= 20 {
 		return s
@@ -231,9 +280,14 @@ func (h *Handler) oauthPoll(w http.ResponseWriter, r *http.Request) {
 		jsonWrite(w, http.StatusOK, map[string]any{"status": "pending"})
 		return
 	}
+	prev := h.toks.Get()
 	if err := h.toks.Save(tok); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
 		return
+	}
+	if accountSwitched(prev, tok) {
+		// 真的换了账号才清；同一账号重新扫码不该丢掉今日「已上报」（见 accountSwitched）
+		h.invalidateAccountCaches()
 	}
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"status": "success",
@@ -266,6 +320,7 @@ func (h *Handler) accountDelete(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.invalidateAccountCaches()
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -323,9 +378,14 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 	if t.Domain == "" {
 		t.Domain = config.EndpointOf(h.cfg.Get().Region).Domain
 	}
+	prev := h.toks.Get()
 	if err := h.toks.Save(t); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
 		return
+	}
+	if accountSwitched(prev, t) {
+		// 同账号重导不清，否则今日上报会按新会话再发一轮（见 accountSwitched）
+		h.invalidateAccountCaches()
 	}
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"ok":       true,

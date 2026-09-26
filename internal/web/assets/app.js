@@ -64,6 +64,11 @@ function appShell(){
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{name:'',custom_key:''}, keyModal:false,
     resources:{accounts:[],loaded:false},
+    _resourceRefetch:false,   // 在途期间到来的强刷意图（见 pages/resources.js loadResources）
+    /* 账号代次：换账号 / 删凭证时 +1。账号口径加载器发请求前捕获代次、响应落地时比对，
+       不一致则丢弃 —— 否则旧账号响应晚于新账号落地会把新数据覆盖回旧值（last-write-wins）。
+       放壳层：resources/growth 对象会被整体替换，标志放里面会跟着丢。 */
+    _accountGen:0,
     hideDepleted: localStorage.getItem('buddy2api:hideDepleted')==='1', // 默认 false = 全部显示
     checkin:{loaded:false}, checkinOk:false, checkinErr:'', checkinPending:false,
     /* ── 任务 ── */
@@ -200,6 +205,22 @@ function appShell(){
     /* 会话边界：清空「已进场」缓存。401 或退出后再登录属新会话，数据已失效；
        若不清理，afterLogin() → enter(view) 会被 entered 挡下，当前页保留过期前的旧统计 / 旧 Key 列表。 */
     resetSession(){ this.entered = {}; },
+    /* 凭证被删除：清空账号口径的本地状态并撤销保活。
+       此刻已无凭证，不能改成重拉（只会失败弹错）；而状态留着的话，保活会让余额/任务页
+       继续展示被删账号的数据。撤销 entered 后下次进入页面重新拉取。 */
+    resetAccountData(){
+      this._accountGen++;   // 先换代：在途的旧账号响应此后一律丢弃
+      this._resourceRefetch = false;   // 上一代的待重取意图随代作废
+      this.resources = {accounts:[],loaded:false};
+      this.checkin = {loaded:false}; this.checkinOk = false; this.checkinErr = ''; this.checkinPending = false;
+      this.growth = {available:true, reason:'', loaded:false, streak:null, heatmap:null,
+                     buddy:null, travel:null, lottery:null, today:null, last_run:null,
+                     degraded:[], updated_at:0};
+      this.growthErr = '';
+      // 只撤销账号口径两页的保活；keys/logs/settings 不跟账号走，清掉只会白拉一次
+      delete this.entered.resources;
+      delete this.entered.growth;
+    },
     toast(msg, type=''){
       const id = ++this._toastSeq;
       this.toasts.push({id,msg,type});
@@ -293,6 +314,27 @@ function appShell(){
     },
     async loadSettings(){
       try{ this.settings = await this.api('/admin/settings'); this._savedSettings = Object.assign({}, this.settings); }catch(e){}
+    },
+    /**
+     * 凭证变更（导入 / OAuth 登录）后强刷跨页数据。
+     *
+     * 后端已清旧账号缓存（见 admin.invalidateAccountCaches），但前端各页 keep-alive，
+     * 余额/签到/任务会原样留在状态里；这里按 force=1 重拉，保证换完账号立刻看到新数据。
+     *
+     * 不碰 entered（原地强刷，重进页面不该再拉一次），不碰 loadModels（那是 region 口径，非账号口径）。
+     *
+     * 先换代再清在途标志：+1 使所有旧账号响应作废，随后清掉 _loading / _resourceRefetch ——
+     * 旧响应既已被丢弃，就不必再为它让路，否则下面的 loadResources(true) 会被去重挡下。
+     */
+    refreshAccountData(){
+      this._accountGen++;
+      this._resourceRefetch = false;
+      this.resources._loading = false;
+      this.loadAccount();
+      this.loadHealth();
+      this.loadResources(true);
+      this.loadCheckin();
+      this.loadGrowth(true);
     },
 
     /** 上报条数区间文案：有波动显示 N±J（实际 a-b 条），无波动显示 N 条 */

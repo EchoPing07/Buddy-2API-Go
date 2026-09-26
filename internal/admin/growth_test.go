@@ -21,6 +21,7 @@ import (
 
 type fakeSched struct {
 	reconfigureN int
+	resetN       int
 	chainN       int
 	travelN      int
 	reportN      int
@@ -28,9 +29,18 @@ type fakeSched struct {
 	redeemN      int
 	lastTier     string
 	lastCount    int
+	// calls 按顺序记录 reset/reconfigure，供「先复位再重装配」的顺序断言
+	calls []string
 }
 
-func (f *fakeSched) Reconfigure() { f.reconfigureN++ }
+func (f *fakeSched) Reconfigure() {
+	f.reconfigureN++
+	f.calls = append(f.calls, "reconfigure")
+}
+func (f *fakeSched) ResetAccountState() {
+	f.resetN++
+	f.calls = append(f.calls, "reset")
+}
 func (f *fakeSched) RunGrowthChain() scheduler.GrowthChainResult {
 	f.chainN++
 	return scheduler.GrowthChainResult{Ran: true, Day: "2026-01-01"}

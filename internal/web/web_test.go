@@ -555,6 +555,7 @@ const fs = require('fs');
 const src = process.argv.slice(2).map(function (f) { return fs.readFileSync(f, 'utf8'); }).join('\n');
 
 const loads = [];
+const real = {};   // 被 stub 换下的真实现（需要跑真实逻辑的断言用）
 // 侧栏导航 DOM 的替代对象：applyTitle 依据 .nav-link 的 href 与文案建页名映射，
 // 置空用于模拟壳层不在 DOM（会话过期、登录页展示中）。
 let navLinks = [];
@@ -592,7 +593,13 @@ Object.keys(PAGES).forEach(function (k) {
 });
 ['loadStats', 'loadModels', 'loadKeys', 'loadAccount', 'loadGrowth', 'loadCheckin',
  'loadSettings', 'loadResources', 'loadLogs'].forEach(function (m) {
-  if (typeof inst[m] === 'function') inst[m] = function () { loads.push(m); };
+  // 记参数：loadResources/loadGrowth 的 force 标志要被断言（换账号必须强刷）
+  if (typeof inst[m] === 'function') {
+    real[m] = inst[m];   // 保留真实现，供 10c/12 直接跑
+    inst[m] = function () {
+      loads.push(arguments.length ? m + '(' + Array.prototype.join.call(arguments, ',') + ')' : m);
+    };
+  }
 });
 inst.loadHealth = function () { loads.push('loadHealth'); };
 inst.$nextTick = function (fn) { fn(); }; // Alpine magic（onPop 的滚动回位用）
@@ -726,6 +733,172 @@ const n = inst.keys.length;
 const ghost = { id: 999, name: 'ghost', status: 'active' };
 await inst.updateKey(ghost, { name: 'x' });
 if (inst.keys.length !== n) fail('对不存在的行调用 updateKey 改变了行数: ' + inst.keys.length);
+global.fetch = savedFetch;
+
+// 10) 换账号（导入凭证 / OAuth 登录）后必须立即强刷「账号口径」数据
+// 回归：后端清了缓存，但前端各页 keep-alive —— 余额/签到/任务会继续展示上一账号的数据，
+// 直到手动刷新或重进页面。
+inst.toast = function () {};      // 避免 toast 清理 timer 拖住进程退出
+inst.oauthStop = function () {};  // 同上（内含 setTimeout）
+const jwt = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1In0.sig';
+function accountDataLoaded(where, withModels) {
+  if (count('loadResources(true)') !== 1) fail(where + ' 未强刷余额（loadResources(true)）: ' + JSON.stringify(loads));
+  if (count('loadGrowth(true)') !== 1) fail(where + ' 未强刷任务（loadGrowth(true)）: ' + JSON.stringify(loads));
+  if (count('loadCheckin') !== 1) fail(where + ' 未刷新签到状态: ' + JSON.stringify(loads));
+  if (count('loadAccount') !== 1) fail(where + ' 未刷新账号信息: ' + JSON.stringify(loads));
+  if (count('loadHealth') !== 1) fail(where + ' 未刷新健康状态: ' + JSON.stringify(loads));
+  if (withModels && count('loadModels') !== 1) fail(where + ' 未刷新模型列表: ' + JSON.stringify(loads));
+  if (!withModels && count('loadModels') !== 0) fail(where + ' 不应拉模型列表（跟 region 走，不跟账号走）');
+}
+
+// 10a) 导入凭证
+loads.length = 0;
+inst.entered = { resources: Date.now() - 60 * 1000 };  // 已进过余额页（keep-alive）
+global.fetch = async function () {
+  return { ok: true, status: 200, json: async function () { return { ok: true, uid: 'u2', nickname: '新账号' }; } };
+};
+inst.importForm = { access_token: jwt, refresh_token: '', domain: '', filename: '' };
+await inst.importAccount();
+await new Promise(function (r) { setTimeout(r, 0); });   // importAccount 未 await 内层 busy()，等一轮宏任务
+accountDataLoaded('导入凭证后', false);
+if (Object.keys(inst.entered).length !== 1) fail('换账号是原地强刷，不应动 entered（重进页面会多拉一次）');
+
+// 10b) OAuth 登录（同一体验，另加模型列表）
+loads.length = 0;
+inst.oauth = { state: 'st-1', auth_url: '', poll_msg: '', _timer: null, _deadline: Date.now() + 60000 };
+global.fetch = async function () {
+  return { ok: true, status: 200, json: async function () { return { status: 'success', account: { uid: 'u3', nickname: '扫码账号' } }; } };
+};
+await inst.oauthPoll();
+accountDataLoaded('OAuth 登录后', true);
+
+// 10c) 在途请求期间到来的强刷不得被静默丢弃
+// 余额加载器用 _loading 去重，而在途那次拿的正是**上一账号**的余额，丢掉就把旧数据留在页面上；
+// 真实现必须在在途请求落地后补发一次 force=1。
+inst.loadResources = real.loadResources;   // 10a/10b 用的是记录 stub，这里跑真实现
+let releaseFirst = null;
+const urls = [];
+global.fetch = function (url) {
+  urls.push(String(url));
+  if (urls.length === 1) {   // 第一个请求（旧账号）挂住不返回
+    return new Promise(function (resolve) {
+      releaseFirst = function () {
+        resolve({ ok: true, status: 200, json: async function () {
+          return { cached: false, data: { accounts: [{ package_name: '旧账号包', capacity_remain: 1 }] } };
+        } });
+      };
+    });
+  }
+  return Promise.resolve({ ok: true, status: 200, json: async function () {
+    return { cached: false, data: { accounts: [{ package_name: '新账号包', capacity_remain: 99 }] } };
+  } });
+};
+const inflight = inst.loadResources(false);   // 旧账号余额：请求在途
+const forced = inst.loadResources(true);     // 换账号后的强刷：被 _loading 去重挡下
+releaseFirst();
+await inflight;
+await forced;
+await new Promise(function (r) { setTimeout(r, 0); });   // 重取是 finally 里的 fire-and-forget
+if (urls.length !== 2) fail('在途期间到来的强刷被丢弃了（应补发一次）: ' + JSON.stringify(urls));
+if (!/force=1/.test(urls[1])) fail('补发的请求必须带 force=1: ' + urls[1]);
+if (String(inst.resources.accounts[0].package_name) !== '新账号包') {
+  fail('页面最终应显示新账号的余额，得到 ' + JSON.stringify(inst.resources.accounts));
+}
+global.fetch = savedFetch;
+
+// 11) 删除凭证后账号口径缓存必须就地清空并撤销保活
+// 回归：deleteAccount 原先只 loadAccount/loadHealth，余额/任务留在内存里仍是上一账号的数据，
+// 且 entered 未撤销 —— 保活使两页不再重拉，被删账号的额度包/签到会一直显示。
+// 这里也不能改成「重拉」：此刻已无凭证，只会失败弹错。
+inst.resources = { accounts: [{ package_name: '已删账号包', capacity_remain: 1 }], loaded: true };
+inst.growth = Object.assign({}, inst.growth, { loaded: true, streak: { days: 42 }, heatmap: { '2026-01-01': 1 } });
+inst.checkin = { loaded: true, today_checked_in: true }; inst.checkinOk = true; inst.checkinErr = '旧错'; inst.checkinPending = true;
+inst.growthErr = '旧错误';
+inst.hideDepleted = true;   // 与账号无关的状态，作为「未被整块清空」的哨兵
+inst.entered = { resources: Date.now(), growth: Date.now(), keys: Date.now() };
+global.fetch = async function () {
+  return { ok: true, status: 200, json: async function () { return { ok: true }; } };
+};
+inst.deleteAccount();
+if (!inst.confirmBox.open) fail('deleteAccount 应先弹确认框');
+inst.confirmBox.onOk();
+await new Promise(function (r) { setTimeout(r, 0); });   // 内层 busy() 未被 deleteAccount await
+if (inst.resources.accounts.length !== 0) fail('删除凭证后余额仍是被删账号的额度包: ' + JSON.stringify(inst.resources.accounts));
+if (inst.resources.loaded !== false) fail('删除凭证后 resources 未回到未加载态（无凭证重拉只会失败）: ' + inst.resources.loaded);
+if (inst.growth.loaded !== false || inst.growth.streak !== null || inst.growth.heatmap !== null) {
+  fail('删除凭证后任务数据未清空: ' + JSON.stringify(inst.growth));
+}
+if (inst.checkin.loaded !== false || inst.checkinOk || inst.checkinErr || inst.checkinPending) {
+  fail('删除凭证后签到状态/标志未清空: ' + JSON.stringify([inst.checkin, inst.checkinOk, inst.checkinErr, inst.checkinPending]));
+}
+if (inst.growthErr) fail('删除凭证后 growthErr 未清空: ' + inst.growthErr);
+if (inst.hideDepleted !== true) fail('resetAccountData 误伤了非账号状态（hideDepleted）');
+if ('resources' in inst.entered) fail('删除凭证后未撤销余额页保活（重进仍展示被删账号数据）');
+if ('growth' in inst.entered) fail('删除凭证后未撤销任务页保活（重进仍展示被删账号数据）');
+if (!('keys' in inst.entered)) fail('只应撤销账号口径两页的保活，不得清空整个 entered（密钥/日志/设置会白拉）');
+global.fetch = savedFetch;
+
+// 12) 换账号/删凭证时在途的旧账号响应必须作废（代次校验），不得覆盖新数据
+// 回归：三个账号口径加载器无条件写回响应，而强刷是「先发新请求」的 —— 旧账号的响应只要
+// 晚于新账号落地就会把新数据覆盖回旧值（last-write-wins）。
+inst.loadResources = real.loadResources;
+inst.loadGrowth = real.loadGrowth;
+inst.loadCheckin = real.loadCheckin;
+
+// 12a) 删除凭证时三个加载器的在途响应都不得把被删账号的数据写回
+inst.resetAccountData();
+let release12 = [];
+let phase12 = 'old';
+global.fetch = function (url) {
+  const u = String(url); const ph = phase12;
+  const payload = function () {
+    if (u.indexOf('/admin/resources') === 0) {
+      return {cached: false, data: {accounts: [{package_name: ph + '账号的包', capacity_remain: 5}]}};
+    }
+    if (u.indexOf('/admin/growth/overview') === 0) {
+      return {available: true, streak: {days: ph === 'old' ? 11 : 22}, heatmap: {cells: []}, degraded: []};
+    }
+    return {random_target: ph === 'old' ? '08:00' : '20:00', data: {data: {today_checked_in: ph !== 'old', credit: 1}}};
+  };
+  if (ph === 'old') {
+    return new Promise(function (res) {
+      release12.push(function () { res({ok: true, status: 200, json: async function () { return payload(); }}); });
+    });
+  }
+  return Promise.resolve({ok: true, status: 200, json: async function () { return payload(); }});
+};
+const d1 = inst.loadResources(true), d2 = inst.loadGrowth(true), d3 = inst.loadCheckin();
+inst.resetAccountData();          // 在途期间用户删除了凭证
+release12.forEach(function (f) { f(); });
+await Promise.all([d1, d2, d3]);
+await new Promise(function (r) { setTimeout(r, 0); });
+if ((inst.resources.accounts || []).length !== 0) {
+  fail('删除凭证后在途响应把被删账号的余额写回了: ' + JSON.stringify(inst.resources.accounts));
+}
+if (inst.growth.streak !== null || inst.growth.loaded !== false) {
+  fail('删除凭证后在途响应把被删账号的任务数据写回了: ' + JSON.stringify(inst.growth));
+}
+if (inst.checkin.loaded !== false || inst.checkin.random_target) {
+  fail('删除凭证后在途响应把被删账号的签到写回了: ' + JSON.stringify(inst.checkin));
+}
+
+// 12b) 换账号时旧账号响应「后落地」不得覆盖新账号数据
+inst.resetAccountData();
+release12 = [];
+phase12 = 'old';
+const o1 = inst.loadGrowth(true), o2 = inst.loadCheckin();   // 旧账号：挂住
+phase12 = 'new';
+inst.refreshAccountData();                                  // 换账号：新请求立即返回
+await new Promise(function (r) { setTimeout(r, 30); });
+release12.forEach(function (f) { f(); });                    // 旧响应最后落地
+await Promise.all([o1, o2]);
+await new Promise(function (r) { setTimeout(r, 30); });
+if (!inst.growth.streak || inst.growth.streak.days !== 22) {
+  fail('换账号后旧响应覆盖了新账号的任务数据: ' + JSON.stringify(inst.growth.streak));
+}
+if (inst.checkin.random_target !== '20:00') {
+  fail('换账号后旧响应覆盖了新账号的签到状态，random_target=' + inst.checkin.random_target);
+}
 global.fetch = savedFetch;
 
 console.log('OK ' + JSON.stringify(loads));

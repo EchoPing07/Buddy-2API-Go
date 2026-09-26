@@ -31,6 +31,8 @@ PAGE('account', {
     this.askConfirm('退出登录','将删除本地保存的 OAuth 凭证，确定继续？', ()=>{
       this.busy(async()=>{
         await this.api('/admin/account',{method:'DELETE'});
+        // 凭证已删：就地清空账号口径状态并撤销保活（此刻不能再强刷，无凭证只会报错）
+        this.resetAccountData();
         this.toast('已清除凭证','ok');
         this.loadAccount(); this.loadHealth();
       })();
@@ -80,7 +82,8 @@ PAGE('account', {
       this.toast('导入成功：'+(r.nickname||r.uid||'已保存'),'ok');
       this.importModal = false;
       this.importForm = {access_token:'',refresh_token:'',domain:'',filename:''};
-      this.loadAccount(); this.loadHealth();
+      // 换账号：余额/签到/任务重拉（后端已清缓存，但前端 keep-alive，旧数据会残留）
+      this.refreshAccountData();
     })();
   },
 
@@ -105,7 +108,8 @@ PAGE('account', {
       if(r.status==='success'){
         this.oauthStop();
         this.toast('登录成功：'+(r.account.nickname||r.account.uid),'ok');
-        this.loadAccount(); this.loadHealth(); this.loadModels();
+        // 换账号，同导入；loadModels 单独留着：模型列表跟 region 走不跟账号走
+        this.refreshAccountData(); this.loadModels();
       }else if(r.status==='error'){
         this.oauthStop(r.message);
       }else{
