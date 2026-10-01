@@ -265,7 +265,8 @@ tbody tr:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
 .lg i{width:10px;height:10px;border-radius:3px}
 .lg-bar i{background:var(--chart-bar-hl)}
 .lg-line i{height:3px;border-radius:2px;background:var(--fg)}
-.model-rows{max-height:340px;overflow-y:auto;padding-right:2px}
+/* 上限与 dashboard.js 图表高 H=236 对应：两卡 head/padding 等高，rows 上限=左卡图表高时卡片总高恰好与左卡一致（调整图表高度需同步此处） */
+.model-rows{max-height:236px;overflow-y:auto;padding-right:2px}
 .model-row{display:grid;grid-template-columns:minmax(72px,128px) 1fr 52px;align-items:center;gap:10px;padding:7px 0}
 .model-row+.model-row{border-top:1px solid color-mix(in oklab,var(--border) 45%,transparent)}
 .model-name{font-size:var(--fs-xs);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
