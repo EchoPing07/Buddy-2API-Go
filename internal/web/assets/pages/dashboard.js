@@ -30,10 +30,29 @@ PAGE('dashboard', {
     if(!daily.length){ el.innerHTML = '<div class="chart-empty">暂无数据</div>'; return; }
     const W = el.clientWidth || 600;
     if(W < 40) return;
-    const H = 236, padL = 34, padR = 44, padT = 12, padB = 24;
-    const iw = W-padL-padR, ih = H-padT-padB;
+    const H = 236, padT = 12, padB = 24;
     const maxB = Math.max(...daily.map(d=>d.tokens||0), 1);   // 柱：Tokens（左轴）
     const maxL = Math.max(...daily.map(d=>d.requests||0), 1); // 线：请求（右轴）
+    // 刻度文案：满量程的 0/¼/½/¾/满 五档
+    const tickB = g => this.compact(Math.round(maxB*g/4));
+    const tickL = g => this.compact(Math.round(maxL*g/4));
+    // 左右内边距按刻度实测墨迹宽度自适应，下限保持原值。字体栈首位 Inter 未内嵌，缺失时回退
+    // 系统字体，同一串刻度在不同机器上能宽出 4~6px；写死 padL=34 时 "250.6M" 的首位数字会
+    // 越出 SVG 视口左边界而被静默裁掉（SVG 按视口边界裁切，不是 viewBox），看起来像 "50.6M"。
+    const axisPad = (ticks, gap, min) => {
+      const box = document.createElementNS('http://www.w3.org/2000/svg','svg');
+      box.setAttribute('style','position:absolute;left:-9999px;top:0;width:10px;height:10px');
+      const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+      t.setAttribute('class','axis-label'); // 复用 .axis-label 的字体度量，与正式刻度同源
+      box.appendChild(t); el.appendChild(box);
+      let ink = 0;
+      ticks.forEach(v=>{ t.textContent = v; const bb = t.getBBox(); if(bb.width > ink) ink = bb.width; });
+      el.removeChild(box);
+      return Math.max(min, Math.ceil(ink) + gap); // gap = 7px 轴间距 + 7px 外侧呼吸位
+    };
+    const padL = axisPad([0,1,2,3,4].map(tickB), 14, 34);
+    const padR = axisPad([0,1,2,3,4].map(tickL), 14, 44);
+    const iw = W-padL-padR, ih = H-padT-padB;
     const step = iw/daily.length;
     const barW = Math.max(4, Math.min(16, step*0.48));
     const cx = i => padL + step*i + step/2;
@@ -57,8 +76,8 @@ PAGE('dashboard', {
     for(let g=0; g<=4; g++){
       const gy = padT + ih - ih*g/4;
       s += `<line class="grid-line" x1="${padL}" x2="${W-padR}" y1="${gy.toFixed(1)}" y2="${gy.toFixed(1)}"/>`;
-      s += `<text class="axis-label" text-anchor="end" x="${padL-7}" y="${(gy+3.5).toFixed(1)}">${this.compact(Math.round(maxB*g/4))}</text>`;
-      s += `<text class="axis-label" x="${W-padR+7}" y="${(gy+3.5).toFixed(1)}">${this.compact(Math.round(maxL*g/4))}</text>`;
+      s += `<text class="axis-label" text-anchor="end" x="${padL-7}" y="${(gy+3.5).toFixed(1)}">${tickB(g)}</text>`;
+      s += `<text class="axis-label" x="${W-padR+7}" y="${(gy+3.5).toFixed(1)}">${tickL(g)}</text>`;
     }
     daily.forEach((d,i)=>{
       const y = yB(d.tokens||0);
