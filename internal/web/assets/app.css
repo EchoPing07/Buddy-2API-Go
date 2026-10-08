@@ -188,6 +188,25 @@ tbody tr:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
 .kv{display:flex;gap:14px;padding:7px 0;font-size:var(--fs-sm);align-items:baseline}
 .kv .k{width:110px;flex-shrink:0;color:var(--muted-fg);font-size:var(--fs-xs)}
 .kv .v{min-width:0;word-break:break-all}
+/* .kv 内的按钮（如复制）靠右且不参与压缩：URL 过长换行时按钮不被挤变形 */
+.kv .btn{margin-left:auto;flex-shrink:0}
+/* 代码块标题：复用 .label（--fs-xs / 500 / muted-fg + 6px 下间距）。
+   分隔线与间距口径同 .action-row（卡底动作行）：上边框 + 上下各 14px，
+   使「端点三行」与「调用示例」成为两块而非一串等距行。 */
+.code-label{margin-top:14px;padding-top:14px;border-top:1px solid color-mix(in oklab,var(--border) 55%,transparent)}
+/* 代码块：等宽字体与 --fs-xs 继承自 .mono,code；横向滚动使长 URL 不撑破卡片。
+   上间距由 .code-label 承担（代码块恒紧跟标签），此处再给 14px 会与标签拉开 20px。 */
+.code-wrap{position:relative}
+.code-block{padding:12px 14px;padding-right:44px;border-radius:8px;background:var(--secondary);overflow-x:auto}
+.code-block code{white-space:pre;line-height:1.7}
+/* 复制按钮：absolute 挂在代码块右上角。不跟随横向滚动（在 .code-wrap 上而非 .code-block 内），
+   否则长 URL 一滚按钮就跟着滑走，反而更难点。
+   top:8px 与首行文字居中对齐：块内 padding-top 12px、首行高约 20px、按钮高 28px
+   → 12 + (20-28)/2 = 8。 */
+.code-copy{position:absolute;top:8px;right:8px;z-index:1}
+/* 代码块下方说明：.field-hint 的 5px 上边距是表单内（紧跟输入框）的间距，
+   跟在整块代码后面太贴，此处与 card-head / action-row 同取 14px。 */
+.code-hint{margin-top:14px}
 
 /* ── 布局：侧边栏 + 内容 ── */
 .shell{min-height:100vh}

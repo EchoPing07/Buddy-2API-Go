@@ -1,5 +1,31 @@
 /* ═══ 页面层：密钥（PAGE(key, def) 注册本页专属状态与动作） ═══ */
 PAGE('keys', {
+  /* ── 调用示例（纯展示：不发请求、不读状态） ──
+
+     用 location.origin 而非 location.href / pathname 推导，原因由本项目结构决定：
+
+       - 软导航只 pushState 改 path（/ → /keys），origin 恒定；
+       - 全部 7 个 view 常驻同一文档，Alpine 对**每个** view 的表达式都求值，
+         包括当前未显示的那个。故任何基于 pathname 反推前缀的写法，在密钥页以外的
+         页面上都会被求值出错误的 base。origin 与当前路径无关，恒等于用户实际
+         访问的地址（协议 + host + 端口），因此天然覆盖改端口、局域网 IP、HTTPS 反代。
+
+     盲区：反代到子路径（https://host/buddy/ → 服务根）时正确 base 应带 /buddy 前缀，
+     而 origin 拿不到。但全站路由硬编码（/v1/*、/assets/*、308 规范化到 /keys），
+     本就不支持子路径部署，属既有边界而非本次引入。 */
+  get baseUrl(){ return location.origin + '/v1'; },
+  get chatUrl(){ return location.origin + '/v1/chat/completions'; },
+  get modelsUrl(){ return location.origin + '/v1/models'; },
+  /* 示例 Key 一律用占位符：代码块是会被截图、贴进 issue 与聊天记录的传播面，
+     填真实 Key 等于把凭证贴出去。表格里已明文列出各 Key，替换成本一步。 */
+  get sampleKey(){ return 'sk-xxxxxx'; },
+  get curlSample(){
+    return `curl ${this.chatUrl} \\
+  -H "Authorization: Bearer ${this.sampleKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"你好"}]}'`;
+  },
+
     /* ── Keys ── */
   async loadKeys(){
     try{ const r = await this.api('/admin/api-keys'); this.keys = r.keys||[]; }catch(e){}

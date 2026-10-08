@@ -38,6 +38,45 @@
             还没有 Key，点击右上角创建
           </div>
         </div>
+
+        <!-- ═══ 调用示例 ═══
+             纯展示：不发请求、不读状态，三个 URL 全由当前访问地址推导（见 pages/keys.js）。
+             放表格下方而非上方：Key 列表是本页主体，示例作为「拿到 Key 之后」的下一步。 -->
+        <div class="card">
+          <div class="card-head">
+            <h3>调用</h3>
+          </div>
+          <div class="kv">
+            <span class="k">Base URL</span>
+            <span class="v"><span class="mono" x-text="baseUrl"></span></span>
+            <button class="btn btn-ghost btn-sm" @click="copy(baseUrl)">复制</button>
+          </div>
+          <div class="kv">
+            <span class="k">对话补全</span>
+            <span class="v"><span class="mono" x-text="chatUrl"></span></span>
+            <button class="btn btn-ghost btn-sm" @click="copy(chatUrl)">复制</button>
+          </div>
+          <div class="kv">
+            <span class="k">模型列表</span>
+            <span class="v"><span class="mono" x-text="modelsUrl"></span></span>
+            <button class="btn btn-ghost btn-sm" @click="copy(modelsUrl)">复制</button>
+          </div>
+          <!-- 复制按钮叠在代码块右上角：absolute 脱离文档流，不占首行文本空间；
+               右侧留白由 .code-wrap .code-block 的 padding-right 让出，避免被按钮压住。
+               纯图标按钮必须带 title / aria-label，否则无可读名称。 -->
+          <div class="label code-label">调用示例</div>
+          <div class="code-wrap">
+            <button class="btn btn-ghost btn-sm code-copy" @click="copy(curlSample)"
+                    title="复制示例" aria-label="复制示例">
+              <span class="ic" x-html="ic('copy')"></span>
+            </button>
+            <pre class="code-block"><code x-text="curlSample"></code></pre>
+          </div>
+          <div class="field-hint code-hint">
+            <div>* Base URL 取自当前访问地址</div>
+            <div>* 示例中的 <span class="mono">sk-xxxxxx</span> 是占位符，请替换为真实 API Key</div>
+          </div>
+        </div>
       </section>
 
 <!-- ═══ 创建 Key 弹窗 ═══ -->
