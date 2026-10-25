@@ -13,7 +13,7 @@
 // 内常驻，侧边栏 <a href> 由 app.js 拦截为软导航（切 view + pushState 换 URL）。
 // 因此切页不重载文档、不重新请求资源，已加载数据保活。
 //
-// 代价：每份 HTML 含全部 7 个 view（约 50KB）；页面在启动时渲染一次并缓存，请求只做字节写出
+// 代价：每份 HTML 含全部 8 个 view（约 50KB）；页面在启动时渲染一次并缓存，请求只做字节写出
 // （走 http.ServeContent，Content-Length / HEAD / 304 由其处理）。
 //
 // href 仅保证禁用 JS 时可到达正确 URL、新标签页可用：页面本体（登录页、主界面）都在
@@ -65,6 +65,7 @@ var pages = []pageDef{
 	{key: "resources", title: "余额", icon: "wallet"},
 	{key: "growth", title: "任务", icon: "growth"},
 	{key: "logs", title: "日志", icon: "logs"},
+	{key: "labs", title: "实验", icon: "labs"},
 	{key: "settings", title: "设置", icon: "settings"},
 }
 

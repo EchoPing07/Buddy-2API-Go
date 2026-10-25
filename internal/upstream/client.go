@@ -42,6 +42,9 @@ func New(toks *auth.TokenStore, regionProvider func() string, chatTimeoutSeconds
 
 func (c *Client) ep() config.Endpoint { return config.EndpointOf(c.regionProvider()) }
 
+// authBase token 刷新请求主机。包级变量便于单测以 httptest 替换（生产恒为当前端点）。
+var authBase = func(c *Client) string { return c.ep().Upstream }
+
 // TokenSummary 返回当前 token 副本（未登录为 nil）。
 func (c *Client) TokenSummary() *auth.Token { return c.toks.Get() }
 
@@ -162,7 +165,7 @@ func (c *Client) RefreshFn(t *auth.Token) (*auth.Token, error) {
 	if t.RefreshToken == "" {
 		return nil, fmt.Errorf("缺少 refresh_token，无法刷新，请重新登录")
 	}
-	url := c.ep().Upstream + "/v2/plugin/auth/token/refresh"
+	url := authBase(c) + "/v2/plugin/auth/token/refresh"
 	// 刷新用旧 token 的域信息构造头
 	old := *t
 	old.Domain = orDefault(t.Domain, c.ep().Domain)

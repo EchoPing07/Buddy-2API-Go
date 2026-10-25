@@ -112,7 +112,7 @@ func TestLoginPageStructure(t *testing.T) {
 			t.Errorf("%s: 表单副标题应使用 login-form-sub（与品牌列描述 login-sub 分开，两者边距/宽度不同）", p.Key)
 		}
 		// 登录页只有一个 <h1>（表单标题）；品牌标题降为 <p>，否则一页两个 h1 破坏大纲。
-		// 注意不能断言整份文档 h1 总数：文档内常驻全部 7 个页面，各自另有一个 h1。
+		// 注意不能断言整份文档 h1 总数：文档内常驻全部 8 个页面，各自另有一个 h1。
 		if n := strings.Count(html, `<h1 class="login-h1">`); n != 1 {
 			t.Errorf("%s: 登录页 h1 数 = %d，期望 1（仅表单标题「登录」）", p.Key, n)
 		}
@@ -129,13 +129,13 @@ func TestLoginPageStructure(t *testing.T) {
 	}
 }
 
-// TestPagesRendered 每页都应渲染出完整 HTML：含 data-page、标题、7 个 view 容器。
+// TestPagesRendered 每页都应渲染出完整 HTML：含 data-page、标题、8 个 view 容器。
 //
-// 文档内常驻全部页面（软导航只切 .view 显隐，不重载文档），因此每份 HTML 都含 7 个
+// 文档内常驻全部页面（软导航只切 .view 显隐，不重载文档），因此每份 HTML 都含 8 个
 // <section class="space">；各页 <title> / data-page 仍然各自正确，深链与刷新不受影响。
 func TestPagesRendered(t *testing.T) {
 	h, _ := newTestRouter(t)
-	if got, want := len(h.Keys()), 7; got != want {
+	if got, want := len(h.Keys()), 8; got != want {
 		t.Fatalf("页面数量 = %d，期望 %d", got, want)
 	}
 	for _, p := range h.Pages() {
@@ -478,7 +478,7 @@ func TestHeadRequests(t *testing.T) {
 
 // TestAppMergesAllPages 总装必须合并全部页面层。
 //
-// 7 个 view 常驻同一文档，Alpine 会在 x-data 根作用域（即 app() 返回的实例）上求值
+// 8 个 view 常驻同一文档，Alpine 会在 x-data 根作用域（即 app() 返回的实例）上求值
 // 全部页面的指令；若只合并当前页，其他页的表达式会报 ReferenceError 且视图渲染不全。
 func TestAppMergesAllPages(t *testing.T) {
 	h, _ := newTestRouter(t)

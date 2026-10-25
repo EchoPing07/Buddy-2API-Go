@@ -580,9 +580,14 @@ func applyAggToLog(agg *aggregated, l *store.LogEntry) {
 
 // ── models / health ──
 
-// Models 处理 GET /v1/models。
+// Models 处理 GET /v1/models。对话模型后按实验开关追加嵌入模型（挂 /v1/embeddings，
+// 默认关闭，开启由管理后台「实验」页控制），便于客户端发现；上游嵌入注册表与 chat
+// 模型列表相互独立，故不并入 ModelCache。
 func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 	ids := h.models.List()
+	if h.cfg.Get().EmbeddingsEnabled {
+		ids = append(ids, upstream.EmbeddingsModel)
+	}
 	data := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		data = append(data, map[string]any{

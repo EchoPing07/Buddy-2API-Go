@@ -5,7 +5,7 @@ PAGE('keys', {
      用 location.origin 而非 location.href / pathname 推导，原因由本项目结构决定：
 
        - 软导航只 pushState 改 path（/ → /keys），origin 恒定；
-       - 全部 7 个 view 常驻同一文档，Alpine 对**每个** view 的表达式都求值，
+       - 全部 8 个 view 常驻同一文档，Alpine 对**每个** view 的表达式都求值，
          包括当前未显示的那个。故任何基于 pathname 反推前缀的写法，在密钥页以外的
          页面上都会被求值出错误的 base。origin 与当前路径无关，恒等于用户实际
          访问的地址（协议 + host + 端口），因此天然覆盖改端口、局域网 IP、HTTPS 反代。

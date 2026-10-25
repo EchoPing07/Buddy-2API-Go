@@ -10,10 +10,12 @@
 
 ### ✨ 新功能
 
+- **OpenAI 兼容嵌入端点 `POST /v1/embeddings`（实验特性，默认关闭）**：新增侧边栏「实验」页，嵌入端点开关与调用示例集中于此（开关即时落库，走 `GET/PUT /admin/experiments`；env `BUDDY2API_EMBEDDINGS_ENABLED` 可强制覆盖）。关闭时端点返回 403 `embeddings_disabled` 且 `GET /v1/models` 不列出嵌入模型；开启后对接上游 `/v2/embeddings`（与 chat 模型注册表相互独立），`input` 支持字符串 / 字符串数组（token id 数组不支持，明确报 400），响应为标准 OpenAI 形状（`data[i]` 补 `index`，附 `usage`）。模型名透传上游，实测注册表仅 `bge-m3`（1024 维）可用：`/v3/config` 中的 `nes-gf` 等条目不属于嵌入注册表，调用将得到 404 `model_not_found`（附已知模型提示）。凭证链路与 chat 一致（token 过期预刷新 + 401 刷新重试一次）。
 - **多账号存档与手动切换**：账号页新增「账号切换」卡片。OAuth 登录 / 凭证导入成功后自动存档到 `data/accounts/<id>.json`（0600），列表显示昵称、uid、端点、有效期与当前标记，可一键切换或移除（当前账号不可移除）。活动账号始终只有 `data/token.json` 一份：切换 = 归档当前 → 用目标档案覆盖 → `invalidateAccountCaches()`，upstream / proxy / scheduler 无需感知；不含轮询、负载均衡或故障转移。切到同一账号不失效缓存（与 `accountSwitched` 同口径），避免当天活跃上报翻倍。新增 `GET /admin/accounts`、`POST /admin/accounts/{uid}/activate`、`DELETE /admin/accounts/{uid}`，列表只返回元信息、不含任何凭证。
 
 ### 🔧 工程与文档
 
+- 新增 `internal/upstream/embeddings_test.go`（请求形状 / 404 模型缺失 / 401 刷新重试 / 条数不符防御 / 200 包错误码防御）、`internal/proxy/embeddings_test.go`（input 归一、响应契约、实验开关门控 403 与 `/v1/models` 条件追加）与 `internal/admin/experiments_test.go`（默认关闭、开关节奏、缺字段 400、env 锁定不生效）；`RefreshFn` 的请求主机改经 `authBase` 变量（生产行为不变），供单测以 httptest 替换。README 端点表 / 使用示例 / env 表补 `/v1/embeddings` 与实验页口径；web_test 页面数断言随「实验」页 7→8。
 - 新增 `internal/auth/accounts_test.go`（存档 / 列表 / 读取 / 删除 / 非法 UID 归一）与 `internal/admin/accounts_test.go`（切换生效、旧账号归档、缓存失效、同账号不清缓存）；README / DEVELOPMENT 同步「单一活动账号 + 手动切换」的定位口径。
 
 ---

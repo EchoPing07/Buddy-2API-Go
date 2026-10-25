@@ -105,6 +105,8 @@ func (h *Handler) Routes() func(chi.Router) {
 
 		r.Get("/settings", h.getSettings)
 		r.Put("/settings", h.putSettings)
+		r.Get("/experiments", h.getExperiments)
+		r.Put("/experiments", h.putExperiments)
 			r.Get("/models", h.listModels)
 			r.Post("/models/refresh", h.refreshModels)
 		})
@@ -1098,6 +1100,39 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 	_ = oldCfg
 
 	h.getSettings(w, r)
+}
+
+// ── 实验特性 ──
+
+// getExperiments 读实验特性开关（GET /admin/experiments）。
+// 单独成组而非并入 settings：实验开关按特性逐个挂、生命周期不稳定，
+// 不进设置页的大表单契约（设置页整单 PUT，字段增删会牵连前端提交体）。
+func (h *Handler) getExperiments(w http.ResponseWriter, r *http.Request) {
+	cfg := h.cfg.Get()
+	jsonWrite(w, http.StatusOK, map[string]any{"embeddings_enabled": cfg.EmbeddingsEnabled})
+}
+
+// putExperiments 改实验特性开关（PUT /admin/experiments，{embeddings_enabled}）。
+// env 锁定的字段由 cfg.Update 保持 env 值（与设置页同口径），响应恒回服务端真值。
+func (h *Handler) putExperiments(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EmbeddingsEnabled *bool `json:"embeddings_enabled"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if req.EmbeddingsEnabled == nil {
+		jsonErr(w, http.StatusBadRequest, "缺少 embeddings_enabled 字段")
+		return
+	}
+	if err := h.cfg.Update(func(c *config.Config) error {
+		c.EmbeddingsEnabled = *req.EmbeddingsEnabled
+		return nil
+	}); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.getExperiments(w, r)
 }
 
 // ── 模型 ──

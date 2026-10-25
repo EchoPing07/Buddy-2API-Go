@@ -112,6 +112,7 @@ func main() {
 	r.Group(func(r chi.Router) {
 		r.Use(keys.Authenticate)
 		r.Post("/v1/chat/completions", proxyH.Chat)
+		r.Post("/v1/embeddings", proxyH.Embeddings)
 		r.Get("/v1/models", proxyH.Models)
 	})
 

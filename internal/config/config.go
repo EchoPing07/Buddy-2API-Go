@@ -69,6 +69,9 @@ type Config struct {
 	LogRetentionDays     int    `json:"log_retention_days"`
 	LogMaxSizeMB         int    `json:"log_max_size_mb"`
 	ChatTimeoutSeconds   int    `json:"chat_timeout_seconds"`
+	// EmbeddingsEnabled 实验特性：OpenAI 兼容嵌入端点 /v1/embeddings 的总开关，默认关闭。
+	// 管理后台「实验」页切换（PUT /admin/experiments），env BUDDY2API_EMBEDDINGS_ENABLED 可强制。
+	EmbeddingsEnabled bool `json:"embeddings_enabled"`
 }
 
 // 默认 cron 表达式（defaults() 与 admin 存量兜底共用，避免字面量两处漂移）。
@@ -295,6 +298,7 @@ func Load(dataDir string) (*Manager, error) {
 	envInt("BUDDY2API_LOG_RETENTION_DAYS", "log_retention_days", &cfg.LogRetentionDays)
 	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
 	envInt("BUDDY2API_CHAT_TIMEOUT_SECONDS", "chat_timeout_seconds", &cfg.ChatTimeoutSeconds)
+	envBool("BUDDY2API_EMBEDDINGS_ENABLED", "embeddings_enabled", &cfg.EmbeddingsEnabled)
 	// env 覆盖发生在上面的 Normalize 之后（envInt 只挡 <=0），超界值在此钳制，
 	// 防止 Duration 换算溢出为负导致所有 chat 请求立即超时并被落盘
 	if cfg.ChatTimeoutSeconds > MaxChatTimeoutSeconds {
@@ -417,6 +421,9 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["chat_timeout_seconds"] {
 		nc.ChatTimeoutSeconds = m.cfg.ChatTimeoutSeconds
+	}
+	if m.envSets["embeddings_enabled"] {
+		nc.EmbeddingsEnabled = m.cfg.EmbeddingsEnabled
 	}
 	nc.Normalize()
 	old := m.cfg

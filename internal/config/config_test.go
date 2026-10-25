@@ -154,6 +154,9 @@ func TestNormalizeGrowth(t *testing.T) {
 	if d := defaults(); d.GrowthReportCount != 10 || d.GrowthReportJitter != 0 || d.AutoGrowth {
 		t.Errorf("defaults 应为 count=10、jitter=0 且开关关，得到 %+v", d)
 	}
+	if d := defaults(); d.EmbeddingsEnabled {
+		t.Error("嵌入端点实验开关默认必须关闭")
+	}
 	// 条数钳制：<=0 → 1；>10 → 10；合法值保留
 	c = Config{GrowthReportCount: 0}
 	c.Normalize()

@@ -1,0 +1,51 @@
+      <section x-cloak class="space">
+        <header class="page-head">
+          <h1>实验</h1>
+        </header>
+
+        <!-- ═══ 嵌入模型 ═══
+             开关即时落库（PUT /admin/experiments，无「保存」按钮）：
+             关闭时 /v1/embeddings 返回 403、/v1/models 不再列出嵌入模型；
+             调用示例仅开启后展示（关闭状态下端点不可用，示例无意义）。 -->
+        <div class="card">
+          <div class="card-head"><h3>嵌入模型</h3></div>
+          <div class="switch-row">
+            <div>
+              <div class="sw-label">嵌入端点 /v1/embeddings</div>
+              <p class="field-hint" x-text="labs.embeddings_enabled
+                ? '已开启：OpenAI 兼容嵌入，当前上游嵌入模型仅 bge-m3（1024 维）'
+                : '默认关闭；开启后暴露 POST /v1/embeddings（bge-m3，1024 维），关闭时该端点返回 403'"></p>
+            </div>
+            <button type="button" class="switch" :class="{on:!!labs.embeddings_enabled}"
+                    @click="toggleEmbeddings()" aria-label="切换嵌入端点"></button>
+          </div>
+
+          <template x-if="labs.embeddings_enabled">
+            <div>
+              <div class="kv">
+                <span class="k">嵌入端点</span>
+                <span class="v"><span class="mono" x-text="embUrl"></span></span>
+                <button class="btn btn-ghost btn-sm" @click="copy(embUrl)">复制</button>
+              </div>
+              <!-- 复制按钮叠在代码块右上角：absolute 脱离文档流，不占首行文本空间；
+                   右侧留白由 .code-wrap .code-block 的 padding-right 让出，避免被按钮压住。
+                   纯图标按钮必须带 title / aria-label，否则无可读名称。 -->
+              <div class="label code-label">调用示例</div>
+              <div class="code-wrap">
+                <button class="btn btn-ghost btn-sm code-copy" @click="copy(embCurlSample)"
+                        title="复制嵌入示例" aria-label="复制嵌入示例">
+                  <span class="ic" x-html="ic('copy')"></span>
+                </button>
+                <pre class="code-block"><code x-text="embCurlSample"></code></pre>
+              </div>
+              <div class="field-hint code-hint">
+                <div>* 端点取自当前访问地址</div>
+                <div>* 示例中的 <span class="mono">sk-xxxxxx</span> 是占位符，请替换为真实 API Key（在「密钥」页创建）</div>
+                <div>* 嵌入模型当前仅支持 <span class="mono">bge-m3</span>（1024 维），其余模型名返回 404</div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <p class="field-hint">实验特性依赖上游非公开接口，可能随时变动、失效或被移除；开关状态保存在 config.json，env <span class="mono">BUDDY2API_EMBEDDINGS_ENABLED</span> 可强制覆盖。</p>
+      </section>

@@ -8,6 +8,7 @@
 > 项目地址：<https://github.com/EchoPing07/Buddy-2API-Go>
 
 - `POST /v1/chat/completions` —— OpenAI 兼容对话（流式透传 / 非流式聚合）
+- `POST /v1/embeddings` —— OpenAI 兼容嵌入（模型 `bge-m3`，1024 维；**实验特性，默认关闭**，管理后台「实验」页开启）
 - `GET /v1/models` —— 实时模型列表（从上游 `/v3/config` 动态拉取并缓存，cn / global 两套端点自动适配）
 - 内置 Web 管理后台 —— OAuth 登录、API Key 管理、官方余额、每日签到、成长任务、请求日志、仪表盘等
 - 默认中国端点（`copilot.tencent.com`），可切换国际端点（`www.codebuddy.ai`）
@@ -25,7 +26,7 @@
 | ----------- | ------------------------------------------------------- |
 | 单一活动账号      | 同一时刻只有一份活动凭证（`data/token.json`），OAuth 登录              |
 | 多账号切换       | 登录 / 导入的凭证自动存档到 `data/accounts/`，账号页一键切换（手动，不轮询） |
-| OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/models`、`/health` |
+| OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/embeddings`（实验，默认关）、`/v1/models`、`/health` |
 | 多 API Key   | 随机 / 自定义 Key，支持备注、启停、使用量统计                              |
 | 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期，可一键隐藏已用完 / 已过期额度包 |
 | 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取（在「任务」页） |
@@ -150,6 +151,15 @@ curl http://127.0.0.1:10082/v1/chat/completions \
   -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
+嵌入（`/v1/embeddings`，实验特性：先在管理后台「实验」页开启，默认关闭；当前上游嵌入模型仅 `bge-m3`，1024 维）：
+
+```bash
+curl http://127.0.0.1:10082/v1/embeddings \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"bge-m3","input":["你好，世界"]}'
+```
+
 ## 🖥️ 命令行参数
 
 | 参数 | 说明 |
@@ -164,7 +174,8 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | 端点 | 说明 |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI 兼容 chat（流式透传 / 非流式聚合） |
-| `GET /v1/models` | 模型列表（craft 可用集，从 `/v3/config` 动态拉取并缓存） |
+| `POST /v1/embeddings` | OpenAI 兼容嵌入（**实验特性，默认关闭**，在管理后台「实验」页开启；关闭时返回 403 `embeddings_disabled`）。`input` 支持字符串 / 字符串数组；模型名透传上游，已知可用仅 `bge-m3`，未知模型返回 404 `model_not_found` |
+| `GET /v1/models` | 模型列表（craft 可用集 + 嵌入模型（仅实验开关开启时），从 `/v3/config` 动态拉取并缓存） |
 | `GET /health` | 健康检查（`status` / `region` / `has_token` / `expired` / `version`） |
 
 ### 管理后台（`/admin/*`，Cookie 会话）
@@ -184,6 +195,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `GET /admin/logs` | 请求日志（分页 + 筛选 model/key/status） |
 | `GET /admin/stats` | 仪表盘聚合 |
 | `GET /admin/settings` `PUT /admin/settings` | 读 / 改配置（密码、region、签到、cron 等） |
+| `GET /admin/experiments` `PUT /admin/experiments` | 实验特性开关（读 / 改 `{embeddings_enabled}`；env `BUDDY2API_EMBEDDINGS_ENABLED` 强制时 PUT 不生效） |
 | `GET /admin/models` `POST /admin/models/refresh` | 模型列表（含当前生效倍率）/ 手动重新拉取 `/v3/config`。倍率取自上游 `models[].credits` 与 `modelPromotions` 折扣活动，按请求时刻实时评估时段窗口；仅作展示参考，非计费接口 |
 
 ### Web（go:embed 多页 + 软导航，无构建步骤、无外部依赖）
@@ -191,7 +203,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | 端点 | 说明 |
 |---|---|
 | `GET /` | 统计页（首页）。`GET /dashboard` 与 `/dashboard/` 308 永久跳回 `/`（仅别名） |
-| `GET /account` `/keys` `/resources` `/growth` `/logs` `/settings` | 账号 / 密钥 / 余额 / 任务 / 日志 / 设置。深链、刷新、新标签页直接可用 |
+| `GET /account` `/keys` `/resources` `/growth` `/logs` `/labs` `/settings` | 账号 / 密钥 / 余额 / 任务 / 日志 / 实验 / 设置。深链、刷新、新标签页直接可用 |
 | `GET /assets/app.css` `/assets/app.js` `/assets/alpine.js` | 内嵌样式 / 共享层 + 各页脚本（启动时按清单顺序拼接）/ Alpine.js 运行时 |
 
 页面与静态资源均接受 **GET / HEAD**；其余方法回统一 JSON `405`（`Allow: GET, HEAD`）。末斜杠只作别名：
@@ -234,6 +246,7 @@ curl http://127.0.0.1:10082/v1/chat/completions \
 | `BUDDY2API_LOG_RETENTION_DAYS` | 日志保留天数（默认 90） |
 | `BUDDY2API_LOG_MAX_SIZE_MB` | 日志表容量上限 MB（默认 50） |
 | `BUDDY2API_CHAT_TIMEOUT_SECONDS` | chat 上游响应头超时秒数（默认 60，1-3600）。上游自请求发出至开始响应的等待上限，超时即中止本次请求；流式连接建立后（含推理阶段）不再受超时约束。也可在管理后台「设置 → 基本」修改，改后需重启生效 |
+| `BUDDY2API_EMBEDDINGS_ENABLED` | 嵌入端点实验开关强制值（`true`/`false`；设置后管理后台「实验」页的开关不再生效） |
 | `BUDDY2API_DATA_DIR` | 数据目录（默认 `./data`） |
 
 指纹头伪装另有 `CB_GATEWAY_USER_AGENT` / `CB_GATEWAY_STAINLESS_OS` 等可选 env（一般无需修改），完整变量见 [.env.example](.env.example)。
@@ -263,8 +276,8 @@ Buddy-2API-Go/
 │   ├── config/            # 配置加载（config.json + env 覆盖）
 │   ├── store/             # SQLite 数据层（API Keys / 日志 / 缓存）
 │   ├── auth/              # 凭证：token.json 读写、JWT 解析、OAuth 设备流
-│   ├── upstream/          # 上游客户端：chat 转发、billing、checkin、growth（成长任务）、指纹头
-│   ├── proxy/             # /v1/chat/completions 代理（流式透传 + 非流式聚合）
+│   ├── upstream/          # 上游客户端：chat 转发、embeddings、billing、checkin、growth（成长任务）、指纹头
+│   ├── proxy/             # /v1/chat/completions 代理（流式透传 + 非流式聚合）与 /v1/embeddings
 │   ├── apikey/            # OpenAI 端点 Key 管理（明文存储/随机/校验/限额）
 │   ├── admin/             # 管理后台 API（登录/账号/keys/日志/签到/余额/任务/设置）
 │   ├── scheduler/         # 任务（签到状态机 + 成长任务链 / 旅行巡检 + 模型列表刷新 + 日志清理）
