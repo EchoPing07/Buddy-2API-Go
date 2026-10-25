@@ -57,6 +57,50 @@
             </div>
           </template>
         </div>
+
+        <!-- 多账号档案：切换只改活动凭证（token.json），不轮询、不故障转移 -->
+        <div class="card">
+          <div class="card-head">
+            <h3>账号切换</h3>
+            <span class="muted-xs" x-show="accounts.loaded" x-text="accounts.items.length+' 个已存账号'"></span>
+            <div class="spacer"></div>
+            <span class="muted-xs">登录或导入凭证后自动存档</span>
+          </div>
+          <div class="empty" x-show="accounts.loaded && !accounts.items.length">
+            <span class="ic ic-lg" x-html="ic('account')"></span>
+            还没有其它账号
+          </div>
+          <div class="table-wrap" x-show="accounts.items.length">
+            <table>
+              <thead><tr><th>账号</th><th>uid</th><th>端点</th><th>有效期</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="a in accounts.items" :key="a.uid">
+                  <tr>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <span x-text="a.nickname||'未命名'"></span>
+                        <span class="badge" :class="a.active?'badge-ok':(a.expired?'badge-err':'badge-muted')"
+                              x-text="a.active?'当前':(a.expired?'已过期':'正常')"></span>
+                        <span class="badge badge-warn" x-show="!a.region_match" title="凭证属于另一端点">端点不匹配</span>
+                      </div>
+                    </td>
+                    <td class="mono" x-text="(a.uid||'').slice(-10)"></td>
+                    <td x-text="a.domain||'—'"></td>
+                    <td x-text="a.expires_at?ts(a.expires_at)+'（'+a.expires_human+'）':'—'"></td>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <button class="btn btn-secondary btn-sm" x-show="!a.active"
+                                @click="switchAccount(a)" :disabled="loading">切换</button>
+                        <button class="btn btn-ghost btn-sm" style="color:var(--destructive)" x-show="!a.active"
+                                @click="removeAccount(a)" :disabled="loading">移除</button>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
 <!-- ═══ 导入凭证弹窗 ═══ -->

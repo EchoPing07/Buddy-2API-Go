@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -75,6 +76,10 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Delete("/account", h.accountDelete)
 			r.Get("/account/export", h.accountExport)
 			r.Post("/account/import", h.accountImport)
+			// 多账号档案：手动切换到某个已存账号（无轮询 / 无故障转移）。
+			r.Get("/accounts", h.listAccounts)
+			r.Post("/accounts/{uid}/activate", h.activateAccount)
+			r.Delete("/accounts/{uid}", h.deleteAccountProfile)
 
 			r.Get("/resources", h.resources)
 			r.Get("/checkin/status", h.checkinStatus)
@@ -98,8 +103,8 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Get("/logs", h.logs)
 			r.Get("/stats", h.stats)
 
-			r.Get("/settings", h.getSettings)
-			r.Put("/settings", h.putSettings)
+		r.Get("/settings", h.getSettings)
+		r.Put("/settings", h.putSettings)
 			r.Get("/models", h.listModels)
 			r.Post("/models/refresh", h.refreshModels)
 		})
@@ -285,6 +290,7 @@ func (h *Handler) oauthPoll(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
 		return
 	}
+	h.archiveAccount(tok) // 扫码得到的账号自动入档，切换列表里才看得到
 	if accountSwitched(prev, tok) {
 		// 真的换了账号才清；同一账号重新扫码不该丢掉今日「已上报」（见 accountSwitched）
 		h.invalidateAccountCaches()
@@ -383,6 +389,7 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
 		return
 	}
+	h.archiveAccount(t) // 导入的账号同样入档
 	if accountSwitched(prev, t) {
 		// 同账号重导不清，否则今日上报会按新会话再发一轮（见 accountSwitched）
 		h.invalidateAccountCaches()
@@ -393,6 +400,141 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		"nickname": t.Nickname,
 		"domain":   t.Domain,
 	})
+}
+
+// ── 多账号档案 ──
+//
+// 活动账号始终只有 token.json（auth.TokenStore）；data/accounts/<id>.json 是旁挂副本。
+// 切换 = 归档当前 → 用目标档案覆盖 token.json，因此 upstream / proxy / scheduler 无需改动。
+// 唯一必须做的是 invalidateAccountCaches：余额/签到/成长缓存与「今日已完成」日标志都是
+// 按单账号设计的，不清会让新账号继承旧账号状态并当天静默跳过任务。
+
+// accountBook 档案库与 token.json 同处数据目录。
+func (h *Handler) accountBook() *auth.AccountBook { return auth.NewAccountBook(h.toks.DataDir()) }
+
+// archiveAccount 把凭证存入档案库。失败只留痕：登录/导入本身已成功，
+// 档案写不进去不该回滚主流程（用户也就少一份可切换的副本）。
+func (h *Handler) archiveAccount(t *auth.Token) {
+	if err := h.accountBook().Save(t); err != nil {
+		slog.Warn("保存账号档案失败", "uid", t.UID, "error", err)
+	}
+}
+
+// accountItem 账号列表项（不含任何凭证）。
+type accountItem struct {
+	UID          string `json:"uid"`
+	Nickname     string `json:"nickname"`
+	Domain       string `json:"domain"`
+	ExpiresAt    int64  `json:"expires_at"`
+	ExpiresHuman string `json:"expires_human"`
+	Expired      bool   `json:"expired"`
+	Active       bool   `json:"active"`
+	RegionMatch  bool   `json:"region_match"`
+}
+
+// newAccountItem 元信息 → 列表项。active 为当前 token.json（nil = 未登录）。
+func newAccountItem(m auth.AccountMeta, active *auth.Token, regionDomain string) accountItem {
+	t := auth.Token{ExpiresAt: m.ExpiresAt}
+	return accountItem{
+		UID:          m.ID,
+		Nickname:     m.Nickname,
+		Domain:       m.Domain,
+		ExpiresAt:    m.ExpiresAt,
+		ExpiresHuman: t.ExpiresInHuman(),
+		Expired:      t.IsExpired(),
+		Active:       active != nil && active.UID == m.UID,
+		RegionMatch:  m.Domain == regionDomain,
+	}
+}
+
+func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
+	book := h.accountBook()
+	metas, err := book.List()
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, "读取账号列表失败: "+err.Error())
+		return
+	}
+	// 升级前只登录过一次的旧安装：token.json 有凭证但没有档案。补存一份（幂等），
+	// 否则列表空着，用户第一次切换时旧账号就丢了。
+	if active := h.toks.Get(); active != nil && !hasAccountUID(metas, active.UID) {
+		h.archiveAccount(active)
+		if metas, err = book.List(); err != nil {
+			jsonErr(w, http.StatusInternalServerError, "读取账号列表失败: "+err.Error())
+			return
+		}
+	}
+	active := h.toks.Get()
+	regionDomain := config.EndpointOf(h.cfg.Get().Region).Domain
+	items := make([]accountItem, 0, len(metas))
+	for _, m := range metas {
+		items = append(items, newAccountItem(m, active, regionDomain))
+	}
+	// 当前账号置顶（List 已按 SavedAt 倒序，但刚归档的旧账号会排到前面）。
+	sort.SliceStable(items, func(i, j int) bool { return items[i].Active && !items[j].Active })
+	jsonWrite(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func hasAccountUID(metas []auth.AccountMeta, uid string) bool {
+	for _, m := range metas {
+		if m.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// activateAccount 切换到指定档案。
+func (h *Handler) activateAccount(w http.ResponseWriter, r *http.Request) {
+	book := h.accountBook()
+	next, err := book.Load(chi.URLParam(r, "uid"))
+	if err != nil {
+		if errors.Is(err, auth.ErrAccountNotFound) {
+			jsonErr(w, http.StatusNotFound, "账号档案不存在")
+			return
+		}
+		jsonErr(w, http.StatusInternalServerError, "读取账号档案失败: "+err.Error())
+		return
+	}
+	// 同一账号：不动凭证也不清缓存（清了当天活跃上报会按新会话再发一轮）。
+	if cur := h.toks.Get(); cur != nil && cur.UID == next.UID {
+		jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": next.UID, "nickname": next.Nickname})
+		return
+	}
+	// 先归档当前：刷新后 token.json 是最新的，档案可能还停在旧 token 上。
+	if cur := h.toks.Get(); cur != nil {
+		h.archiveAccount(cur)
+	}
+	if err := h.toks.Save(next); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
+		return
+	}
+	h.invalidateAccountCaches()
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": next.UID, "nickname": next.Nickname})
+}
+
+// deleteAccountProfile 移除档案。当前正在使用的账号不允许移除：
+// token.json 还在，下次列表自愈会把档案重新写回来。
+func (h *Handler) deleteAccountProfile(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "uid")
+	book := h.accountBook()
+	t, err := book.Load(id)
+	if err != nil {
+		if errors.Is(err, auth.ErrAccountNotFound) {
+			jsonErr(w, http.StatusNotFound, "账号档案不存在")
+			return
+		}
+		jsonErr(w, http.StatusInternalServerError, "读取账号档案失败: "+err.Error())
+		return
+	}
+	if active := h.toks.Get(); active != nil && active.UID == t.UID {
+		jsonErr(w, http.StatusBadRequest, "当前账号正在使用，请先切换到其他账号或退出登录")
+		return
+	}
+	if err := book.Delete(id); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "删除账号档案失败: "+err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // ── 余额 ──

@@ -34,7 +34,7 @@ PAGE('account', {
         // 凭证已删：就地清空账号口径状态并撤销保活（此刻不能再强刷，无凭证只会报错）
         this.resetAccountData();
         this.toast('已清除凭证','ok');
-        this.loadAccount(); this.loadHealth();
+        this.loadAccount(); this.loadHealth(); this.loadAccounts();
       })();
     });
   },
@@ -84,7 +84,37 @@ PAGE('account', {
       this.importForm = {access_token:'',refresh_token:'',domain:'',filename:''};
       // 换账号：余额/签到/任务重拉（后端已清缓存，但前端 keep-alive，旧数据会残留）
       this.refreshAccountData();
+      this.loadAccounts();   // 导入的账号已入档，列表立即出现
     })();
+  },
+
+    /* ── 多账号档案 ── */
+  /** 拉取档案列表；失败静默（账号页其余内容不依赖它） */
+  async loadAccounts(){
+    try{
+      const r = await this.api('/admin/accounts');
+      if(r && Array.isArray(r.items)) this.accounts = {items:r.items, loaded:true};
+    }catch(e){ /* 忽略 */ }
+  },
+  switchAccount(a){
+    this.askConfirm('切换账号',
+      '切换到「'+(a.nickname||a.uid.slice(-8))+'」？',
+      ()=>this.busy(async()=>{
+        const r = await this.api('/admin/accounts/'+encodeURIComponent(a.uid)+'/activate',{method:'POST'});
+        this.toast('已切换到 '+(r.nickname||r.uid||''),'ok');
+        // 后端已清账号口径缓存，前端 keep-alive，必须原地强刷
+        this.refreshAccountData();
+        this.loadAccounts();
+      })());
+  },
+  removeAccount(a){
+    this.askConfirm('移除账号',
+      '从列表删除「'+(a.nickname||a.uid.slice(-8))+'」的本地存档？当前登录不受影响。',
+      ()=>this.busy(async()=>{
+        await this.api('/admin/accounts/'+encodeURIComponent(a.uid),{method:'DELETE'});
+        this.toast('已移除','ok');
+        this.loadAccounts();
+      })(), {okText:'移除'});
   },
 
     /* ── OAuth 设备流 ── */
@@ -109,7 +139,7 @@ PAGE('account', {
         this.oauthStop();
         this.toast('登录成功：'+(r.account.nickname||r.account.uid),'ok');
         // 换账号，同导入；loadModels 单独留着：模型列表跟 region 走不跟账号走
-        this.refreshAccountData(); this.loadModels();
+        this.refreshAccountData(); this.loadModels(); this.loadAccounts();
       }else if(r.status==='error'){
         this.oauthStop(r.message);
       }else{
@@ -125,5 +155,5 @@ PAGE('account', {
   oauthCancel(){ this.oauthStop(); },
 
   /* ── 进场：本页所需数据 ── */
-  load(){ this.loadAccount(); },
+  load(){ this.loadAccount(); this.loadAccounts(); },
 });

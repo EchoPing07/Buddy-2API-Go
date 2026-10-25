@@ -132,6 +132,9 @@ func NewTokenStore(dataDir string) (*TokenStore, error) {
 	return s, nil
 }
 
+// DataDir 返回凭证所在数据目录（账号档案 data/accounts 与之同级）。
+func (s *TokenStore) DataDir() string { return filepath.Dir(s.path) }
+
 // Load 从磁盘加载（启动时调用）。
 func (s *TokenStore) Load() error {
 	s.mu.Lock()

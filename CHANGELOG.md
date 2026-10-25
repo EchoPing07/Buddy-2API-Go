@@ -6,6 +6,18 @@
 
 ---
 
+## [Unreleased]
+
+### ✨ 新功能
+
+- **多账号存档与手动切换**：账号页新增「账号切换」卡片。OAuth 登录 / 凭证导入成功后自动存档到 `data/accounts/<id>.json`（0600），列表显示昵称、uid、端点、有效期与当前标记，可一键切换或移除（当前账号不可移除）。活动账号始终只有 `data/token.json` 一份：切换 = 归档当前 → 用目标档案覆盖 → `invalidateAccountCaches()`，upstream / proxy / scheduler 无需感知；不含轮询、负载均衡或故障转移。切到同一账号不失效缓存（与 `accountSwitched` 同口径），避免当天活跃上报翻倍。新增 `GET /admin/accounts`、`POST /admin/accounts/{uid}/activate`、`DELETE /admin/accounts/{uid}`，列表只返回元信息、不含任何凭证。
+
+### 🔧 工程与文档
+
+- 新增 `internal/auth/accounts_test.go`（存档 / 列表 / 读取 / 删除 / 非法 UID 归一）与 `internal/admin/accounts_test.go`（切换生效、旧账号归档、缓存失效、同账号不清缓存）；README / DEVELOPMENT 同步「单一活动账号 + 手动切换」的定位口径。
+
+---
+
 ## [v0.2.0] - 2026-09-19
 
 > 两条主线：**成长任务体系**移植与**前端多页重构**，另含 6 项修复。

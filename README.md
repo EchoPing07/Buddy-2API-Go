@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
 [![Go Version](https://img.shields.io/badge/Go-1.25+-blue)](go.mod)
 
-> 用 Go 实现的 **CodeBuddy / WorkBuddy 转 OpenAI 兼容代理网关**：单账号、单二进制、内置 Web 管理面板。
+> 用 Go 实现的 **CodeBuddy / WorkBuddy 转 OpenAI 兼容代理网关**：单一活动账号（可手动切换）、单二进制、内置 Web 管理面板。
 >
 > 项目地址：<https://github.com/EchoPing07/Buddy-2API-Go>
 
@@ -16,7 +16,6 @@
 
 - **本项目仅用于学习与研究目的**，请勿用于任何违法违规用途，不要干坏事。使用者需自行承担一切后果，作者不对任何滥用行为负责。
 - 本项目的代码参考了 wicm84266964/Buddy2api、Sliverkiss/CodeBuddy2api、cyl2361341082-alt/Buddy2api、ShouZhuo0413/codebuddy2api、Sliverkiss/workbuddy2api 等项目，Web 管理面板的 UI 设计参考了 [grok2api](https://github.com/EchoPing07/grok2api)（详见 [致谢与参考](#-致谢与参考)）。
-- **本项目定位为个人单账号使用，明确不接受“号池”（多账号池 / 多凭证轮询）相关的建议与提交，相关需求请勿提 Issue 或 PR。**
 - 本项目**不存储对话内容**，数据库仅保存元信息（模型、token 数、耗时、状态码等）。
 - **成长任务（活跃地图上报 / 连登奖励 / 猫猫旅行等）默认关闭，属可选实验性功能**：其实现为模拟官方客户端事件的活跃上报，可能不符合上游服务条款，存在触发风控、账号受限等风险，是否开启及其后果由使用者自行评估承担。
 
@@ -24,7 +23,8 @@
 
 | 模块          | 说明                                                      |
 | ----------- | ------------------------------------------------------- |
-| 单账号代理       | 一份凭证（`data/token.json`），OAuth 登录                        |
+| 单一活动账号      | 同一时刻只有一份活动凭证（`data/token.json`），OAuth 登录              |
+| 多账号切换       | 登录 / 导入的凭证自动存档到 `data/accounts/`，账号页一键切换（手动，不轮询） |
 | OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/models`、`/health` |
 | 多 API Key   | 随机 / 自定义 Key，支持备注、启停、使用量统计                              |
 | 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期，可一键隐藏已用完 / 已过期额度包 |
