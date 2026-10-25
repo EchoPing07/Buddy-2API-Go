@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# /etc/init.d/buddy2api — Buddy 2API Go (OpenRC service for Alpine Linux)
+
+name="buddy2api"
+description="Buddy 2API Go - OpenAI compatible proxy gateway"
+command="/opt/buddy2api/buddy2api"
+command_args="-data ${BUDDY2API_DATA_DIR:-/opt/buddy2api/data}"
+command_background="yes"
+pidfile="/run/buddy2api.pid"
+output_log="/opt/buddy2api/data/stdout.log"
+error_log="/opt/buddy2api/data/stderr.log"
+
+depend() {
+	need net
+	after net.firewall
+}

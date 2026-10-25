@@ -1,0 +1,6 @@
+# /etc/conf.d/buddy2api — Buddy 2API Go 服务环境变量
+export BUDDY2API_LISTEN=0.0.0.0:10082
+export BUDDY2API_DATA_DIR=/opt/buddy2api/data
+# 管理后台密码（不设置时首次启动默认为 password，可在 Web 后台修改）
+#export BUDDY2API_ADMIN_PASSWORD=change-me
+export TZ=Asia/Shanghai
