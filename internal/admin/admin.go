@@ -23,6 +23,7 @@ import (
 	"buddy2api-go/internal/config"
 	"buddy2api-go/internal/scheduler"
 	"buddy2api-go/internal/store"
+	"buddy2api-go/internal/taskops"
 	"buddy2api-go/internal/upstream"
 )
 
@@ -40,6 +41,12 @@ type SchedulerControl interface {
 	RunGrowthRedeem(tier string) scheduler.GrowthRedeemActionResult
 }
 
+// taskRunnerProvider scheduler 可选实现：暴露共享的任务执行器（单一互斥锁）。
+// 单独成接口而不并进 SchedulerControl，是为了不强制所有 fake 实现新方法。
+type taskRunnerProvider interface {
+	Runner() *taskops.Runner
+}
+
 // Handler 管理后台 API 处理器。
 type Handler struct {
 	cfg     *config.Manager
@@ -51,12 +58,17 @@ type Handler struct {
 	keys    *apikey.Manager
 	sched   SchedulerControl
 	session *Session
+	tasks   *taskops.Runner // 任务动作执行器（New() 中创建，见 tasks.go）
 }
 
 // New 创建处理器。
 func New(cfg *config.Manager, st *store.Store, toks *auth.TokenStore, client *upstream.Client,
 	models *upstream.ModelCache, keys *apikey.Manager, sched SchedulerControl, session *Session) *Handler {
-	return &Handler{cfg: cfg, st: st, toks: toks, client: client, growth: client, models: models, keys: keys, sched: sched, session: session}
+	return &Handler{cfg: cfg, st: st, toks: toks, client: client, growth: client, models: models,
+		keys: keys, sched: sched, session: session,
+		// 复用 scheduler 的执行器（单一实例 = 单一互斥锁），避免面板一键完成与
+		// 夜猫子 cron 并发跑两轮真实对话。sched 为 nil 的测试路径才自建。
+		tasks: runnerOrDefault(sched, client)}
 }
 
 // Routes 挂载 /admin 路由。
@@ -85,6 +97,18 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Get("/checkin/status", h.checkinStatus)
 			r.Post("/checkin/claim", h.checkinClaim)
 
+			// ── 成长任务（列表 / 接受 / 领奖 / 一键完成 / 扫描 / 补领清扫 / 补偿）──
+			r.Get("/tasks", h.tasksList)
+			r.Post("/tasks/accept", h.tasksAccept)
+			r.Post("/tasks/claim", h.tasksClaim)
+			r.Post("/tasks/auto", h.tasksAuto)
+			r.Post("/tasks/auto_all", h.tasksAutoAll)
+			r.Get("/tasks/scan", h.tasksScan)
+			r.Post("/tasks/sweep", h.tasksSweep)
+			r.Get("/tasks/actions", h.tasksActions)
+			r.Get("/compensation", h.compensation)
+			r.Post("/compensation/claim", h.compensationClaim)
+
 			r.Get("/growth/overview", h.growthOverview)
 			r.Post("/growth/run", h.growthRun)
 			r.Post("/growth/report", h.growthReport)
@@ -103,14 +127,24 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Get("/logs", h.logs)
 			r.Get("/stats", h.stats)
 
-		r.Get("/settings", h.getSettings)
-		r.Put("/settings", h.putSettings)
-		r.Get("/experiments", h.getExperiments)
-		r.Put("/experiments", h.putExperiments)
+			r.Get("/settings", h.getSettings)
+			r.Put("/settings", h.putSettings)
+			r.Get("/experiments", h.getExperiments)
+			r.Put("/experiments", h.putExperiments)
 			r.Get("/models", h.listModels)
 			r.Post("/models/refresh", h.refreshModels)
 		})
 	}
+}
+
+// runnerOrDefault 取 scheduler 的共享执行器；没有 scheduler（单测）时自建一个。
+func runnerOrDefault(sched SchedulerControl, client *upstream.Client) *taskops.Runner {
+	if p, ok := sched.(taskRunnerProvider); ok {
+		if r := p.Runner(); r != nil {
+			return r
+		}
+	}
+	return taskops.NewRunner(client)
 }
 
 // ── util ──
@@ -909,6 +943,10 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		"growth_travel_cron":     cfg.GrowthTravelCron,
 		"growth_report_count":    cfg.GrowthReportCount,
 		"growth_report_jitter":   cfg.GrowthReportJitter,
+		"growth_queue_cron":      cfg.GrowthQueueCron,
+		"blackcat_cron":          cfg.BlackcatCron,
+		"task_sweep_enabled":     cfg.TaskSweepEnabled,
+		"task_sweep_minutes":     cfg.TaskSweepMinutes,
 		"resource_cache_seconds": cfg.ResourceCacheSeconds,
 		"log_retention_days":     cfg.LogRetentionDays,
 		"log_max_size_mb":        cfg.LogMaxSizeMB,
@@ -933,6 +971,10 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		GrowthTravelCron     *string `json:"growth_travel_cron"`
 		GrowthReportCount    *int    `json:"growth_report_count"`
 		GrowthReportJitter   *int    `json:"growth_report_jitter"`
+		GrowthQueueCron      *string `json:"growth_queue_cron"`
+		BlackcatCron         *string `json:"blackcat_cron"`
+		TaskSweepEnabled     *bool   `json:"task_sweep_enabled"`
+		TaskSweepMinutes     *int    `json:"task_sweep_minutes"`
 		ResourceCacheSeconds *int    `json:"resource_cache_seconds"`
 		LogRetentionDays     *int    `json:"log_retention_days"`
 		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
@@ -1028,6 +1070,31 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			c.GrowthTravelCron = strings.TrimSpace(*req.GrowthTravelCron)
 		}
+		if req.GrowthQueueCron != nil {
+			if !validCron(*req.GrowthQueueCron) {
+				return fmt.Errorf("任务队列 cron 表达式非法（需 6 段含秒，如 0 0 1 * * *）")
+			}
+			c.GrowthQueueCron = strings.TrimSpace(*req.GrowthQueueCron)
+		}
+		if req.BlackcatCron != nil {
+			if !validCron(*req.BlackcatCron) {
+				return fmt.Errorf("夜猫子 cron 表达式非法（需 6 段含秒，如 0 0 23 * * *）")
+			}
+			c.BlackcatCron = strings.TrimSpace(*req.BlackcatCron)
+		}
+		if req.TaskSweepEnabled != nil {
+			c.TaskSweepEnabled = *req.TaskSweepEnabled
+		}
+		if req.TaskSweepMinutes != nil {
+			n := *req.TaskSweepMinutes
+			if n < 1 {
+				n = 1
+			}
+			if n > config.TaskSweepMinutesMax {
+				n = config.TaskSweepMinutesMax
+			}
+			c.TaskSweepMinutes = n
+		}
 		if req.GrowthReportCount != nil {
 			n := *req.GrowthReportCount
 			if n < 1 {
@@ -1078,6 +1145,14 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		if req.GrowthTravelCron == nil && !validCron(c.GrowthTravelCron) {
 			slog.Warn("存量 growth_travel_cron 非法，回落默认", "value", c.GrowthTravelCron)
 			c.GrowthTravelCron = config.DefaultGrowthTravelCron
+		}
+		if req.GrowthQueueCron == nil && !validCron(c.GrowthQueueCron) {
+			slog.Warn("存量 growth_queue_cron 非法，回落默认", "value", c.GrowthQueueCron)
+			c.GrowthQueueCron = config.DefaultGrowthQueueCron
+		}
+		if req.BlackcatCron == nil && !validCron(c.BlackcatCron) {
+			slog.Warn("存量 blackcat_cron 非法，回落默认", "value", c.BlackcatCron)
+			c.BlackcatCron = config.DefaultBlackcatCron
 		}
 		return nil
 	})

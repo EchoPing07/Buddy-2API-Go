@@ -26,12 +26,11 @@
 package upstream
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -55,66 +54,22 @@ func (e *GrowthError) Error() string {
 }
 
 // growthBase growth 域请求主机。包级变量便于单测以 httptest 替换（生产恒为当前端点）。
-var growthBase = func(c *Client) string { return c.ep().Upstream }
+var growthBase = func(c *Client) string {
+	if c.GrowthBaseOverride != "" {
+		return c.GrowthBaseOverride
+	}
+	return c.ep().Upstream
+}
 
 // growthCall growth 域统一传输：任意 method/body，token 有效性保证 + 信封解析。
 // 语义与 billing() 对齐：先 EnsureValid（需要时自动刷新）再请求；
 // HTTP 非 2xx 或业务 code != 0 → *GrowthError；2xx 但响应体不是 JSON 信封
 // （反代错误页等）→ 普通 error，不包装 GrowthError（正常态分类器一律判 false）。
 func (c *Client) growthCall(method, path string, body any) (json.RawMessage, error) {
-	t, err := c.token()
-	if err != nil {
-		return nil, err
-	}
-	// growth 前也确保 token 有效（同 billing()：best-effort，失败仍尝试请求）
-	_ = c.toks.EnsureValid(c.RefreshFn)
-	t = c.toks.Get()
-	if t == nil { // EnsureValid 与 Get 之间可能被并发登出清空
-		return nil, ErrNoToken
-	}
-	old := *t
-	old.Domain = orDefault(t.Domain, c.ep().Domain)
-
-	var rdr io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		rdr = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequest(method, growthBase(c)+path, rdr)
-	if err != nil {
-		return nil, err
-	}
-	req.Header = billingHeaders(&old)
-	resp, err := c.short.Do(req) // 30s 超时，单次 RPC 足够
-	if err != nil {
-		return nil, err
-	}
-	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	resp.Body.Close()
-	if rerr != nil {
-		return nil, rerr
-	}
-	var env envelope
-	parseErr := json.Unmarshal(raw, &env)
-	trunc := truncStr(string(raw), 300)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &GrowthError{Status: resp.StatusCode, Msg: env.Msg, Body: trunc}
-	}
-	if parseErr != nil {
-		// 2xx 但非 JSON：不能当成功，否则写操作会被静默记为假成功（如 BuddyFirst
-		// 后误报「领养成功」）；宁可 fail，次日重试（服务端幂等）。
-		return nil, fmt.Errorf("growth 响应体非 JSON（HTTP %d）: %s", resp.StatusCode, trunc)
-	}
-	if env.Code != 0 {
-		return nil, &GrowthError{Status: resp.StatusCode, Code: env.Code, Msg: env.Msg, Body: trunc}
-	}
-	if len(env.Data) == 0 {
-		return json.RawMessage("null"), nil // 信封缺 data：归一化为 null，调用方 Unmarshal 得零值
-	}
-	return env.Data, nil
+	// token 保证（含 401 刷新重试）统一在 doGrowthEnvelope 里做。
+	return c.doGrowthEnvelope(func() (*http.Request, error) {
+		return c.growthRequest(method, path, body)
+	})
 }
 
 // ── 活跃上报 ──────────────────────────────────────────────────────────────────
@@ -166,12 +121,24 @@ type chatRequestEvent struct {
 // requestID 为本轮请求独立标识（多轮同会话上报时各条不同），空时回落 conversationID。
 // 一条上报同时点亮 growth 连登 + 解锁领养前置任务（chat_5 需 5 次对话）。
 func (c *Client) ReportChatActivity(conversationID, requestID string) error {
+	return c.ReportChatActivityModel(conversationID, requestID, "", "")
+}
+
+// ReportChatActivityModel 同上，但可指定上报携带的模型：供「体验某模型」类任务
+// 对齐实际模型（Model_chat_GLM5.2 需 requestModelId=glm-5.2 且独立 requestID；
+// black_cat 同理）。modelID 为空时回落默认 deepseek-v4-flash。
+func (c *Client) ReportChatActivityModel(conversationID, requestID, modelID, modelName string) error {
 	t, err := c.token()
 	if err != nil {
 		return err
 	}
 	if requestID == "" {
 		requestID = conversationID
+	}
+	if strings.TrimSpace(modelID) == "" {
+		modelID, modelName = "deepseek-v4-flash", "DeepSeek V4 Flash"
+	} else if strings.TrimSpace(modelName) == "" {
+		modelName = modelID
 	}
 	now := time.Now().UnixMilli()
 	ev := chatRequestEvent{
@@ -182,8 +149,8 @@ func (c *Client) ReportChatActivity(conversationID, requestID string) error {
 		ConversationID:        conversationID,
 		RequestID:             requestID,
 		InputLength:           12,
-		RequestModelID:        "deepseek-v4-flash",
-		RequestModelName:      "DeepSeek V4 Flash",
+		RequestModelID:        modelID,
+		RequestModelName:      modelName,
 		IsPlan:                false,
 		IsAutoExecuteTerminal: false,
 		IsAutoModify:          false,
@@ -262,6 +229,29 @@ func (g *GrowthStreakInfo) Claimed(tier string) bool {
 		return g.Redemption.Tier28dStatus == "claimed"
 	}
 	return false
+}
+
+// EligibleTiers 返回「天数达标且未领」的全部档位，按 days 升序。
+// 与 EligibleTier 的差别：兑换时要把**所有**已解锁档都领掉（否则 7d/14d 的奖励
+// 会被 28d 的存在挡住，只有最高档被领）。
+func (g *GrowthStreakInfo) EligibleTiers() []string {
+	days := g.Streak.Days
+	type pair struct {
+		tier string
+		days int
+	}
+	var hits []pair
+	for _, sp := range g.Redemption.Tiers {
+		if days >= sp.Days && !g.Claimed(sp.Tier) {
+			hits = append(hits, pair{tier: sp.Tier, days: sp.Days})
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].days < hits[j].days })
+	out := make([]string, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.tier)
+	}
+	return out
 }
 
 // EligibleTier 挑「天数达标且未领」的最高档；"" = 无可领档（正常态）。
@@ -379,20 +369,38 @@ func (c *Client) GrowthRedeem(tier, clientToken string) (*GrowthRedeemResult, er
 	return &res, nil
 }
 
-// GrowthLotteryChances 查询抽奖次数余额（GET /activity/growth/lottery/chances → data.balance）。
+// GrowthLotteryChances 查询抽奖次数余额。
+// 双口径兼容：优先 /activity/growth/lottery/chances（data.balance，本项目既有实测口径），
+// 失败或返回 0 时回退 /activity/growth/lottery/summary（data.chances，成长中心页面口径）。
 // 0 = 无次数（连登奖励未送或已抽完），正常态、无副作用。
 func (c *Client) GrowthLotteryChances() (int, error) {
 	data, err := c.growthCall(http.MethodGet, "/activity/growth/lottery/chances", nil)
-	if err != nil {
-		return 0, err
+	if err == nil {
+		var resp struct {
+			Balance int `json:"balance"`
+		}
+		if jsonErr := json.Unmarshal(data, &resp); jsonErr != nil {
+			return 0, jsonErr
+		}
+		if resp.Balance > 0 {
+			return resp.Balance, nil
+		}
 	}
-	var resp struct {
-		Balance int `json:"balance"`
+	// 回退到成长中心页面口径（chances）；两个端点都失败才报错。
+	data2, err2 := c.growthCall(http.MethodGet, "/activity/growth/lottery/summary", nil)
+	if err2 != nil {
+		if err != nil {
+			return 0, err // 首个端点的错误更有信息量
+		}
+		return 0, err2
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, err
+	var resp2 struct {
+		Chances int `json:"chances"`
 	}
-	return resp.Balance, nil
+	if jsonErr := json.Unmarshal(data2, &resp2); jsonErr != nil {
+		return 0, jsonErr
+	}
+	return resp2.Chances, nil
 }
 
 // GrowthLotteryDrawResult 单次抽奖结果。prize_type credit=积分 / physical=实物

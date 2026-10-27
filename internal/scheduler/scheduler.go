@@ -1,7 +1,9 @@
-// Package scheduler 定时任务：自动签到状态机（cron 定时 / 时间范围随机 / 末班兜底）+ 模型列表刷新 + 日志清理。
+// Package scheduler 定时任务：自动签到状态机 + 成长任务链 + 猫猫旅行 + 夜猫子 +
+// 任务队列 + 周期补领清扫 + 模型列表刷新 + 日志清理。
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"math/rand/v2"
@@ -12,6 +14,7 @@ import (
 
 	"buddy2api-go/internal/config"
 	"buddy2api-go/internal/store"
+	"buddy2api-go/internal/taskops"
 	"buddy2api-go/internal/upstream"
 )
 
@@ -34,6 +37,13 @@ var secondsParser = cron.NewParser(
 	cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
 )
 
+// TaskQueueHook 任务队列执行回调（由 admin 侧注入：扫描待办 → 逐个跑动作）。
+// nil 时到点跳过（测试构造 Scheduler 时通常不注入）。
+type TaskQueueHook func()
+
+// TaskSweepHook 补领清扫回调（返回本轮汇总，供日志）。
+type TaskSweepHook func() taskops.SweepStats
+
 // Scheduler cron 调度器。
 type Scheduler struct {
 	mu     sync.Mutex
@@ -50,12 +60,30 @@ type Scheduler struct {
 	growth             growthClient
 	growthReportID     cron.EntryID // 上报+奖励链 cron entry
 	growthTravelID     cron.EntryID // 旅行巡检 cron entry
+	growthQueueID      cron.EntryID // 任务队列 cron entry
+	blackcatID         cron.EntryID // 夜猫子 cron entry
 	growthCatchupTimer *time.Timer  // 启动补跑 timer（s.mu 保护；Stop 时取消，重入重置不叠加）
+
+	// 任务侧钩子（admin 在构造后注入；启动期写、运行期读，用 mutex 保护）
+	hookMu        sync.Mutex
+	taskQueueHook TaskQueueHook
+	taskSweepHook TaskSweepHook
+
+	// 补领清扫独立 ticker（分钟级，与 cron 表达式无关）。
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
+	sweepDone   chan struct{}
+
+	// runner 任务动作执行器（New 中创建一次）。**必须与 admin 共用同一个实例**：
+	// Runner 的互斥锁是实例字段，各建各的会让夜猫子 cron 与面板「一键完成全部」
+	// 同时跑两轮真实对话（各动作幂等，但含真实对话，重跑白耗配额）。
+	runner *taskops.Runner
 }
 
 // New 创建调度器并启动日志清理任务（每天 03:00）与模型列表刷新（每小时 01 分）。
 func New(cfg *config.Manager, client *upstream.Client, st *store.Store, models *upstream.ModelCache) *Scheduler {
 	s := &Scheduler{c: cron.New(cron.WithParser(secondsParser), cron.WithChain()), cfg: cfg, client: client, st: st, models: models, growth: client}
+	s.runner = taskops.NewRunner(client)
 	if _, err := s.c.AddFunc("0 0 3 * * *", s.cleanupLogs); err != nil {
 		slog.Error("注册日志清理任务失败", "error", err)
 	}
@@ -67,25 +95,46 @@ func New(cfg *config.Manager, client *upstream.Client, st *store.Store, models *
 	return s
 }
 
-// Reconfigure 按配置重装配定时任务：签到（auto_checkin）+ 成长任务（auto_growth）。
-// 日内状态下次 tick 重建。
+// Runner 返回任务执行器（admin 应把它注入 Handler，共用同一把互斥锁）。
+func (s *Scheduler) Runner() *taskops.Runner { return s.runner }
+
+// SetRunner 用外部创建的执行器替换内置实例（admin 先构造 Handler 再注入 scheduler 时用）。
+// 传 nil 不生效——内置实例始终存在，避免 tickBlackcat 拿到 nil。
+func (s *Scheduler) SetRunner(r *taskops.Runner) {
+	if r != nil {
+		s.runner = r
+	}
+}
+
+// SetTaskQueueHook 挂载任务队列回调（扫描待办并逐个执行）。
+func (s *Scheduler) SetTaskQueueHook(fn TaskQueueHook) {
+	s.hookMu.Lock()
+	s.taskQueueHook = fn
+	s.hookMu.Unlock()
+}
+
+// SetTaskSweepHook 挂载补领清扫回调。
+func (s *Scheduler) SetTaskSweepHook(fn TaskSweepHook) {
+	s.hookMu.Lock()
+	s.taskSweepHook = fn
+	s.hookMu.Unlock()
+}
+
+// Reconfigure 按配置重装配定时任务：签到（auto_checkin）+ 成长任务（auto_growth）
+// + 补领清扫（task_sweep_enabled）。日内状态下次 tick 重建。
 func (s *Scheduler) Reconfigure() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 先摘旧 entry（签到 + 成长），再按开关重挂
-	if s.tickID != 0 {
-		s.c.Remove(s.tickID)
-		s.tickID = 0
+	// 先摘旧 entry（签到 + 成长四类 + 夜猫子），再按开关重挂
+	old := []cron.EntryID{s.tickID, s.growthReportID, s.growthTravelID, s.growthQueueID, s.blackcatID}
+	for _, id := range old {
+		if id != 0 {
+			s.c.Remove(id)
+		}
 	}
+	s.tickID, s.growthReportID, s.growthTravelID = 0, 0, 0
+	s.growthQueueID, s.blackcatID = 0, 0
 	s.ck = checkinDay{}
-	if s.growthReportID != 0 {
-		s.c.Remove(s.growthReportID)
-		s.growthReportID = 0
-	}
-	if s.growthTravelID != 0 {
-		s.c.Remove(s.growthTravelID)
-		s.growthTravelID = 0
-	}
 
 	cfg := s.cfg.Get()
 	if cfg.AutoCheckin {
@@ -112,36 +161,141 @@ func (s *Scheduler) Reconfigure() {
 		} else {
 			s.growthTravelID = id
 		}
+		// 任务队列：每日扫描待办并逐个执行。Sequential 族每日零点解锁一环，
+		// 没有这条排程就只能手动点「执行全部待办」推进。
+		if id, err := s.c.AddFunc(cfg.GrowthQueueCron, s.tickTaskQueue); err != nil {
+			slog.Error("注册任务队列失败", "error", err, "cron", cfg.GrowthQueueCron)
+		} else {
+			s.growthQueueID = id
+		}
+		// 夜猫子：black_cat 只在夜间窗口计数，须在窗口内补足。
+		if id, err := s.c.AddFunc(cfg.BlackcatCron, s.tickBlackcat); err != nil {
+			slog.Error("注册夜猫子任务失败", "error", err, "cron", cfg.BlackcatCron)
+		} else {
+			s.blackcatID = id
+		}
 		slog.Info("成长任务已开启", "report_cron", cfg.GrowthReportCron,
-			"travel_cron", cfg.GrowthTravelCron, "count", cfg.GrowthReportCount)
+			"travel_cron", cfg.GrowthTravelCron, "queue_cron", cfg.GrowthQueueCron,
+			"blackcat_cron", cfg.BlackcatCron, "count", cfg.GrowthReportCount)
 		// 启动补跑：当日已过上报时点且未上报 → 30s 后补跑一次。
 		// 判定同步完成（仅一条 SQLite 读）；timer 由 s.mu 保护并在 Stop 取消。
 		s.scheduleGrowthCatchup(cfg)
 	}
+	interval := time.Duration(0)
+	if cfg.TaskSweepEnabled && cfg.AutoGrowth {
+		interval = time.Duration(cfg.TaskSweepMinutes) * time.Minute
+	}
+	s.startTaskSweepLocked(interval)
 }
 
-// Stop 停止调度器（含取消未触发的成长补跑 timer）。
+// startTaskSweepLocked 启停补领清扫 ticker（调用方需持 s.mu）。
+// interval<=0 → 停止。重复调用会先停旧的再起新的，不会叠加。
+func (s *Scheduler) startTaskSweepLocked(interval time.Duration) {
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+		s.sweepCancel = nil
+		if s.sweepDone != nil {
+			<-s.sweepDone
+			s.sweepDone = nil
+		}
+	}
+	if interval <= 0 {
+		slog.Info("任务补领清扫已禁用")
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.sweepCtx, s.sweepCancel, s.sweepDone = ctx, cancel, done
+	slog.Info("任务补领清扫已启动", "interval", interval,
+		"说明", "分钟级 accept/claim，只补领已达标未领的奖励，不跑任何行为链")
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.runSweepWithContext(ctx)
+			}
+		}
+	}()
+}
+
+// runSweepWithContext 一轮清扫（带取消）。ctx 只用于「关机时不再发起新请求」；
+// Sweep 的单次 HTTP 已有 short 客户端 30s 超时兜底，不必在请求层接 ctx。
+func (s *Scheduler) runSweepWithContext(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	_ = s.RunTaskSweepOnce()
+}
+
+// RunTaskSweepOnce 执行一轮补领清扫（ticker 与手动按钮共用）。
+func (s *Scheduler) RunTaskSweepOnce() taskops.SweepStats {
+	s.hookMu.Lock()
+	fn := s.taskSweepHook
+	s.hookMu.Unlock()
+	if fn == nil {
+		return taskops.SweepStats{Reason: "no_hook"}
+	}
+	return fn()
+}
+
+// tickTaskQueue 任务队列 cron 入口（异步：队列自身会起 goroutine）。
+func (s *Scheduler) tickTaskQueue() {
+	s.hookMu.Lock()
+	fn := s.taskQueueHook
+	s.hookMu.Unlock()
+	if fn == nil {
+		return
+	}
+	fn()
+}
+
+// tickBlackcat 夜猫子 cron 入口：窗口内才真正执行（窗口外静默跳过）。
+func (s *Scheduler) tickBlackcat() {
+	if reason := s.growthPrecondition(); reason != "" {
+		return
+	}
+	if !upstream.InNightWindow(time.Now()) {
+		slog.Info("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
+		return
+	}
+	res, err := s.runner.Auto("black_cat")
+	switch {
+	case err != nil:
+		slog.Warn("blackcat: 执行失败", "error", err)
+	case res.Claimed:
+		slog.Info("blackcat: 完成并领奖", "progress", res.ProgressAfter,
+			"credit", res.Credit, "energy", res.Energy)
+	default:
+		slog.Info("blackcat: 已处理", "status", res.Status, "message", res.Message,
+			"progress", res.ProgressBefore+"→"+res.ProgressAfter)
+	}
+}
+
+// Stop 停止调度器（含取消未触发的成长补跑 timer 与补领清扫 ticker）。
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	if s.growthCatchupTimer != nil {
 		s.growthCatchupTimer.Stop()
 		s.growthCatchupTimer = nil
 	}
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+		s.sweepCancel = nil
+	}
+	done := s.sweepDone
+	s.sweepDone = nil
 	s.mu.Unlock()
+	if done != nil {
+		<-done // 已在跑的那一轮会自行返回（单请求 30s 超时兜底）
+	}
 	<-s.c.Stop().Done()
 }
 
-// ResetAccountState 换账号时丢弃日内状态（签到/成长）与成长日标志镜像，由 admin.invalidateAccountCaches 调用。
-//
-// 为什么必须在这里做：两套状态都按自然日分片（day 字段），与账号无关 —— 旧账号的
-// 「今日已签到/已上报」会让新账号当天全部定时任务静默跳过。日标志镜像由成长链在 growthMu 内写，
-// 交给调用方在锁外删会被在跑的链收尾时写回，所以必须持锁删；内存态与镜像在同一临界区内清，
-// 读镜像回填内存的 rollGrowthDayLocked 也持同一把锁，中间不会插进来回填。两把锁分开取，顺序无所谓。
-//
-// 刻意不动 checkin_cache：random_target 是本地调度决策（与账号无关），status 是 admin 侧的 60s 展示缓存。
-//
-// 用阻塞 Lock 而非 TryLock：只在用户显式换账号时调用，宁可等也不能静默跳过；
-// 代价是 HTTP 处理器会被一起堵住，最坏需等一条在跑的成长链发完 N 条上报（可能拖到几分钟）。
 func (s *Scheduler) ResetAccountState() {
 	s.mu.Lock()
 	s.ck = checkinDay{}
@@ -163,6 +317,10 @@ var growthAccountScopedKeys = []string{
 	growthKeyReportDay,
 	growthKeyAdoptDay,
 	growthKeyRewardDay,
+	// 任务中心落库的「上一轮清扫/队列」：属账号口径，换账号后必须清，
+	// 否则面板会把上一账号的领奖统计挂在当前账号上。
+	"task_last_sweep",
+	"task_last_queue",
 	growthKeyLastRun,
 }
 

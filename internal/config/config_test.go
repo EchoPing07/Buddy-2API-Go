@@ -263,3 +263,85 @@ func TestLoadEnvGrowth(t *testing.T) {
 		t.Errorf("env 字段应不可被 Update 覆盖: %+v", m.Get())
 	}
 }
+
+// TestNormalizeTaskSchedule 任务侧新排程字段：cron 回落默认、清扫间隔钳制与默认值。
+func TestNormalizeTaskSchedule(t *testing.T) {
+	d := defaults()
+	if d.GrowthQueueCron != DefaultGrowthQueueCron || d.BlackcatCron != DefaultBlackcatCron {
+		t.Errorf("默认 cron 异常: %q / %q", d.GrowthQueueCron, d.BlackcatCron)
+	}
+	if !d.TaskSweepEnabled {
+		t.Error("补领清扫默认应开启（否则「已达标未领」永远没人领）")
+	}
+	if d.TaskSweepMinutes != DefaultTaskSweepMinutes {
+		t.Errorf("清扫间隔默认应为 %d，得到 %d", DefaultTaskSweepMinutes, d.TaskSweepMinutes)
+	}
+
+	// 零值 / 空白 → 回落默认
+	var c Config
+	c.Normalize()
+	if c.GrowthQueueCron != DefaultGrowthQueueCron {
+		t.Errorf("空 growth_queue_cron 应回落默认，得到 %q", c.GrowthQueueCron)
+	}
+	if c.BlackcatCron != DefaultBlackcatCron {
+		t.Errorf("空 blackcat_cron 应回落默认，得到 %q", c.BlackcatCron)
+	}
+	if c.TaskSweepMinutes != DefaultTaskSweepMinutes {
+		t.Errorf("间隔零值应回落 %d，得到 %d", DefaultTaskSweepMinutes, c.TaskSweepMinutes)
+	}
+
+	// 合法自定义保留
+	c = Config{GrowthQueueCron: "0 30 2 * * *", BlackcatCron: "0 15 23 * * *",
+		TaskSweepEnabled: true, TaskSweepMinutes: 5}
+	c.Normalize()
+	if c.GrowthQueueCron != "0 30 2 * * *" || c.BlackcatCron != "0 15 23 * * *" || c.TaskSweepMinutes != 5 {
+		t.Errorf("合法自定义不应被改: %q / %q / %d", c.GrowthQueueCron, c.BlackcatCron, c.TaskSweepMinutes)
+	}
+
+	// 超界钳制
+	c = Config{TaskSweepMinutes: TaskSweepMinutesMax + 1000}
+	c.Normalize()
+	if c.TaskSweepMinutes != TaskSweepMinutesMax {
+		t.Errorf("超界间隔应钳为 %d，得到 %d", TaskSweepMinutesMax, c.TaskSweepMinutes)
+	}
+	c = Config{TaskSweepMinutes: -5}
+	c.Normalize()
+	if c.TaskSweepMinutes != DefaultTaskSweepMinutes {
+		t.Errorf("负间隔应回落 %d，得到 %d", DefaultTaskSweepMinutes, c.TaskSweepMinutes)
+	}
+}
+
+// TestTaskScheduleEnvOverride env 覆盖新字段且 PUT 无法覆盖（envSets 保护）。
+func TestTaskScheduleEnvOverride(t *testing.T) {
+	t.Setenv("BUDDY2API_TASK_SWEEP_MINUTES", "3")
+	t.Setenv("BUDDY2API_TASK_SWEEP_ENABLED", "false")
+	t.Setenv("BUDDY2API_BLACKCAT_CRON", "0 0 22 * * *")
+
+	dir := t.TempDir()
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := m.Get()
+	if cfg.TaskSweepMinutes != 3 {
+		t.Errorf("env 覆盖 sweep_minutes 失败: %d", cfg.TaskSweepMinutes)
+	}
+	if cfg.TaskSweepEnabled {
+		t.Error("env 关闭 sweep 失败")
+	}
+	if cfg.BlackcatCron != "0 0 22 * * *" {
+		t.Errorf("env 覆盖 blackcat_cron 失败: %q", cfg.BlackcatCron)
+	}
+	// env 字段运行时不可被 Update 覆盖
+	if err := m.Update(func(c *Config) error {
+		c.TaskSweepMinutes = 99
+		c.BlackcatCron = "0 0 5 * * *"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg = m.Get()
+	if cfg.TaskSweepMinutes != 3 || cfg.BlackcatCron != "0 0 22 * * *" {
+		t.Errorf("env 字段不应被 PUT 覆盖，得到 %d / %q", cfg.TaskSweepMinutes, cfg.BlackcatCron)
+	}
+}

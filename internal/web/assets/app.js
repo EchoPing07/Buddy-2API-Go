@@ -220,6 +220,11 @@ function appShell(){
                      buddy:null, travel:null, lottery:null, today:null, last_run:null,
                      degraded:[], updated_at:0};
       this.growthErr = '';
+      // 任务中心（成长任务列表 / 补偿状态）同属账号口径：换账号或删凭证必须一并清空，
+      // 否则被删账号的任务进度与补偿额度会留在页面上。
+      this.tasks = []; this.tasksLoaded = false; this.tasksOk = true; this.tasksErr = '';
+      this.tasksResults = []; this.comp = {}; this.compLoaded = false;
+      this.lastSweep = null; this.lastQueue = null;
       // 只撤销账号口径两页的保活；keys/logs/settings 不跟账号走，清掉只会白拉一次
       delete this.entered.resources;
       delete this.entered.growth;
@@ -338,6 +343,8 @@ function appShell(){
       this.loadResources(true);
       this.loadCheckin();
       this.loadGrowth(true);
+      this.loadTasks();          // 任务中心与成长总览同为账号口径，换账号必须一并刷新
+      this.loadCompensation();
     },
 
     /** 上报条数区间文案：有波动显示 N±J（实际 a-b 条），无波动显示 N 条 */

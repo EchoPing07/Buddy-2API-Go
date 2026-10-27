@@ -137,7 +137,28 @@
                 <label class="label">旅行巡检 Cron</label>
                 <input class="input" x-model="settings.growth_travel_cron" placeholder="0 0 9,21 * * *">
               </div>
-              <p class="field-hint" style="margin-top:-6px">上报链按 上报→连登→领养→兑换→抽奖 执行；旅行巡检按状态机自动 领奖/派出</p>
+              <div class="form-grid c2">
+                <div class="form-row">
+                  <label class="label">任务队列 Cron</label>
+                  <input class="input" x-model="settings.growth_queue_cron" placeholder="0 0 1 * * *">
+                </div>
+                <div class="form-row">
+                  <label class="label">夜猫子 Cron</label>
+                  <input class="input" x-model="settings.blackcat_cron" placeholder="0 0 23 * * *">
+                </div>
+              </div>
+              <div class="switch-row" style="margin-top:-4px">
+                <div>
+                  <div class="sw-label">周期补领清扫</div>
+                  <p class="field-hint">分钟级只做 accept/claim（不跑行为链），把「已达标但没领」的任务奖励领掉；随「自动任务」总开关生效</p>
+                </div>
+                <button type="button" class="switch" :class="{on:!!settings.task_sweep_enabled}" @click="settings.task_sweep_enabled=!settings.task_sweep_enabled" aria-label="切换补领清扫"></button>
+              </div>
+              <div class="form-row" x-show="settings.task_sweep_enabled" style="margin-top:-4px">
+                <label class="label">清扫间隔（分钟）</label>
+                <input class="input" type="number" min="1" max="1440" x-model.number="settings.task_sweep_minutes">
+              </div>
+              <p class="field-hint" style="margin-top:-6px">上报链按 上报→连登→领养→兑换→抽奖 执行；旅行巡检按状态机自动 领奖/派出；任务队列每日扫描待办逐个执行（Sequential 族每日零点解锁一环）；夜猫子仅在 23:00–08:00 窗口计数</p>
               <p class="field-hint" x-text="growthCountHint()" style="margin-top:2px"></p>
               <p class="field-hint" style="margin-top:2px">错过当日上报时点，下次启动自动补跑一次（22:00 前有效）；Docker 部署若 TZ 非 CST，cron 时点需自行换算</p>
             </div>

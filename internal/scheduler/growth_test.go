@@ -3,6 +3,7 @@ package scheduler
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"buddy2api-go/internal/auth"
 	"buddy2api-go/internal/config"
 	"buddy2api-go/internal/store"
+	"buddy2api-go/internal/taskops"
 	"buddy2api-go/internal/upstream"
 )
 
@@ -58,6 +60,10 @@ type fakeGrowth struct {
 
 	giftCredit int64
 	compCredit int64
+	// compStatus 补偿状态查询返回值（默认「无活动」，即 Pending()==false）
+	compStatus    upstream.CompensationStatus
+	compStatusErr error
+	compClaimErr  error
 }
 
 func (f *fakeGrowth) TokenSummary() *auth.Token { return f.token }
@@ -175,7 +181,20 @@ func (f *fakeGrowth) TravelClaim(recordID int64) (int64, error) {
 
 func (f *fakeGrowth) ClaimGift() (int64, error) { return f.giftCredit, nil }
 
-func (f *fakeGrowth) ClaimCompensation() (int64, error) { return f.compCredit, nil }
+func (f *fakeGrowth) ClaimCompensation() (int64, error) {
+	if f.compClaimErr != nil {
+		return 0, f.compClaimErr
+	}
+	return f.compCredit, nil
+}
+
+// GetCompensationStatus 默认返回「无活动」，使 stepBonus 不会因查询失败而告警。
+func (f *fakeGrowth) GetCompensationStatus() (upstream.CompensationStatus, error) {
+	if f.compStatusErr != nil {
+		return upstream.CompensationStatus{}, f.compStatusErr
+	}
+	return f.compStatus, nil
+}
 
 // ── 测试基建 ─────────────────────────────────────────────────────────────────
 
@@ -206,6 +225,8 @@ func newTestScheduler(t *testing.T, region string, fake *fakeGrowth) (*Scheduler
 		st:     st,
 		growth: fake,
 	}
+	// 与 New 同口径：内置 runner 始终存在（tickBlackcat 直接用它，不得为 nil）
+	s.runner = taskops.NewRunner(nil)
 	return s, st, cfg
 }
 
@@ -371,8 +392,9 @@ func TestGrowthChainMakeupRefillTier(t *testing.T) {
 	if stp := stepOf(&res, "lottery"); stp == nil || stp.Status != "ok" {
 		t.Errorf("兑换送 chances 后应抽奖，得到 %+v", stp)
 	}
-	if fake.drawN != 1 {
-		t.Errorf("自动链应只抽 1 次，得到 %d", fake.drawN)
+	// 行为变更：自动链现在把 chances 抽完（抽奖次数只能从兑换获得，留着不生息）。
+	if fake.drawN != 2 {
+		t.Errorf("自动链应抽完 2 次 chances，得到 %d", fake.drawN)
 	}
 }
 
@@ -1099,5 +1121,385 @@ func TestGrowthCatchupFire(t *testing.T) {
 	s.growthCatchupFire()
 	if fake.reportCalls != n {
 		t.Error("今日上报已完成时补跑回调不应再执行链")
+	}
+}
+
+// ── 任务侧排程与链路补强 ──────────────────────────────────────────────────────
+
+// TestStepBonusCompensationPending 补偿「先查后领」：待领才领（记 bonus 步）、无活动/已领静默。
+func TestStepBonusCompensationPending(t *testing.T) {
+	cases := []struct {
+		name       string
+		st         upstream.CompensationStatus
+		claimMoney int64
+		wantStep   string // 期望出现的 step key（"" = 不出现）
+		wantStatus string
+	}{
+		{
+			name:     "无活动 → 静默",
+			st:       upstream.CompensationStatus{Active: false},
+			wantStep: "",
+		},
+		{
+			name:       "待领 → 领取成功",
+			st:         upstream.CompensationStatus{Active: true, CreditNum: 500, EndTime: "2026-10-22 23:59:59"},
+			claimMoney: 500,
+			wantStep:   "bonus",
+			wantStatus: "ok",
+		},
+		{
+			name:     "已领 → 静默",
+			st:       upstream.CompensationStatus{Active: true, Claimed: true, CreditNum: 500},
+			wantStep: "",
+		},
+		{
+			name:     "额度为零 → 静默",
+			st:       upstream.CompensationStatus{Active: true, CreditNum: 0},
+			wantStep: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeGrowth{compStatus: c.st, compCredit: c.claimMoney}
+			s, _, _ := newTestScheduler(t, "cn", fake)
+			res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
+			s.stepBonus(res)
+			if c.wantStep == "" {
+				if _, ok := res.findStep("bonus"); ok {
+					t.Errorf("不应记 bonus 步，得到 %+v", res.Steps)
+				}
+				if _, ok := res.findStep("compensation"); ok {
+					t.Errorf("不应记 compensation 步，得到 %+v", res.Steps)
+				}
+				return
+			}
+			stp, ok := res.findStep(c.wantStep)
+			if !ok || stp.Status != c.wantStatus {
+				t.Errorf("%s 步应为 %s，得到 %+v", c.wantStep, c.wantStatus, res.Steps)
+			}
+			if !strings.Contains(stp.Detail, "补偿") {
+				t.Errorf("bonus 详情应含补偿信息，得到 %q", stp.Detail)
+			}
+		})
+	}
+}
+
+// TestStepBonusCompensationQueryError 补偿状态查询失败必须 warn（不能把「查不到」当「没有」）。
+func TestStepBonusCompensationQueryError(t *testing.T) {
+	fake := &fakeGrowth{compStatusErr: errors.New("network down")}
+	s, _, _ := newTestScheduler(t, "cn", fake)
+	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
+	s.stepBonus(res)
+	stp, ok := res.findStep("compensation")
+	if !ok || stp.Status != "warn" {
+		t.Fatalf("查询失败应记 warn，得到 %+v", stp)
+	}
+	if !strings.Contains(stp.Detail, "查询失败") {
+		t.Errorf("warn 详情应说明查询失败，得到 %q", stp.Detail)
+	}
+}
+
+// TestStepBonusCompensationClaimError 待领但领取失败必须 fail，并带出截止日（会过期）。
+func TestStepBonusCompensationClaimError(t *testing.T) {
+	fake := &fakeGrowth{
+		compStatus:   upstream.CompensationStatus{Active: true, CreditNum: 500, EndTime: "2026-10-22 23:59:59"},
+		compClaimErr: &upstream.GrowthError{Status: 500, Msg: "boom"},
+	}
+	s, _, _ := newTestScheduler(t, "cn", fake)
+	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
+	s.stepBonus(res)
+	stp, ok := res.findStep("compensation")
+	if !ok || stp.Status != "fail" {
+		t.Fatalf("领取失败应记 fail，得到 %+v", stp)
+	}
+	if !strings.Contains(stp.Detail, "2026-10-22") {
+		t.Errorf("fail 详情应带截止日，得到 %q", stp.Detail)
+	}
+}
+
+// TestStepRewardChainRedeemsAllTiers 兑换要把所有已解锁未领档位都领掉（不只最高档）。
+func TestStepRewardChainRedeemsAllTiers(t *testing.T) {
+	info := &upstream.GrowthStreakInfo{}
+	info.Streak.Days = 30
+	info.Redemption.Tiers = []upstream.GrowthTierSpec{
+		{Tier: "7d", Days: 7, Credit: 80},
+		{Tier: "14d", Days: 14, Credit: 150},
+		{Tier: "28d", Days: 28, Credit: 400},
+	}
+	fake := &fakeGrowth{streakSeq: []*upstream.GrowthStreakInfo{info}, chances: 0}
+	s, _, _ := newTestScheduler(t, "cn", fake)
+	// 绕过上报/领养等步骤，直接测奖励链
+	s.growthState.day = upstream.GrowthTodayDate(time.Now())
+	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
+	var pInfo *upstream.GrowthStreakInfo
+	s.stepRewardChain(res, &pInfo)
+
+	if len(fake.redeemTiers) != 3 {
+		t.Fatalf("应兑换全部 3 档，得到 %v", fake.redeemTiers)
+	}
+	want := map[string]bool{"7d": true, "14d": true, "28d": true}
+	for _, tier := range fake.redeemTiers {
+		if !want[tier] {
+			t.Errorf("意外档位 %s（应升序 7d/14d/28d），全部: %v", tier, fake.redeemTiers)
+		}
+	}
+	stp, ok := res.findStep("redeem")
+	if !ok || stp.Status != "ok" {
+		t.Fatalf("redeem 应 ok，得到 %+v", stp)
+	}
+}
+
+// TestStepRewardChainSkipsClaimedTier 已领档位不再兑换。
+func TestStepRewardChainSkipsClaimedTier(t *testing.T) {
+	info := &upstream.GrowthStreakInfo{}
+	info.Streak.Days = 30
+	info.Redemption.Tier7dStatus = "claimed"
+	info.Redemption.Tier14dStatus = "claimed"
+	info.Redemption.Tiers = []upstream.GrowthTierSpec{
+		{Tier: "7d", Days: 7}, {Tier: "14d", Days: 14}, {Tier: "28d", Days: 28},
+	}
+	fake := &fakeGrowth{streakSeq: []*upstream.GrowthStreakInfo{info}}
+	s, _, _ := newTestScheduler(t, "cn", fake)
+	s.growthState.day = upstream.GrowthTodayDate(time.Now())
+	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
+	var pInfo *upstream.GrowthStreakInfo
+	s.stepRewardChain(res, &pInfo)
+
+	if len(fake.redeemTiers) != 1 || fake.redeemTiers[0] != "28d" {
+		t.Errorf("只应兑换未领的 28d，得到 %v", fake.redeemTiers)
+	}
+}
+
+// TestStepLotteryDrawsAll 抽奖要把 chances 全部抽完（次数只能从兑换获得，留着不生息）。
+func TestStepLotteryDrawsAll(t *testing.T) {
+	fake := &fakeGrowth{chances: 3}
+	s, _, _ := newTestScheduler(t, "cn", fake)
+	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
+	s.stepLottery(res)
+	if fake.drawN != 3 {
+		t.Errorf("应抽 3 次，得到 %d", fake.drawN)
+	}
+	stp, ok := res.findStep("lottery")
+	if !ok || stp.Status != "ok" {
+		t.Fatalf("lottery 应 ok，得到 %+v", stp)
+	}
+}
+
+// TestStepLotteryStopsOnNoChance 抽到一半次数用尽：结束本轮但仍记 ok（已抽到的结果保留）。
+func TestStepLotteryStopsOnNoChance(t *testing.T) {
+	fake := &fakeGrowth{
+		chances: 5,
+		drawErr: &upstream.GrowthError{Status: 400, Msg: "insufficient lottery chance balance"},
+	}
+	s, _, _ := newTestScheduler(t, "cn", fake)
+	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
+	s.stepLottery(res)
+	if fake.drawN != 1 {
+		t.Errorf("无次数应立刻结束（只尝试 1 次），得到 %d", fake.drawN)
+	}
+	// 一次都没抽到 → skip
+	if stp, _ := res.findStep("lottery"); stp.Status != "skip" {
+		t.Errorf("未抽到任何奖品应记 skip，得到 %+v", stp)
+	}
+}
+
+// TestSweepHookNoHook 未挂载清扫钩子时返回 no_hook（不 panic）。
+func TestSweepHookNoHook(t *testing.T) {
+	s, _, _ := newTestScheduler(t, "cn", &fakeGrowth{})
+	st := s.RunTaskSweepOnce()
+	if st.Reason != "no_hook" {
+		t.Errorf("无钩子应返回 no_hook，得到 %q", st.Reason)
+	}
+}
+
+// TestSweepHookInvoked 挂载后 ticker / 手动入口都会调到钩子。
+func TestSweepHookInvoked(t *testing.T) {
+	s, _, _ := newTestScheduler(t, "cn", &fakeGrowth{})
+	calls := 0
+	s.SetTaskSweepHook(func() taskops.SweepStats {
+		calls++
+		return taskops.SweepStats{Ran: true, Claimed: 1, Credits: 100}
+	})
+	st := s.RunTaskSweepOnce()
+	if calls != 1 {
+		t.Errorf("钩子应被调用 1 次，得到 %d", calls)
+	}
+	if st.Claimed != 1 || st.Credits != 100 {
+		t.Errorf("应回传钩子结果，得到 %+v", st)
+	}
+}
+
+// TestTaskQueueHookInvoked 任务队列钩子被 cron 入口调用。
+func TestTaskQueueHookInvoked(t *testing.T) {
+	s, _, _ := newTestScheduler(t, "cn", &fakeGrowth{})
+	called := false
+	s.SetTaskQueueHook(func() { called = true })
+	s.tickTaskQueue()
+	if !called {
+		t.Error("tickTaskQueue 应调用已挂载钩子")
+	}
+	// 未挂载时不应 panic
+	s.SetTaskQueueHook(nil)
+	s.tickTaskQueue()
+}
+
+// TestBlackcatScheduleRegistered 夜猫子与任务队列 cron 在开启 auto_growth 后注册，
+// 关闭后摘除（Reconfigure 幂等、不叠加）。
+func TestBlackcatScheduleRegistered(t *testing.T) {
+	fake := &fakeGrowth{}
+	s, _, cfg := newTestScheduler(t, "cn", fake)
+	if err := cfg.Update(func(c *config.Config) error { c.AutoGrowth = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconfigure()
+	s.mu.Lock()
+	hasBlackcat := s.blackcatID != 0
+	hasQueue := s.growthQueueID != 0
+	s.mu.Unlock()
+	if !hasBlackcat {
+		t.Error("开启 auto_growth 后应注册夜猫子 cron")
+	}
+	if !hasQueue {
+		t.Error("开启 auto_growth 后应注册任务队列 cron")
+	}
+
+	// 再 Reconmfigure 一次不应叠加（entry 被替换）
+	s.Reconfigure()
+	entries := len(s.c.Entries())
+	s.Reconfigure()
+	if got := len(s.c.Entries()); got != entries {
+		t.Errorf("重复 Reconfigure 不应叠加 cron entry: %d → %d", entries, got)
+	}
+
+	// 关闭后摘除
+	if err := cfg.Update(func(c *config.Config) error { c.AutoGrowth = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconfigure()
+	s.mu.Lock()
+	hasBlackcat = s.blackcatID != 0
+	hasQueue = s.growthQueueID != 0
+	s.mu.Unlock()
+	if hasBlackcat || hasQueue {
+		t.Error("关闭 auto_growth 后应摘除夜猫子与任务队列 cron")
+	}
+}
+
+// TestTaskSweepTickerConfig 补领清扫 ticker 随配置启停。
+func TestTaskSweepTickerConfig(t *testing.T) {
+	fake := &fakeGrowth{}
+	s, _, cfg := newTestScheduler(t, "cn", fake)
+	s.SetTaskSweepHook(func() taskops.SweepStats { return taskops.SweepStats{Ran: true} })
+
+	if err := cfg.Update(func(c *config.Config) error {
+		c.AutoGrowth = true
+		c.TaskSweepEnabled = true
+		c.TaskSweepMinutes = 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconfigure()
+	s.mu.Lock()
+	running := s.sweepCancel != nil
+	s.mu.Unlock()
+	if !running {
+		t.Fatal("开启后应启动清扫 ticker")
+	}
+
+	if err := cfg.Update(func(c *config.Config) error { c.TaskSweepEnabled = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconfigure()
+	s.mu.Lock()
+	running = s.sweepCancel != nil
+	s.mu.Unlock()
+	if running {
+		t.Error("关闭后应停止清扫 ticker")
+	}
+
+	// 重复启停不应 panic / 泄漏（Stop 后再 Reconfigure 也安全）
+	if err := cfg.Update(func(c *config.Config) error { c.TaskSweepEnabled = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconfigure()
+	s.Reconfigure()
+	s.Stop()
+}
+
+// ── 回归护栏 ─────────────────────────────────────────────────────────────────
+
+// TestBlackcatUsesSharedRunner 夜猫子 cron 必须用 scheduler 的共享执行器，
+// 不能每次 NewRunner（互斥锁是实例字段，各建各的等于没有互斥）。
+func TestBlackcatUsesSharedRunner(t *testing.T) {
+	s, _, _ := newTestScheduler(t, "cn", &fakeGrowth{})
+	if s.runner == nil {
+		t.Fatal("Scheduler 必须持有内置 runner（tickBlackcat 直接用它）")
+	}
+	if s.Runner() != s.runner {
+		t.Error("Runner() 应返回内置实例（admin 据此复用同一把锁）")
+	}
+
+	// SetRunner 可替换（admin 先建 Handler 再注入的场景）
+	other := taskops.NewRunner(s.client)
+	s.SetRunner(other)
+	if s.Runner() != other {
+		t.Error("SetRunner 应生效")
+	}
+	// nil 不得把 runner 清空（否则 tickBlackcat 会 nil 解引用）
+	s.SetRunner(nil)
+	if s.Runner() != other {
+		t.Error("SetRunner(nil) 不应清空执行器")
+	}
+}
+
+// TestTaskSweepTickerStops 补领清扫 ticker 必须能被 Stop 停掉并等它退出，
+// 且重复 Reconfigure 不叠加 ticker。
+func TestTaskSweepTickerStops(t *testing.T) {
+	s, _, _ := newTestScheduler(t, "cn", &fakeGrowth{})
+	cfg := s.cfg.Get()
+	cfg.AutoGrowth = true
+	cfg.TaskSweepEnabled = true
+	cfg.TaskSweepMinutes = 1
+	if err := s.cfg.Update(func(c *config.Config) error { *c = cfg; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconfigure()
+	if s.sweepCancel == nil {
+		t.Fatal("TaskSweepEnabled 时应有 ticker")
+	}
+	first := s.sweepDone
+
+	// 再调一次：旧 ticker 必须先退出（否则每次保存设置都会漏一个 goroutine）
+	s.Reconfigure()
+	if s.sweepDone == first {
+		t.Error("重复 Reconfigure 应重启 ticker 而不是复用")
+	}
+	select {
+	case <-first:
+	default:
+		t.Error("旧 ticker 应已退出")
+	}
+
+	s.Stop()
+	if s.sweepCancel != nil {
+		t.Error("Stop 后 sweepCancel 应为 nil")
+	}
+}
+
+// TestResetAccountStateClearsTaskCache 换账号必须清掉任务中心的落库统计，
+// 否则面板会把上一账号的「上次领奖 N 项」挂在当前账号上。
+func TestResetAccountStateClearsTaskCache(t *testing.T) {
+	s, st, _ := newTestScheduler(t, "cn", &fakeGrowth{})
+	for _, k := range []string{"task_last_sweep", "task_last_queue"} {
+		if err := st.SetCache(growthCacheTable, k, `{"ok":true}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.ResetAccountState()
+	for _, k := range []string{"task_last_sweep", "task_last_queue"} {
+		if _, _, ok := st.GetCache(growthCacheTable, k, 7*24*3600); ok {
+			t.Errorf("换账号后 %s 应被清掉", k)
+		}
 	}
 }

@@ -24,6 +24,14 @@ type Client struct {
 	short          *http.Client // 其余接口
 	toks           *auth.TokenStore
 	regionProvider func() string
+
+	// GrowthBaseOverride / WebBaseOverride / MPBaseOverride / AuthBaseOverride 覆盖
+	// 成长域、Web 域、小程序上报域与 token 刷新域的主机。空值 = 使用端点表 / 官方固定值
+	// （生产恒为空）。用途：指向自建镜像、本地桩服务器（端到端测试），以及逆代期间的流量对照。
+	GrowthBaseOverride string
+	WebBaseOverride    string
+	MPBaseOverride     string
+	AuthBaseOverride   string
 }
 
 // New 创建上游客户端。chatTimeoutSeconds 设置 chat 上游的响应头超时（上游多久不开始
@@ -42,8 +50,14 @@ func New(toks *auth.TokenStore, regionProvider func() string, chatTimeoutSeconds
 
 func (c *Client) ep() config.Endpoint { return config.EndpointOf(c.regionProvider()) }
 
-// authBase token 刷新请求主机。包级变量便于单测以 httptest 替换（生产恒为当前端点）。
-var authBase = func(c *Client) string { return c.ep().Upstream }
+// authBase token 刷新请求主机。包级变量便于单测以 httptest 替换（生产恒为当前端点）；
+// 跨包测试用 Client.AuthBaseOverride。
+var authBase = func(c *Client) string {
+	if c.AuthBaseOverride != "" {
+		return c.AuthBaseOverride
+	}
+	return c.ep().Upstream
+}
 
 // TokenSummary 返回当前 token 副本（未登录为 nil）。
 func (c *Client) TokenSummary() *auth.Token { return c.toks.Get() }
@@ -102,6 +116,54 @@ func (c *Client) chatOnce(ctx context.Context, body []byte, t *auth.Token) (*htt
 	}
 	req.Header = chatHeaders(t)
 	return c.long.Do(req)
+}
+
+// ── 鉴权传输层（growth / web / desktop / mp 共用）────────────────────────────────
+
+// doAuthed 统一鉴权传输：确保 token 有效 → 构造 → 发送 → 401 时强制刷新并重建重试一次。
+//
+// build 必须是**构造函数而不是现成请求**。原因：token 刷新后要重设 Authorization，
+// 传现成请求会让重试继续携带旧 token。这条曾让任务体系「列表能读、领奖与上报恒 401」，
+// 因为旧写法先把旧 token 写进头、再调 EnsureValid（刷新结果对已建好的请求无效）。
+//
+// 语义与 DoChat 一致：刷新失败不吞掉原始 401，交给调用方按正常态分类器处理。
+func (c *Client) doAuthed(cl *http.Client, build func() (*http.Request, error)) (int, []byte, error) {
+	if c.toks.Get() == nil {
+		return 0, nil, ErrNoToken
+	}
+	// 过期则刷新（best-effort：失败仍尝试请求，401 分支还有一次强刷机会）
+	_ = c.toks.EnsureValid(c.RefreshFn)
+
+	status, raw, err := sendOnce(cl, build)
+	if err != nil {
+		return 0, nil, err
+	}
+	if status != http.StatusUnauthorized {
+		return status, raw, nil
+	}
+	// 401：强制刷新（可能已被别的 goroutine 刷过，ForceRefresh 幂等）后重建请求重试一次。
+	if rerr := c.toks.ForceRefresh(c.RefreshFn); rerr != nil {
+		return status, raw, nil // 刷不动：把原 401 交回调用方，别伪装成网络错误
+	}
+	return sendOnce(cl, build)
+}
+
+// sendOnce 构造并发送一次请求，读完响应体（≤4MB）。
+func sendOnce(cl *http.Client, build func() (*http.Request, error)) (int, []byte, error) {
+	req, err := build()
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if rerr != nil {
+		return resp.StatusCode, nil, rerr
+	}
+	return resp.StatusCode, raw, nil
 }
 
 // DoChat 完整 chat 流程：确保 token 有效 → 请求 → 401 则刷新重试一次。

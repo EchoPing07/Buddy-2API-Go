@@ -86,6 +86,12 @@ func main() {
 	proxyH := proxy.New(client, models, keys, st, cfg)
 	adminH := admin.New(cfg, st, toks, client, models, keys, sched, session)
 
+	// 任务侧两个回调由 admin 实现（编排在 taskops，scheduler 只负责到点触发）：
+	//   - 补领清扫：分钟级 ticker，只 accept/claim，把「已达标未领」的奖励领掉；
+	//   - 任务队列：每日 cron，扫描待办并逐个跑动作（Sequential 族每日解锁一环）。
+	sched.SetTaskSweepHook(adminH.RunTaskSweep)
+	sched.SetTaskQueueHook(adminH.RunTaskQueueOnce)
+
 	// 前端：启动时解析模板并预渲染全部页面。
 	// app.js 必须排在 alpine.js 之前：alpine.min.js 末尾以 queueMicrotask(Alpine.start())
 	// 自启动，微任务会在下一个 defer 脚本执行前清空，Alpine 先加载即在 app() 定义前启动。

@@ -30,7 +30,12 @@ PAGE('settings', {
       if(s.auto_growth){
         body.growth_report_cron = (s.growth_report_cron||'').trim();
         body.growth_travel_cron = (s.growth_travel_cron||'').trim();
+        body.growth_queue_cron = (s.growth_queue_cron||'').trim();
+        body.blackcat_cron = (s.blackcat_cron||'').trim();
       }
+      // 补领清扫开关独立下发（ticker 仍随 auto_growth 生效；手动按钮随时可用）
+      body.task_sweep_enabled = !!s.task_sweep_enabled;
+      if(num(s.task_sweep_minutes) > 0) body.task_sweep_minutes = Math.min(1440, num(s.task_sweep_minutes));
       // 留空/非正不下发（后端这些字段是「>0 才写入」，发 0 会被静默忽略）
       if(num(s.growth_report_count) > 0)    body.growth_report_count = num(s.growth_report_count);
       if(num(s.resource_cache_seconds) > 0) body.resource_cache_seconds = num(s.resource_cache_seconds);

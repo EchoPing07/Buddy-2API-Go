@@ -592,7 +592,7 @@ Object.keys(PAGES).forEach(function (k) {
   PAGES[k].load = function () { loads.push('enter:' + k); if (orig) return orig.call(this); };
 });
 ['loadStats', 'loadModels', 'loadKeys', 'loadAccount', 'loadGrowth', 'loadCheckin',
- 'loadSettings', 'loadResources', 'loadLogs'].forEach(function (m) {
+ 'loadSettings', 'loadResources', 'loadLogs', 'loadTasks', 'loadCompensation'].forEach(function (m) {
   // 记参数：loadResources/loadGrowth 的 force 标志要被断言（换账号必须强刷）
   if (typeof inst[m] === 'function') {
     real[m] = inst[m];   // 保留真实现，供 10c/12 直接跑
@@ -744,6 +744,8 @@ const jwt = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1In0.sig';
 function accountDataLoaded(where, withModels) {
   if (count('loadResources(true)') !== 1) fail(where + ' 未强刷余额（loadResources(true)）: ' + JSON.stringify(loads));
   if (count('loadGrowth(true)') !== 1) fail(where + ' 未强刷任务（loadGrowth(true)）: ' + JSON.stringify(loads));
+  if (count('loadTasks') !== 1) fail(where + ' 未刷新任务中心（loadTasks）: ' + JSON.stringify(loads));
+  if (count('loadCompensation') !== 1) fail(where + ' 未刷新补偿状态（loadCompensation）: ' + JSON.stringify(loads));
   if (count('loadCheckin') !== 1) fail(where + ' 未刷新签到状态: ' + JSON.stringify(loads));
   if (count('loadAccount') !== 1) fail(where + ' 未刷新账号信息: ' + JSON.stringify(loads));
   if (count('loadHealth') !== 1) fail(where + ' 未刷新健康状态: ' + JSON.stringify(loads));
@@ -827,6 +829,14 @@ if (inst.resources.accounts.length !== 0) fail('删除凭证后余额仍是被�
 if (inst.resources.loaded !== false) fail('删除凭证后 resources 未回到未加载态（无凭证重拉只会失败）: ' + inst.resources.loaded);
 if (inst.growth.loaded !== false || inst.growth.streak !== null || inst.growth.heatmap !== null) {
   fail('删除凭证后任务数据未清空: ' + JSON.stringify(inst.growth));
+}
+// 任务中心 / 补偿同属账号口径：删凭证后必须一起清空（否则会展示被删账号的进度与额度）
+if ((inst.tasks || []).length !== 0 || inst.tasksLoaded !== false || inst.tasksErr) {
+  fail('删除凭证后任务中心未清空: ' + JSON.stringify({ tasks: inst.tasks, loaded: inst.tasksLoaded, err: inst.tasksErr }));
+}
+if ((inst.tasksResults || []).length !== 0) fail('删除凭证后任务执行结果未清空');
+if (inst.compLoaded !== false || (inst.comp && Object.keys(inst.comp).length)) {
+  fail('删除凭证后补偿状态未清空: ' + JSON.stringify(inst.comp));
 }
 if (inst.checkin.loaded !== false || inst.checkinOk || inst.checkinErr || inst.checkinPending) {
   fail('删除凭证后签到状态/标志未清空: ' + JSON.stringify([inst.checkin, inst.checkinOk, inst.checkinErr, inst.checkinPending]));
@@ -1060,4 +1070,120 @@ func scanTagBalance(doc string) (int, []int, error) {
 		i += tagEnd + 1
 	}
 	return depth, viewDepths, nil
+}
+
+// TestGrowthPageTaskCenter 任务中心 UI 契约：页面含任务表、一键完成与补领清扫入口，
+// 页面脚本含对应动作；设置页含新排程项。这类「功能是否真的接线」的问题只能靠源码断言。
+func TestGrowthPageTaskCenter(t *testing.T) {
+	html, err := pageFS.ReadFile("pages/growth.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := assetFS.ReadFile("assets/pages/growth.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, script := string(html), string(js)
+
+	for _, want := range []string{
+		"成长任务",              // 卡片标题
+		"sortedTasks()",     // 任务表格数据源
+		"runTasksAutoAll()", // 一键完成全部
+		"runTasksSweep()",   // 补领清扫按钮
+		"runTaskAuto(",      // 单任务一键完成
+		"runTaskClaim(",     // 单任务领取
+		"tasksResults",      // 逐项执行结果
+		"活动补偿",              // 补偿卡片
+		"runCompensationClaim()",
+		"lastSweep", // 上一轮清扫结果（落库，刷新后仍在）
+		"lastQueue", // 上一轮队列结果
+		"taskAt(",   // 落库时间戳格式化
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("growth.html 缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"/admin/tasks'",          // 列表
+		"/admin/tasks/auto'",     // 单任务一键完成
+		"/admin/tasks/auto_all'", // 全部
+		"/admin/tasks/claim'",    // 领奖
+		"/admin/tasks/sweep'",    // 清扫
+		"/admin/compensation'",   // 补偿状态
+		"/admin/tasks/accept'",   // 接受
+		"/admin/tasks/sweep'",    // 补领清扫
+		"/admin/compensation'",   // 补偿状态
+		"/admin/compensation/claim'",
+		"loadTasks", "loadCompensation",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("growth.js 缺少 %q", want)
+		}
+	}
+	// 动作执行必须有并发闸（重复点击不能起第二轮）
+	if !strings.Contains(script, "tasksBusy") || !strings.Contains(script, "tasksRunning") {
+		t.Error("growth.js 缺少任务并发闸（tasksBusy/tasksRunning）")
+	}
+	// 门控失败必须展示人话 detail 而不是裸 reason
+	if !strings.Contains(script, "r.detail") {
+		t.Error("growth.js 未展示服务端 detail（门控原因需人话）")
+	}
+
+	settingsHTML, err := pageFS.ReadFile("pages/settings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settingsJS, err := assetFS.ReadFile("assets/pages/settings.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"growth_queue_cron", "blackcat_cron", "task_sweep_enabled", "task_sweep_minutes"} {
+		if !strings.Contains(string(settingsHTML), want) {
+			t.Errorf("settings.html 缺少 %q", want)
+		}
+		if !strings.Contains(string(settingsJS), want) {
+			t.Errorf("settings.js 未下发 %q", want)
+		}
+	}
+}
+
+// TestGrowthPageNoDanglingHandlers growth.html 里绑定的 @click 处理函数都必须在
+// growth.js 或共享层里定义（否则点击时静默报 Alpine 未定义错误）。
+func TestGrowthPageNoDanglingHandlers(t *testing.T) {
+	html, err := pageFS.ReadFile("pages/growth.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := assetFS.ReadFile("assets/pages/growth.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := assetFS.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, pageScript := string(html), string(js)
+	sharedScript := string(shared)
+
+	// 抓 @click="fnName(...)" / @click="fnName"
+	re := regexp.MustCompile(`@click="([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	seen := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(page, -1) {
+		name := m[1]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		// 页面脚本里以 `name(` 或 `name:` 或 `async name(` 定义；共享层同理
+		defined := strings.Contains(pageScript, name+"(") || strings.Contains(pageScript, name+":")
+		if !defined {
+			defined = strings.Contains(sharedScript, name+"(") || strings.Contains(sharedScript, name+":")
+		}
+		if !defined {
+			t.Errorf("growth.html 绑定了 %s()，但页面脚本与共享层都没有定义", name)
+		}
+	}
+	if len(seen) == 0 {
+		t.Error("未在 growth.html 中解析到任何 @click 处理器（正则或页面结构变了？）")
+	}
 }

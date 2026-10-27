@@ -165,6 +165,40 @@ func newGrowthTestHandler(t *testing.T, region string, loggedIn bool, gf *fakeGr
 	return h, st, fs
 }
 
+// newTaskTestHandler 任务端点专用 handler（不注入 growth fake，动作走真实 client 分支）。
+func newTaskTestHandler(t *testing.T, region, enterpriseID string, loggedIn bool) *Handler {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if region != "cn" {
+		if err := cfg.Update(func(c *config.Config) error { c.Region = region; return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	toks, err := auth.NewTokenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loggedIn {
+		if err := toks.Save(&auth.Token{
+			UID: "u", AccessToken: "t", EnterpriseID: enterpriseID,
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := upstream.New(toks, func() string { return region }, 60)
+	return &Handler{cfg: cfg, st: st, toks: toks, client: client, sched: &fakeSched{}}
+}
+
 // ── overview 聚合纯函数 ───────────────────────────────────────────────────────────
 
 // TestBuildGrowthOverview 覆盖：tier 状态计算、热力格昨日/今日切片、

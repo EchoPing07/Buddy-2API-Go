@@ -17,6 +17,7 @@
 
 - **本项目仅用于学习与研究目的**，请勿用于任何违法违规用途，不要干坏事。使用者需自行承担一切后果，作者不对任何滥用行为负责。
 - 本项目的代码参考了 wicm84266964/Buddy2api、Sliverkiss/CodeBuddy2api、cyl2361341082-alt/Buddy2api、ShouZhuo0413/codebuddy2api、Sliverkiss/workbuddy2api 等项目，Web 管理面板的 UI 设计参考了 [grok2api](https://github.com/EchoPing07/grok2api)（详见 [致谢与参考](#-致谢与参考)）。
+- **本项目新增的官方成长任务相关功能来自 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)**。
 - 本项目**不存储对话内容**，数据库仅保存元信息（模型、token 数、耗时、状态码等）。
 - **成长任务（活跃地图上报 / 连登奖励 / 猫猫旅行等）默认关闭，属可选实验性功能**：其实现为模拟官方客户端事件的活跃上报，可能不符合上游服务条款，存在触发风控、账号受限等风险，是否开启及其后果由使用者自行评估承担。
 
@@ -31,6 +32,7 @@
 | 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期，可一键隐藏已用完 / 已过期额度包 |
 | 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取（在「任务」页） |
 | 成长任务        | 活跃地图连登上报、连登奖励兑换/抽奖、补签卡、猫猫领养与旅行（仅国内版账号）；错过时点启动自动补跑，默认关闭 |
+| 任务中心        | 官方「成长计划」任务列表 / 接受 / **一键完成** / 自动领奖（25 个任务可纯 API 点亮，含小程序口径）；**分钟级补领清扫**把「已达标没领」的奖励领掉；活动补偿先查后领 |
 | 仪表盘         | 请求量、Token、各模型请求数分布、近期错误等聚合统计                          |
 | 模型倍率         | 模型列表展示当前实际倍率（如 `GLM-5.2 x0.50`），自动套用官方分时段折扣（夜间折扣 / 限时免费等，支持跨零点时段窗与时区） |
 | 自动刷新        | token 过期自动刷新，401 时刷新后重试一次；模型列表每小时 01 分自动刷新（失败保留旧表） |
@@ -135,7 +137,7 @@ go vet ./... && go test ./...
 1. 打开管理后台：本机部署访问 `http://127.0.0.1:10082`，Docker/局域网部署访问 `http://<服务器IP>:10082`，输入管理密码登录（默认 `password`）
 2. 「账号」页 → **登录**（OAuth 设备流，浏览器完成授权）
 3. 「密钥」页 → 创建 API Key（随机或自定义，支持备注/启停）
-4. （可选）「任务」页 → 每日签到与成长任务（活跃地图连登 / 连登奖励兑换与抽奖 / 猫猫旅行，仅国内版账号）；自动执行开关在「设置 → 任务」
+4. （可选）「任务」页 → 每日签到、成长任务中心（任务列表 / 一键完成 / 自动领奖 / 补领清扫 / 活动补偿）与成长任务（活跃地图连登 / 连登奖励兑换与抽奖 / 猫猫旅行，仅国内版账号）；自动执行开关在「设置 → 任务」
 5. 在任意 OpenAI 兼容客户端填入：
 
 ```
@@ -190,7 +192,16 @@ curl http://127.0.0.1:10082/v1/embeddings \
 | `GET /admin/checkin/status` `POST /admin/checkin/claim` | 签到状态 / 领取 |
 | `GET /admin/growth/overview` | 成长任务总览（连登 / 热力格 / 猫猫 / 抽奖聚合，60s 缓存，`?force=1` 强刷） |
 | `POST /admin/growth/run` `POST /admin/growth/report` `POST /admin/growth/travel` | 手动执行完整任务链 / 活跃上报（`{count}` 显式指定 1-10，缺省交由服务端按「配置条数 + 波动数」随机）/ 旅行巡检 |
-| `POST /admin/growth/adopt` `POST /admin/growth/redeem` `POST /admin/growth/lottery` `POST /admin/growth/makeup` `POST /admin/growth/bonus` | 手动领养 / 兑换（`{tier}`=7d/14d/28d）/ 抽奖 / 补签（`{date}` 缺省昨日 CST）/ 领新手礼包与活动补偿 |
+| `POST /admin/growth/adopt` `POST /admin/growth/redeem` `POST /admin/growth/lottery` `POST /admin/growth/makeup` `POST /admin/growth/bonus` | 手动领养 / 兑换（`{tier}`=7d/14d/28d）/ 抽奖（抽完 chances）/ 补签（`{date}` 缺省昨日 CST）/ 领新手礼包与活动补偿 |
+| `GET /admin/tasks` | 官方成长任务全量列表（默认 + 小程序口径合并），含 `claimable`/`claimed`/`auto` 标记 |
+| `POST /admin/tasks/accept` | 接受任务（`{task_codes?}`，缺省=全部未接受；默认与小程序口径分开提交） |
+| `POST /admin/tasks/claim` | 领取单个任务奖励（`{task_code}`；默认任务走 Web 域、小程序任务走 mp 口径，均幂等） |
+| `POST /admin/tasks/auto` | **一键完成**单个任务（`{task_code}`）：动作 → 有界轮询回读（异步计分）→ 达标即自动领奖 |
+| `POST /admin/tasks/auto_all` | 一键完成全部可自动化任务（先批量 accept，再逐项执行；单项失败不阻断） |
+| `GET /admin/tasks/scan` | 只读扫描待办（未领取、未锁定、且有自动动作） |
+| `POST /admin/tasks/sweep` | 立即执行一轮补领清扫（只 accept/claim，不跑行为链） |
+| `GET /admin/tasks/actions` | 支持一键完成的任务清单（任务码 + 说明 + 是否小程序口径 + 是否尝试型） |
+| `GET /admin/compensation` `POST /admin/compensation/claim` | 活动补偿状态（只读）/ 领取（先查后领，无活动·已领·零额度均正常返回） |
 | `GET /admin/api-keys` `POST /admin/api-keys` `PUT /admin/api-keys/{id}` `DELETE /admin/api-keys/{id}` | API Key 增删改查 |
 | `GET /admin/logs` | 请求日志（分页 + 筛选 model/key/status） |
 | `GET /admin/stats` | 仪表盘聚合 |
@@ -242,6 +253,10 @@ curl http://127.0.0.1:10082/v1/embeddings \
 | `BUDDY2API_GROWTH_TRAVEL_CRON` | 猫猫旅行巡检 cron（默认 `0 0 9,21 * * *`） |
 | `BUDDY2API_GROWTH_REPORT_COUNT` | 每日活跃上报条数 1-10（默认 10；领养前置 `chat_5` 需 5 条，同会话多轮、每条间隔 1.5 秒） |
 | `BUDDY2API_GROWTH_REPORT_JITTER` | 上报条数随机波动 ±N（默认 0=固定不波动，上限 10），每次执行在「条数 ±N」内随机取整，更像真人以降低风控判定 |
+| `BUDDY2API_GROWTH_QUEUE_CRON` | 任务队列 cron，6 段含秒（默认 `0 0 1 * * *`）：每日扫描待办并逐个执行动作 |
+| `BUDDY2API_BLACKCAT_CRON` | 夜猫子 cron（默认 `0 0 23 * * *`）：仅 23:00–08:00 窗口内计数，窗口外自动跳过 |
+| `BUDDY2API_TASK_SWEEP_ENABLED` | 周期补领清扫开关（默认 `true`）：分钟级只做 accept/claim，不跑任何行为链 |
+| `BUDDY2API_TASK_SWEEP_MINUTES` | 补领清扫间隔分钟数（默认 15，上限 1440） |
 | `BUDDY2API_RESOURCE_CACHE_SECONDS` | 余额缓存秒数（默认 300） |
 | `BUDDY2API_LOG_RETENTION_DAYS` | 日志保留天数（默认 90） |
 | `BUDDY2API_LOG_MAX_SIZE_MB` | 日志表容量上限 MB（默认 50） |
@@ -276,9 +291,10 @@ Buddy-2API-Go/
 │   ├── config/            # 配置加载（config.json + env 覆盖）
 │   ├── store/             # SQLite 数据层（API Keys / 日志 / 缓存）
 │   ├── auth/              # 凭证：token.json 读写、JWT 解析、OAuth 设备流
-│   ├── upstream/          # 上游客户端：chat 转发、embeddings、billing、checkin、growth（成长任务）、指纹头
+│   ├── upstream/          # 上游客户端：chat 转发、embeddings、billing、checkin、growth（成长任务）、tasks/desktop/web（任务判据上报）、指纹头
 │   ├── proxy/             # /v1/chat/completions 代理（流式透传 + 非流式聚合）与 /v1/embeddings
 │   ├── apikey/            # OpenAI 端点 Key 管理（明文存储/随机/校验/限额）
+│   ├── taskops/           # 成长任务编排（扫描 / Auto / AutoAll / Sweep，全局互斥与节流）
 │   ├── admin/             # 管理后台 API（登录/账号/keys/日志/签到/余额/任务/设置）
 │   ├── scheduler/         # 任务（签到状态机 + 成长任务链 / 旅行巡检 + 模型列表刷新 + 日志清理）
 │   └── web/               # 前端（go:embed 多页 HTML + 内嵌 Alpine.js；shell.html + pages/ + assets/）
@@ -305,6 +321,7 @@ Go 1.25+ · chi · modernc.org/sqlite（纯 Go，无 cgo） · robfig/cron/v3 ·
   - [cyl2361341082-alt/Buddy2api](https://github.com/cyl2361341082-alt/Buddy2api) —— 非流式聚合、finish_reason 修正等实现思路
   - [ShouZhuo0413/codebuddy2api](https://github.com/ShouZhuo0413/codebuddy2api) —— 部分实现思路
   - [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) —— 成长任务体系（活跃地图上报、连登奖励兑换与抽奖、补签卡、猫猫领养与旅行）的接口契约与状态机
+  - [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)（MIT）—— **本项目新增的成长任务相关功能均来自该项目**：判据事件链、桌面/Web/小程序三套指纹上报、双口径任务接口、Web 域领奖、补领清扫与任务队列/夜猫子思路
 - 实时模型列表接口（`GET /v3/config`）参考了 [kuops/opencode-codebuddy-auth](https://github.com/kuops/opencode-codebuddy-auth)。
 - Web 管理面板的 UI 设计参考了 [chenyme/grok2api](https://github.com/chenyme/grok2api)。
 

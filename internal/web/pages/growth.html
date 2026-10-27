@@ -8,7 +8,7 @@
               <span class="spin" x-show="growthBusy"></span>
               <span class="ic" x-show="!growthBusy" x-html="ic('growth')"></span>执行全部
             </button>
-            <button class="btn btn-secondary btn-sm" @click="loadGrowth(true); loadCheckin()" :disabled="loading">
+            <button class="btn btn-secondary btn-sm" @click="loadAll(true)" :disabled="loading">
               <span class="ic" x-html="ic('refresh')"></span>刷新
             </button>
             <a :href="growthCenterUrl" target="_blank" rel="noreferrer" title="在新窗口打开个人中心">
@@ -18,6 +18,26 @@
             </a>
           </div>
         </header>
+
+        <!-- 补偿活动（限时，带领取截止日） -->
+        <div class="card" x-show="compLoaded && comp.ok && comp.status && comp.status.active">
+          <div class="card-head">
+            <h3>活动补偿</h3>
+            <div class="spacer"></div>
+            <span class="badge" :class="comp.pending?'badge-ok':'badge-muted'"
+                  x-text="comp.pending?'待领取':'已领取'"></span>
+          </div>
+          <div class="stat-grid">
+            <div class="stat"><span class="metric-label">可领积分</span>
+              <span class="stat-v" x-text="(comp.status||{}).credit_num||0"></span></div>
+            <div class="stat"><span class="metric-label">领取截止</span>
+              <span class="stat-v" style="font-size:var(--fs-base)" x-text="(comp.status||{}).end_time||'—'"></span></div>
+          </div>
+          <div class="action-row">
+            <button class="btn btn-sm" x-show="comp.pending" @click="runCompensationClaim()" :disabled="tasksBusy">领取补偿</button>
+            <span class="muted-xs" x-text="comp.pending?'补偿带截止日，过期不补':'本次补偿已领取'" ></span>
+          </div>
+        </div>
 
         <!-- 每日签到（国内版功能）：仅 overview 明确返回 available:false 时随不可用横幅隐藏，
              overview 未就绪或请求失败时仍展示；签到接口失败由卡内降级与重试处理 -->
@@ -229,5 +249,108 @@
             <button class="btn btn-secondary btn-sm" @click="loadGrowth(true)">重试</button>
           </div>
         </div>
+        <!-- ═══ 任务中心：成长任务列表 + 一键完成 + 补领清扫 ═══ -->
+        <div class="card" x-show="!tasksLoaded || tasksOk">
+          <div class="card-head">
+            <h3>成长任务</h3>
+            <span class="muted-xs" x-show="tasksLoaded && tasksPendingList().length"
+                  x-text="tasksPendingList().length+' 项待完成'"></span>
+            <div class="spacer"></div>
+            <span class="badge badge-warn" x-show="tasksErr" x-text="tasksErr"></span>
+            <button class="btn btn-sm" @click="runTasksAutoAll()" :disabled="tasksBusy||tasksRunning"
+                    title="依次执行所有支持一键完成的任务">
+              <span class="spin" x-show="tasksRunning"></span>
+              <span x-text="tasksRunning?'执行中…':'一键完成全部'"></span>
+            </button>
+            <button class="btn btn-secondary btn-sm" @click="runTasksSweep()" :disabled="tasksBusy"
+                    title="只 accept / claim 已达标未领的奖励，不跑行为链">补领清扫</button>
+          </div>
+
+          <div class="empty" x-show="!tasksLoaded">
+            <span class="spin" style="width:18px;height:18px"></span>加载中…
+          </div>
+          <div class="empty" x-show="tasksLoaded && tasksOk && !tasks.length">
+            <span class="ic ic-lg" x-html="ic('growth')"></span>
+            <p class="muted-xs" style="margin:0">当前账号没有下发任务（活动未开启或已完成）</p>
+          </div>
+
+          <div x-show="tasksLoaded && tasksOk && tasks.length" class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style="min-width:180px">任务</th>
+                  <th>奖励</th>
+                  <th style="width:120px">进度</th>
+                  <th style="width:100px">状态</th>
+                  <th style="width:190px">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="t in sortedTasks()" :key="t.task_code">
+                  <tr>
+                    <td>
+                      <div style="font-weight:600" x-text="t.title||t.task_code"></div>
+                      <div class="muted-xs" x-text="t.task_code+(t.mp?' · 小程序':'')+(t.auto?'':' · 需客户端')"></div>
+                    </td>
+                    <td>
+                      <span x-text="taskRewardText(t)"></span>
+                    </td>
+                    <td x-text="taskProgressText(t)"></td>
+                    <td>
+                      <span class="badge" :class="taskBadgeClass(t)" x-text="taskStatusText(t)"></span>
+                    </td>
+                    <td>
+                      <div class="action-row" style="margin:0">
+                        <button class="btn btn-sm" x-show="t.auto && !t.claimed && !t.locked"
+                                @click="runTaskAuto(t.task_code)" :disabled="tasksBusy||tasksRunning"
+                                x-text="taskIsDone(t)?'补领':'一键完成'"></button>
+                        <button class="btn btn-secondary btn-sm" x-show="t.claimable"
+                                @click="runTaskClaim(t.task_code)" :disabled="tasksBusy||tasksRunning">领取</button>
+                        <button class="btn btn-secondary btn-sm"
+                                x-show="!t.auto && !t.claimed && !t.locked && t.accept_status!=='accepted'"
+                                @click="runTaskAccept([t.task_code])" :disabled="tasksBusy">接受</button>
+                        <span class="muted-xs" x-show="t.locked">未解锁</span>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- 上一轮清扫 / 队列结果（落库，刷新后仍在） -->
+          <div class="muted-xs" style="margin-top:10px;display:flex;gap:14px;flex-wrap:wrap"
+               x-show="lastSweep || lastQueue">
+            <span x-show="lastSweep"
+                  x-text="'上次清扫 '+(lastSweep?taskAt(lastSweep.at):'')+
+                          '：接受 '+(lastSweep?lastSweep.accepted:0)+
+                          ' 项，领奖 '+(lastSweep?lastSweep.claimed:0)+
+                          ' 项（+'+(lastSweep?(lastSweep.credits||0):0)+' 分）'+
+                          (lastSweep&&lastSweep.reason?('，未执行：'+lastSweep.reason):'')"></span>
+            <span x-show="lastQueue"
+                  x-text="'上次队列 '+(lastQueue?taskAt(lastQueue.at):'')+
+                          '：执行 '+(lastQueue?lastQueue.steps:0)+
+                          ' 项，领奖 '+(lastQueue?lastQueue.claimed:0)+' 项'"></span>
+          </div>
+
+          <!-- 逐项执行结果（一键完成全部后展示）：限高滚动小框，避免整列表平铺撑高页面 -->
+          <div x-show="(tasksResults||[]).length" class="result-box-wrap">
+            <div class="muted-xs" style="margin-bottom:6px">
+              最近一轮执行结果
+              <span x-text="'（'+(tasksResults||[]).length+' 项）'"></span>
+            </div>
+            <div class="result-box">
+              <template x-for="(r,i) in (tasksResults||[])" :key="i">
+                <div class="row result-row">
+                  <span class="badge" :class="r.status==='done'?'badge-ok':(r.status==='error'?'badge-err':'badge-muted')"
+                        x-text="r.task_code"></span>
+                  <span class="muted-xs" style="flex:1" x-text="r.message||''"></span>
+                  <span class="muted-xs" x-show="r.progress_after" x-text="r.progress_after"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
       </section>
 

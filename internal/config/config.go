@@ -63,6 +63,10 @@ type Config struct {
 	AutoGrowth           bool   `json:"auto_growth"`          // 成长任务总开关（活跃地图/连登奖励/猫猫旅行）
 	GrowthReportCron     string `json:"growth_report_cron"`   // 上报+奖励链 cron（6 段含秒）
 	GrowthTravelCron     string `json:"growth_travel_cron"`   // 旅行巡检 cron
+	GrowthQueueCron      string `json:"growth_queue_cron"`    // 任务队列（扫描待办并逐个执行）cron
+	BlackcatCron         string `json:"blackcat_cron"`        // 夜猫子 cron（23:00–08:00 窗口内补足）
+	TaskSweepEnabled     bool   `json:"task_sweep_enabled"`   // 周期补领清扫开关（默认 true）
+	TaskSweepMinutes     int    `json:"task_sweep_minutes"`   // 补领清扫间隔（分钟，默认 15）
 	GrowthReportCount    int    `json:"growth_report_count"`  // 每日上报条数（1-10；领养前置 chat_5 需 5）
 	GrowthReportJitter   int    `json:"growth_report_jitter"` // 每日上报条数随机波动 ±N（0=固定不波动，上限 GrowthReportJitterMax）
 	ResourceCacheSeconds int    `json:"resource_cache_seconds"`
@@ -79,6 +83,13 @@ const (
 	DefaultCheckinCron      = "0 0 9 * * *"
 	DefaultGrowthReportCron = "0 0 10 * * *"
 	DefaultGrowthTravelCron = "0 0 9,21 * * *"
+	DefaultGrowthQueueCron  = "0 0 1 * * *"
+	DefaultBlackcatCron     = "0 0 23 * * *"
+	// DefaultTaskSweepMinutes 补领清扫默认间隔（分钟）。分钟级是刻意的：这条链路只
+	// accept/claim（纯 RPC），代价低；而「达标后无人领奖」会让积分永远卡在半路。
+	DefaultTaskSweepMinutes = 15
+	// TaskSweepMinutesMax 清扫间隔上限（再长就失去「及时领掉」的意义）。
+	TaskSweepMinutesMax = 24 * 60
 )
 
 func defaults() Config {
@@ -94,6 +105,10 @@ func defaults() Config {
 		AutoGrowth:           false,
 		GrowthReportCron:     DefaultGrowthReportCron,
 		GrowthTravelCron:     DefaultGrowthTravelCron,
+		GrowthQueueCron:      DefaultGrowthQueueCron,
+		BlackcatCron:         DefaultBlackcatCron,
+		TaskSweepEnabled:     true,
+		TaskSweepMinutes:     DefaultTaskSweepMinutes,
 		GrowthReportCount:    10,
 		GrowthReportJitter:   0,
 		ResourceCacheSeconds: 300,
@@ -129,6 +144,18 @@ func (c *Config) Normalize() {
 	}
 	if strings.TrimSpace(c.GrowthTravelCron) == "" {
 		c.GrowthTravelCron = d.GrowthTravelCron
+	}
+	if strings.TrimSpace(c.GrowthQueueCron) == "" {
+		c.GrowthQueueCron = d.GrowthQueueCron
+	}
+	if strings.TrimSpace(c.BlackcatCron) == "" {
+		c.BlackcatCron = d.BlackcatCron
+	}
+	if c.TaskSweepMinutes <= 0 {
+		c.TaskSweepMinutes = d.TaskSweepMinutes
+	}
+	if c.TaskSweepMinutes > TaskSweepMinutesMax {
+		c.TaskSweepMinutes = TaskSweepMinutesMax
 	}
 	if c.GrowthReportCount <= 0 {
 		c.GrowthReportCount = 1
@@ -292,6 +319,10 @@ func Load(dataDir string) (*Manager, error) {
 	envBool("BUDDY2API_AUTO_GROWTH", "auto_growth", &cfg.AutoGrowth)
 	envStr("BUDDY2API_GROWTH_REPORT_CRON", "growth_report_cron", &cfg.GrowthReportCron)
 	envStr("BUDDY2API_GROWTH_TRAVEL_CRON", "growth_travel_cron", &cfg.GrowthTravelCron)
+	envStr("BUDDY2API_GROWTH_QUEUE_CRON", "growth_queue_cron", &cfg.GrowthQueueCron)
+	envStr("BUDDY2API_BLACKCAT_CRON", "blackcat_cron", &cfg.BlackcatCron)
+	envBool("BUDDY2API_TASK_SWEEP_ENABLED", "task_sweep_enabled", &cfg.TaskSweepEnabled)
+	envInt("BUDDY2API_TASK_SWEEP_MINUTES", "task_sweep_minutes", &cfg.TaskSweepMinutes)
 	envInt("BUDDY2API_GROWTH_REPORT_COUNT", "growth_report_count", &cfg.GrowthReportCount)
 	envInt("BUDDY2API_GROWTH_REPORT_JITTER", "growth_report_jitter", &cfg.GrowthReportJitter)
 	envInt("BUDDY2API_RESOURCE_CACHE_SECONDS", "resource_cache_seconds", &cfg.ResourceCacheSeconds)
@@ -400,6 +431,18 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["growth_travel_cron"] {
 		nc.GrowthTravelCron = m.cfg.GrowthTravelCron
+	}
+	if m.envSets["growth_queue_cron"] {
+		nc.GrowthQueueCron = m.cfg.GrowthQueueCron
+	}
+	if m.envSets["blackcat_cron"] {
+		nc.BlackcatCron = m.cfg.BlackcatCron
+	}
+	if m.envSets["task_sweep_enabled"] {
+		nc.TaskSweepEnabled = m.cfg.TaskSweepEnabled
+	}
+	if m.envSets["task_sweep_minutes"] {
+		nc.TaskSweepMinutes = m.cfg.TaskSweepMinutes
 	}
 	if m.envSets["growth_report_count"] {
 		nc.GrowthReportCount = m.cfg.GrowthReportCount

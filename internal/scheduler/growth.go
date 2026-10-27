@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"buddy2api-go/internal/auth"
@@ -29,6 +30,8 @@ const (
 	growthCatchupWindowEndMin = 22 * 60
 	// growthReportCountMax 每日上报条数上限（防风控）。
 	growthReportCountMax = config.GrowthReportCountMax
+	// growthLotteryMaxDraws 单轮抽奖上限（异常余额保护：避免一次跑上千次写请求）。
+	growthLotteryMaxDraws = 50
 )
 
 // growthReportGap 同账号内 N 条上报间隔：5 连发模拟同一会话多轮对话，
@@ -67,6 +70,7 @@ type growthClient interface {
 	TravelClaim(recordID int64) (int64, error)
 	ClaimGift() (int64, error)
 	ClaimCompensation() (int64, error)
+	GetCompensationStatus() (upstream.CompensationStatus, error)
 }
 
 // ── 结果类型 ──────────────────────────────────────────────────────────────────
@@ -425,22 +429,54 @@ func (s *Scheduler) stepAdopt(res *GrowthChainResult, force bool) bool {
 	}
 }
 
-// stepBonus 礼包/补偿领取（幂等，有则领）：两者都静默尝试，只有实际到账才记步
-// （业务错误是常态——绝大多数号早已领过，无法与真错误区分）。
+// stepBonus 礼包 + 补偿领取（幂等，有则领）。
+// 两者都静默尝试，只有实际到账才记步（业务错误是常态——绝大多数号早已领过）。
+//
+// 补偿额外做「先查状态 → 待领才领」：补偿带截止日，旧写法把「没有补偿」「已经领过」
+// 与「真的领取失败」压成同一形态，一旦签到停摆就会静默过期。现在查询失败会显式告警。
 func (s *Scheduler) stepBonus(res *GrowthChainResult) {
-	detail := ""
+	var detail []string
 	if credit, err := s.growth.ClaimGift(); err == nil && credit > 0 {
-		detail = fmt.Sprintf("礼包 +%d 积分", credit)
+		detail = append(detail, fmt.Sprintf("礼包 +%d 积分", credit))
 	}
-	if credit, err := s.growth.ClaimCompensation(); err == nil && credit > 0 {
-		if detail != "" {
-			detail += " / "
-		}
-		detail += fmt.Sprintf("补偿 +%d 积分", credit)
+	s.claimCompensationQuiet(res, &detail)
+	if len(detail) > 0 {
+		res.add("bonus", "ok", strings.Join(detail, " / "))
 	}
-	if detail != "" {
-		res.add("bonus", "ok", detail)
+}
+
+// claimCompensationQuiet 补偿领取的可观测化版本：先查状态，待领才领。
+//   - 查询失败 → warn（不把“查不到”当成“没有”）
+//   - 无活动 / 已领 / 零额度 → 静默（正常态，不刷日志）
+//   - 待领但领取失败 → fail（带截止日，必须让人看见）
+func (s *Scheduler) claimCompensationQuiet(res *GrowthChainResult, detail *[]string) {
+	st, err := s.growth.GetCompensationStatus()
+	if err != nil {
+		res.add("compensation", "warn", "补偿状态查询失败: "+err.Error())
+		return
 	}
+	if !st.Pending() {
+		return // 无活动 / 已领 / 零额度：正常态
+	}
+	credit, cerr := s.growth.ClaimCompensation()
+	if cerr != nil {
+		msg := "补偿待领但领取失败（截止 " + orDefaultStr(st.EndTime, "未知") + "）: " + cerr.Error()
+		res.add("compensation", "fail", msg)
+		return
+	}
+	if credit > 0 {
+		*detail = append(*detail, fmt.Sprintf("补偿 +%d 积分", credit))
+	} else {
+		*detail = append(*detail, "补偿已领取")
+	}
+}
+
+// orDefaultStr 空字符串回落默认值。
+func orDefaultStr(s, def string) string {
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	return s
 }
 
 // stepRewardChain 补签 + 兑换 + 抽奖（每日一轮）：
@@ -466,23 +502,33 @@ func (s *Scheduler) stepRewardChain(res *GrowthChainResult, pInfo **upstream.Gro
 			*pInfo = info2
 		}
 	}
-	tier := (*pInfo).EligibleTier()
-	if tier == "" {
+	tiers := (*pInfo).EligibleTiers()
+	if len(tiers) == 0 {
 		// 无可领档位：正常态（很多天没到 7d），不 warn；本轮不抽奖（chances 来自兑换）
 		res.add("redeem", "skip", "无可领档位（未达标或已领）")
 		s.growthState.rewardDone = true
 		_ = s.st.SetCache(growthCacheTable, growthKeyRewardDay, res.Day)
 		return
 	}
-	r, err := s.growth.GrowthRedeem(tier, "")
-	switch {
-	case err == nil:
-		res.add("redeem", "ok", fmt.Sprintf("兑换 %s：+%d 积分 +%d 能量 +%d 补签卡 +%d 抽奖",
-			tier, r.CreditGranted, r.EnergyGranted, r.CardsGranted, r.ChancesGranted))
-	case upstream.IsRedeemAlreadyClaimed(err) || upstream.IsRedeemNotEnoughDays(err):
-		res.add("redeem", "skip", "该档已领取或天数不足")
-	default:
-		res.add("redeem", "fail", "兑换失败: "+err.Error())
+	// 遍历**所有**已解锁未领的档位（不只最高档）：仅领最高档会让 7d/14d 的奖励
+	// 停留在未领（服务端不会因 28d 已领而自动补发低档）。
+	var granted []string
+	for _, tier := range tiers {
+		r, err := s.growth.GrowthRedeem(tier, "")
+		switch {
+		case err == nil:
+			granted = append(granted, fmt.Sprintf("%s(+%dc +%de 卡×%d 抽奖×%d)",
+				tier, r.CreditGranted, r.EnergyGranted, r.CardsGranted, r.ChancesGranted))
+		case upstream.IsRedeemAlreadyClaimed(err) || upstream.IsRedeemNotEnoughDays(err):
+			continue // 该档已领 / 天数不足：正常态
+		default:
+			res.add("redeem", "fail", "兑换 "+tier+" 失败: "+err.Error())
+		}
+	}
+	if len(granted) > 0 {
+		res.add("redeem", "ok", "兑换 "+strings.Join(granted, " / "))
+	} else {
+		res.add("redeem", "skip", "已解锁档位已全部领取")
 	}
 	s.growthState.rewardDone = true
 	_ = s.st.SetCache(growthCacheTable, growthKeyRewardDay, res.Day)
@@ -513,8 +559,9 @@ func (s *Scheduler) makeupYesterday(res *GrowthChainResult, info *upstream.Growt
 	return true
 }
 
-// stepLottery 抽奖一次（自动链保守消耗：每日至多 1 次）。
+// stepLottery 抽奖（自动链：把 chances 抽完）。
 // chances 先查后抽；无次数/未开启是正常态 skip；中实物仅展示奖名（不代填地址）。
+// 抽完而非每日 1 次：抽奖次数只能从兑换获得，留着不生息；兑换后同一天就必须抽掉。
 func (s *Scheduler) stepLottery(res *GrowthChainResult) {
 	chances, err := s.growth.GrowthLotteryChances()
 	if err != nil {
@@ -525,22 +572,41 @@ func (s *Scheduler) stepLottery(res *GrowthChainResult) {
 		res.add("lottery", "skip", "无抽奖次数")
 		return
 	}
-	draw, err := s.growth.GrowthLotteryDraw("")
-	switch {
-	case err == nil:
-		detail := "抽中 " + draw.PrizeName
-		switch draw.PrizeType {
-		case "credit":
-			detail += fmt.Sprintf("（+%d 积分）", draw.CreditAmount)
-		case "physical":
-			detail += "（实物，请在官方渠道填写地址）"
-		}
-		res.add("lottery", "ok", detail)
-	case upstream.IsLotteryNoChance(err) || upstream.IsLotteryDisabled(err):
-		res.add("lottery", "skip", "无抽奖次数或未开启")
-	default:
-		res.add("lottery", "fail", "抽奖失败: "+err.Error())
+	if chances > growthLotteryMaxDraws {
+		chances = growthLotteryMaxDraws // 上限保护：避免异常余额导致一次跑上千次写请求
 	}
+	var wins []string
+	var creditTotal int64
+	for i := 0; i < chances; i++ {
+		draw, err := s.growth.GrowthLotteryDraw("")
+		switch {
+		case err == nil:
+			switch draw.PrizeType {
+			case "credit":
+				creditTotal += int64(draw.CreditAmount)
+				wins = append(wins, fmt.Sprintf("%s(+%d)", draw.PrizeName, draw.CreditAmount))
+			case "physical":
+				wins = append(wins, draw.PrizeName+"(实物，请在官方渠道填写地址)")
+			default:
+				wins = append(wins, draw.PrizeName)
+			}
+		case upstream.IsLotteryNoChance(err) || upstream.IsLotteryDisabled(err):
+			// 次数用尽 / 活动未开启：结束本轮（已抽到的结果照常汇报）
+			i = chances
+		default:
+			res.add("lottery", "fail", "抽奖失败: "+err.Error())
+			i = chances
+		}
+	}
+	if len(wins) == 0 {
+		res.add("lottery", "skip", "无抽奖次数或未开启")
+		return
+	}
+	detail := fmt.Sprintf("抽奖 %d 次：%s", len(wins), strings.Join(wins, " / "))
+	if creditTotal > 0 {
+		detail += fmt.Sprintf("（共 +%d 积分）", creditTotal)
+	}
+	res.add("lottery", "ok", detail)
 }
 
 // travelOutcome 旅行单趟结果（内部传递用）。

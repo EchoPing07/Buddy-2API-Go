@@ -194,7 +194,149 @@ PAGE('growth', {
     return '自动任务：上报 '+s.growth_report_cron+' · 旅行 '+s.growth_travel_cron+' · '+this.growthCountText();
   },
 
+    /* ── 任务中心（成长任务列表 / 一键完成 / 补领清扫 / 补偿） ── */
+  tasks: [], tasksLoaded:false, tasksOk:true, tasksErr:'',
+  tasksBusy:false, tasksRunning:false, tasksResults:[],
+  lastSweep:null, lastQueue:null,
+  comp:{}, compLoaded:false,
+
+  // 待完成：未领、未锁、有自动化动作
+  tasksPendingList(){
+    return (this.tasks||[]).filter(t=>!t.claimed && !t.locked && t.auto);
+  },
+  // 排序：可领取 → 待完成 → 已领 → 锁定（同组内保持服务端顺序）
+  sortedTasks(){
+    const rank = t => t.locked?3:(t.claimed?2:(t.claimable?0:1));
+    return (this.tasks||[]).slice().sort((a,b)=>rank(a)-rank(b));
+  },
+  taskIsDone(t){ return !!(t.target>0 && t.current>=t.target); },
+  // 落库时间戳 → 本地时间串（sweep/queue 结果里带 at 秒级 unix）
+  taskAt(ts){
+    if(!ts) return '';
+    const d = new Date(ts*1000);
+    const p = n => String(n).padStart(2,'0');
+    return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+  },
+  taskProgressText(t){
+    if(t.target>0) return t.current+'/'+t.target;
+    return t.claimed?'已领取':(t.accept_status||'—');
+  },
+  taskRewardText(t){
+    const parts=[];
+    if(t.credit) parts.push('+'+t.credit+'分');
+    if(t.energy) parts.push('+'+t.energy+'能');
+    return parts.length?parts.join(' '):'—';
+  },
+  taskStatusText(t){
+    if(t.claimed) return '已领取';
+    if(t.locked) return '未解锁';
+    if(t.claimable) return '可领取';
+    if(t.accept_status==='accepted') return '进行中';
+    return '待开始';
+  },
+  taskBadgeClass(t){
+    if(t.claimed) return 'badge-muted';
+    if(t.locked) return 'badge-muted';
+    if(t.claimable) return 'badge-ok';
+    if(t.accept_status==='accepted') return 'badge-warn';
+    return 'badge-muted';
+  },
+
+  async loadTasks(){
+    try{
+      const r = await this.api('/admin/tasks');
+      if(r.ok === false){ this.tasksOk=false; this.tasksErr=r.detail||r.reason||''; this.tasksLoaded=true; return; }
+      this.tasks = r.tasks||[];
+      this.lastSweep = r.last_sweep||null;
+      this.lastQueue = r.last_queue||null;
+      this.tasksOk = true; this.tasksErr='';
+    }catch(e){
+      this.tasksOk=false; this.tasksErr=e.message;
+    }finally{ this.tasksLoaded = true; }
+  },
+  async loadCompensation(){
+    try{
+      const r = await this.api('/admin/compensation');
+      this.comp = (r.ok===false) ? {ok:false} : r;
+    }catch(e){ this.comp = {ok:false}; }
+    finally{ this.compLoaded = true; }
+  },
+  loadAll(force){
+    this.loadGrowth(force); this.loadCheckin(); this.loadTasks(); this.loadCompensation(); this.loadSettings();
+  },
+
+  async _taskAction(path, body){
+    if(this.tasksBusy) return null;
+    this.tasksBusy = true;
+    try{
+      const r = await this.api(path,{method:'POST', body:JSON.stringify(body||{})});
+      if(r.ok === false){
+        this.toast(r.detail || (r.reason==='busy'?'已有任务动作在执行，请稍候':(r.reason||'执行失败')),'err');
+        return null;
+      }
+      return r;
+    }catch(e){ this.toast(e.message,'err'); return null; }
+    finally{ this.tasksBusy = false; this.loadTasks(); this.loadGrowth(true); }
+  },
+
+  runTaskAuto(code){
+    const t = (this.tasks||[]).find(x=>x.task_code===code)||{};
+    this.askConfirm('一键完成 '+code,
+      '将执行「'+(t.title||code)+'」的行为链，完成后自动领奖。确认执行？',
+      async ()=>{
+        if(this.tasksBusy) return;
+        this.tasksBusy = true;
+        try{
+          const r = await this.api('/admin/tasks/auto',{method:'POST', body:JSON.stringify({task_code:code})});
+          const res = (r.result)||{};
+          this.toast(res.message||r.detail||'已执行', res.status==='error'?'err':'ok');
+        }catch(e){ this.toast(e.message,'err'); }
+        finally{ this.tasksBusy = false; this.loadTasks(); this.loadGrowth(true); }
+      });
+  },
+  async runTaskClaim(code){
+    const r = await this._taskAction('/admin/tasks/claim',{task_code:code});
+    if(r){
+      if(r.already_claimed) this.toast(r.detail||'该奖励此前已领取');
+      else this.toast('已领取 +'+(r.credit||0)+' 分 +'+(r.energy||0)+' 能','ok');
+    }
+  },
+  async runTaskAccept(codes){
+    const r = await this._taskAction('/admin/tasks/accept',{task_codes:codes});
+    if(r) this.toast('已接受 '+(r.accepted||0)+' 个任务','ok');
+  },
+  runTasksAutoAll(){
+    this.askConfirm('一键完成全部',
+      '将依次执行全部支持一键完成的任务（部分含真实对话，约需数分钟）。期间不能重复触发。确认？',
+      async ()=>{
+        if(this.tasksRunning) return;
+        this.tasksRunning = true;
+        try{
+          const r = await this.api('/admin/tasks/auto_all',{method:'POST'});
+          if(r.ok === false){ this.toast(r.detail||r.reason||'执行失败','err'); return; }
+          this.tasksResults = r.results||[];
+          this.toast('执行完成：领奖 '+(r.claimed||0)+' 项，+'+(r.credit||0)+' 分 +'+(r.energy||0)+' 能','ok');
+        }catch(e){ this.toast(e.message,'err'); }
+        finally{
+          this.tasksRunning = false;
+          this.loadTasks(); this.loadGrowth(true); this.loadCompensation();
+        }
+      });
+  },
+  async runTasksSweep(){
+    const r = await this._taskAction('/admin/tasks/sweep',{});
+    if(r){
+      const s = r.stats||{};
+      if(s.reason) this.toast('未执行：'+(s.reason==='busy'?'已有任务动作在执行':s.reason));
+      else this.toast('清扫完成：接受 '+s.accepted+' 项，领奖 '+s.claimed+' 项（+'+(s.credits||0)+' 分）','ok');
+    }
+  },
+  async runCompensationClaim(){
+    const r = await this._taskAction('/admin/compensation/claim',{});
+    if(r){ this.toast(r.detail||'已处理', r.claimed?'ok':''); this.loadCompensation(); }
+  },
+
   /* ── 进场：本页所需数据（realtime：进入即刷新，见 app.js enter()） ── */
   realtime:true,
-  load(){ this.loadGrowth(false); this.loadCheckin(); this.loadSettings(); },
+  load(){ this.loadAll(false); },
 });
