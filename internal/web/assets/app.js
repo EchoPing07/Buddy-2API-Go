@@ -253,8 +253,26 @@ function appShell(){
         onOk:()=>{ this.confirmBox.open=false; fn(); },
       };
     },
+    /* 全站 8 个复制按钮共用此实现。navigator.clipboard 只在安全上下文（HTTPS / localhost /
+       127.0.0.1）存在，而本项目主推局域网 http://<IP>:10082 —— 那里它是 undefined，直接调用
+       抛 TypeError 且无 catch，用户看不到任何反馈（点了没反应）。故保留 execCommand 降级。 */
     copy(text){
-      navigator.clipboard.writeText(text).then(()=>this.toast('已复制到剪贴板','ok'));
+      const s = text == null ? '' : String(text);
+      if(!s){ this.toast('没有可复制的内容','err'); return; }
+      const fallback = ()=>{               // 不安全上下文 / 权限被拒时的兜底：临时 textarea + 选中复制
+        const ta = document.createElement('textarea');
+        ta.value = s;
+        ta.setAttribute('readonly','');    // 避免移动端弹键盘
+        ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+        document.body.appendChild(ta);
+        ta.select();
+        let ok = false;
+        try{ ok = document.execCommand('copy'); }catch(e){ ok = false; }
+        document.body.removeChild(ta);     // 无论成败都要摘除，否则焦点被抢走
+        this.toast(ok ? '已复制到剪贴板' : '复制失败，请手动选中复制', ok ? 'ok' : 'err');
+      };
+      if(!navigator.clipboard || !navigator.clipboard.writeText){ fallback(); return; }
+      navigator.clipboard.writeText(s).then(()=>this.toast('已复制到剪贴板','ok')).catch(fallback);
     },
     fmt(n){ return (n||0).toLocaleString(); },
     compact(n){
