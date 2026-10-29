@@ -591,7 +591,7 @@ Object.keys(PAGES).forEach(function (k) {
   const orig = PAGES[k].load;
   PAGES[k].load = function () { loads.push('enter:' + k); if (orig) return orig.call(this); };
 });
-['loadStats', 'loadModels', 'loadKeys', 'loadAccount', 'loadGrowth', 'loadCheckin',
+['loadStats', 'loadModels', 'loadKeys', 'loadAccount', 'loadAccounts', 'loadGrowth', 'loadCheckin',
  'loadSettings', 'loadResources', 'loadLogs', 'loadTasks', 'loadCompensation'].forEach(function (m) {
   // 记参数：loadResources/loadGrowth 的 force 标志要被断言（换账号必须强刷）
   if (typeof inst[m] === 'function') {
@@ -753,17 +753,40 @@ function accountDataLoaded(where, withModels) {
   if (!withModels && count('loadModels') !== 0) fail(where + ' 不应拉模型列表（跟 region 走，不跟账号走）');
 }
 
-// 10a) 导入凭证
+// 10a) 导入并启用（activate=true）：换账号 → 强刷账号口径数据，且不动 entered
 loads.length = 0;
 inst.entered = { resources: Date.now() - 60 * 1000 };  // 已进过余额页（keep-alive）
-global.fetch = async function () {
+let importBodies = [];
+global.fetch = async function (url, opts) {
+  if (String(url).indexOf('/admin/account/import') === 0) importBodies.push(JSON.parse(opts.body));
   return { ok: true, status: 200, json: async function () { return { ok: true, uid: 'u2', nickname: '新账号' }; } };
 };
 inst.importForm = { access_token: jwt, refresh_token: '', domain: '', filename: '' };
-await inst.importAccount();
+await inst.importAccount(true);
 await new Promise(function (r) { setTimeout(r, 0); });   // importAccount 未 await 内层 busy()，等一轮宏任务
-accountDataLoaded('导入凭证后', false);
+accountDataLoaded('导入并启用后', false);
+if (importBodies.length !== 1 || importBodies[0].activate !== true) {
+  fail('导入并启用必须带 activate=true: ' + JSON.stringify(importBodies));
+}
+if (inst.importModal) fail('导入成功后应关闭弹窗');
 if (Object.keys(inst.entered).length !== 1) fail('换账号是原地强刷，不应动 entered（重进页面会多拉一次）');
+
+// 10a-2) 仅导入（activate=false）：账号未变，只刷账号档案列表，不得强刷账号口径数据
+// （否则仅仅存一个备用账号也会把当前账号的余额/签到全清一遍）。
+loads.length = 0;
+importBodies = [];
+inst.entered = { resources: Date.now() - 60 * 1000 };
+inst.importForm = { access_token: jwt, refresh_token: '', domain: '', filename: '' };
+await inst.importAccount(false);
+await new Promise(function (r) { setTimeout(r, 0); });
+if (importBodies.length !== 1 || importBodies[0].activate !== false) {
+  fail('仅导入必须带 activate=false: ' + JSON.stringify(importBodies));
+}
+if (count('loadAccounts') !== 1) fail('仅导入后必须刷新账号列表（否则用户看不到导入结果）: ' + JSON.stringify(loads));
+['loadResources(true)', 'loadResources(false)', 'loadGrowth(true)', 'loadTasks', 'loadCompensation', 'loadAccount', 'loadHealth']
+  .forEach(function (m) { if (count(m) !== 0) fail('仅导入不得强刷「' + m + '」: ' + JSON.stringify(loads)); });
+if (inst.importModal) fail('仅导入成功后应关闭弹窗');
+if (Object.keys(inst.entered).length !== 1) fail('仅导入不应动 entered');
 
 // 10b) OAuth 登录（同一体验，另加模型列表）
 loads.length = 0;

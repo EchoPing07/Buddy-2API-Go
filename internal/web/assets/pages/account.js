@@ -70,21 +70,33 @@ PAGE('account', {
     reader.readAsText(file);
     ev.target.value = '';
   },
-  async importAccount(){
+  async importAccount(activate){
     const f = this.importForm;
     if(!f.access_token || !f.access_token.trim()){ this.toast('access_token 不能为空','err'); return; }
+    // 两个按钮共用全局 loading（会同时置灰），但只有被点的那一个转圈
+    this.importActivate = !!activate;
     this.busy(async()=>{
       const r = await this.api('/admin/account/import',{method:'POST',body:JSON.stringify({
         access_token:f.access_token.trim(),
         refresh_token:f.refresh_token.trim(),
         domain:f.domain.trim(),
+        activate:!!activate,
       })});
-      this.toast('导入成功：'+(r.nickname||r.uid||'已保存'),'ok');
       this.importModal = false;
       this.importForm = {access_token:'',refresh_token:'',domain:'',filename:''};
-      // 换账号：余额/签到/任务重拉（后端已清缓存，但前端 keep-alive，旧数据会残留）
-      this.refreshAccountData();
-      this.loadAccounts();   // 导入的账号已入档，列表立即出现
+      // 账号列表必须先刷：仅导入时它是用户能看到的唯一反馈
+      this.loadAccounts();
+      if(activate){
+        this.toast('已导入并启用：'+(r.nickname||r.uid||'已保存'),'ok');
+        // 换账号：余额/签到/任务重拉（后端已清缓存，但前端 keep-alive，旧数据会残留）
+        this.refreshAccountData();
+      }else{
+        const who = r.nickname||r.uid||'已存档';
+        // 无活动账号时「仅导入」不会让应用能用，提示去列表启用（不默默替用户切账号）
+        this.toast('已导入：'+who+(this.account.logged_in
+          ? '，可在「账号切换」中启用'
+          : '（当前无活动账号，请在下方列表点「切换」启用）'),'ok');
+      }
     })();
   },
 

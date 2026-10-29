@@ -10,12 +10,14 @@
 
 ### ✨ 新功能
 
+- **导入凭证拆为「仅导入」与「导入并启用」**：`POST /admin/account/import` 新增 `activate` 字段。默认（不带该字段）为「仅导入」：只把凭证写入账号档案 `data/accounts/<id>.json`，**不改动当前活动账号 `token.json`**，也不再清账号口径缓存或复位调度器日内状态 —— 一次导入多个备用账号时，当前账号的余额 / 签到 / 「今日已上报」都不受影响；弹窗内提示后可到「账号切换」卡片点「切换」启用。带 `"activate":true` 则为「导入并启用」，行为与此前一致（写凭证 → 入档 → 真换账号才 `invalidateAccountCaches()`）。导入弹窗底部因此由单一「导入」改为「仅导入」+「导入并启用」两个按钮（回车默认走「仅导入」）；仅导入时前端只 `loadAccounts()` 刷新档案列表，不触发 `refreshAccountData()`。仅导入路径下档案写入失败会直接回 500（档案是唯一产物），而登录 / 启用路径的入档失败仍只留痕（凭证已落盘）。仅导入的凭证「端点不匹配」提示照常出现在列表里。
 - **模型列表 chip 点击即复制模型 ID**：总览页「模型列表」的每个模型标签改为可点按钮，点一下把模型 `id` 复制到剪贴板（客户端接入填的是 id 而非显示名，同名模型消歧后的 `disp` 仍作展示），复用全站 `copy()` 实现（含 HTTP 局域网下的 `execCommand` 降级），并补 hover / `:active` / `:focus-visible` 反馈与 `aria-label`。
 - **OpenAI 兼容嵌入端点 `POST /v1/embeddings`（实验特性，默认关闭）**：新增侧边栏「实验」页，嵌入端点开关与调用示例集中于此（开关即时落库，走 `GET/PUT /admin/experiments`；env `BUDDY2API_EMBEDDINGS_ENABLED` 可强制覆盖）。关闭时端点返回 403 `embeddings_disabled` 且 `GET /v1/models` 不列出嵌入模型；开启后对接上游 `/v2/embeddings`（与 chat 模型注册表相互独立），`input` 支持字符串 / 字符串数组（token id 数组不支持，明确报 400），响应为标准 OpenAI 形状（`data[i]` 补 `index`，附 `usage`）。模型名透传上游，实测注册表仅 `bge-m3`（1024 维）可用：`/v3/config` 中的 `nes-gf` 等条目不属于嵌入注册表，调用将得到 404 `model_not_found`（附已知模型提示）。凭证链路与 chat 一致（token 过期预刷新 + 401 刷新重试一次）。
 - **多账号存档与手动切换**：账号页新增「账号切换」卡片。OAuth 登录 / 凭证导入成功后自动存档到 `data/accounts/<id>.json`（0600），列表显示昵称、uid、端点、有效期与当前标记，可一键切换或移除（当前账号不可移除）。活动账号始终只有 `data/token.json` 一份：切换 = 归档当前 → 用目标档案覆盖 → `invalidateAccountCaches()`，upstream / proxy / scheduler 无需感知；不含轮询、负载均衡或故障转移。切到同一账号不失效缓存（与 `accountSwitched` 同口径），避免当天活跃上报翻倍。新增 `GET /admin/accounts`、`POST /admin/accounts/{uid}/activate`、`DELETE /admin/accounts/{uid}`，列表只返回元信息、不含任何凭证。
 
 ### 🔧 工程与文档
 
+- 新增 `TestAccountImportOnlyKeepsActiveCredential`（仅导入：活动凭证不变、档案出现、缓存与日内状态均不碰）与 `TestAccountImportActivateSwitches`（导入并启用：换凭证 + 清缓存 + `ResetAccountState`→`Reconfigure`）；原有换账号用例改用 `activate:true`。前端行为用例（`TestFrontendInitialLoad` 第 10 组）拆为 10a / 10a-2，分别断言两个按钮发出的 `activate` 值与是否强刷账号口径数据。
 - 新增 `internal/upstream/embeddings_test.go`（请求形状 / 404 模型缺失 / 401 刷新重试 / 条数不符防御 / 200 包错误码防御）、`internal/proxy/embeddings_test.go`（input 归一、响应契约、实验开关门控 403 与 `/v1/models` 条件追加）与 `internal/admin/experiments_test.go`（默认关闭、开关节奏、缺字段 400、env 锁定不生效）；`RefreshFn` 的请求主机改经 `authBase` 变量（生产行为不变），供单测以 httptest 替换。README 端点表 / 使用示例 / env 表补 `/v1/embeddings` 与实验页口径；web_test 页面数断言随「实验」页 7→8。
 - 新增 `internal/auth/accounts_test.go`（存档 / 列表 / 读取 / 删除 / 非法 UID 归一）与 `internal/admin/accounts_test.go`（切换生效、旧账号归档、缓存失效、同账号不清缓存）；README / DEVELOPMENT 同步「单一活动账号 + 手动切换」的定位口径。
 

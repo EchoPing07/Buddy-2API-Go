@@ -106,9 +106,9 @@
 <!-- ═══ 导入凭证弹窗 ═══ -->
 <template x-if="importModal">
   <div class="overlay" @click.self="importModal=false">
-    <form class="modal" style="max-width:560px" @submit.prevent="importAccount()">
+    <form class="modal" style="max-width:560px" @submit.prevent="importAccount(false)">
       <div class="modal-title">导入凭证</div>
-      <p class="modal-msg">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。</p>
+      <p class="modal-msg">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。<br>「仅导入」只存入账号列表，当前账号不变；「导入并启用」会立即切换为当前账号。</p>
       <div class="form-row">
         <label class="label">从文件导入</label>
         <div class="row">
@@ -127,9 +127,13 @@
       </div>
       <div class="modal-foot">
         <button type="button" class="btn btn-secondary btn-sm" @click="importModal=false">取消</button>
-        <button type="submit" class="btn btn-sm" :disabled="loading">
-          <span class="spin" x-show="loading"></span>
-          <span x-show="!loading">导入</span>
+        <button type="button" class="btn btn-secondary btn-sm" @click="importAccount(false)" :disabled="loading">
+          <span class="spin" x-show="loading && !importActivate"></span>
+          <span x-show="!loading || importActivate">仅导入</span>
+        </button>
+        <button type="button" class="btn btn-sm" @click="importAccount(true)" :disabled="loading">
+          <span class="spin" x-show="loading && importActivate"></span>
+          <span x-show="!loading || !importActivate">导入并启用</span>
         </button>
       </div>
     </form>

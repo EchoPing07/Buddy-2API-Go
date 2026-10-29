@@ -384,6 +384,10 @@ func (h *Handler) accountExport(w http.ResponseWriter, r *http.Request) {
 }
 
 // accountImport 导入账号凭证，必须含 access_token（合法 JWT），其余可选。
+//
+// 默认「仅导入」：只把凭证存进账号档案（data/accounts/<id>.json），不动活动账号 token.json ——
+// 用户可一次导入多个账号，再在「账号切换」里挑一个启用。activate=true 时才写 token.json
+// （立即启用），与切换档案同口径：清账号口径缓存 + 复位调度器日内状态。
 func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AccessToken  string `json:"access_token"`
@@ -392,6 +396,7 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt    int64  `json:"expires_at"`
 		Domain       string `json:"domain"`
 		Nickname     string `json:"nickname"`
+		Activate     bool   `json:"activate"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -420,6 +425,22 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 	if t.Domain == "" {
 		t.Domain = config.EndpointOf(h.cfg.Get().Region).Domain
 	}
+	if !req.Activate {
+		// 仅导入：唯一产出就是这份档案，所以存档失败必须报错（启用路径可以只留痕，
+		// 那里 token.json 已经落地，用户仍有可用凭证）。
+		if err := h.accountBook().Save(t); err != nil {
+			jsonErr(w, http.StatusInternalServerError, "保存账号档案失败: "+err.Error())
+			return
+		}
+		jsonWrite(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"uid":      t.UID,
+			"nickname": t.Nickname,
+			"domain":   t.Domain,
+			"activate": false,
+		})
+		return
+	}
 	prev := h.toks.Get()
 	if err := h.toks.Save(t); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
@@ -435,6 +456,7 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		"uid":      t.UID,
 		"nickname": t.Nickname,
 		"domain":   t.Domain,
+		"activate": true,
 	})
 }
 

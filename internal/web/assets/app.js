@@ -85,6 +85,7 @@ function appShell(){
     labs:{embeddings_enabled:false},  // 实验特性开关（见 pages/labs.js）
     models:{models:[],ids:[],state:null,loading:false},
     importModal:false, importForm:{access_token:'',refresh_token:'',domain:'',filename:''},
+    importActivate:false,      // 导入弹窗当前在跑的是哪一个动作（"仅导入"/"导入并启用"），仅用于按钮 loading 态
     confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},
     oauth:{state:'',auth_url:'',poll_msg:'等待授权中…',_timer:null,_deadline:0},
     _chartGeom:null,

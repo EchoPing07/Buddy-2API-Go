@@ -56,7 +56,8 @@ func TestCredentialChangeInvalidatesAccountCaches(t *testing.T) {
 		{
 			name: "import",
 			req: func(token string) *http.Request {
-				body := `{"access_token":"` + token + `"}`
+				// activate=true：只有「导入并启用」换活动凭证，仅导入不动 token.json
+				body := `{"access_token":"` + token + `","activate":true}`
 				return httptest.NewRequest(http.MethodPost, "/admin/account/import", strings.NewReader(body))
 			},
 			call: func(h *Handler, w http.ResponseWriter, r *http.Request) { h.accountImport(w, r) },
@@ -138,8 +139,18 @@ func seedAccountDayState(t *testing.T, st *store.Store) string {
 	return day
 }
 
-// postImport 走一遍导入端点：token 由 uid 构造（auth.ParseJWT 不验签）。
+// postImport 走一遍导入端点（activate=true，即「导入并启用」）：token 由 uid 构造（auth.ParseJWT 不验签）。
+// 仅导入的路径见 postImportOnly 与 TestAccountImportOnlyKeepsActiveCredential。
 func postImport(t *testing.T, h *Handler, uid, nickname string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := `{"access_token":"` + testJWT(t, uid, nickname) + `","activate":true}`
+	rec := httptest.NewRecorder()
+	h.accountImport(rec, httptest.NewRequest(http.MethodPost, "/admin/account/import", strings.NewReader(body)))
+	return rec
+}
+
+// postImportOnly 走「仅导入」：只入库，不动活动账号 token.json。
+func postImportOnly(t *testing.T, h *Handler, uid, nickname string) *httptest.ResponseRecorder {
 	t.Helper()
 	body := `{"access_token":"` + testJWT(t, uid, nickname) + `"}`
 	rec := httptest.NewRecorder()
@@ -221,6 +232,74 @@ func TestInvalidateOrderingResetBeforeReconfigure(t *testing.T) {
 	}
 	if len(fs.calls) != 2 || fs.calls[0] != "reset" || fs.calls[1] != "reconfigure" {
 		t.Errorf("调用顺序应为 [reset reconfigure]，得到 %v", fs.calls)
+	}
+}
+
+// TestAccountImportOnlyKeepsActiveCredential 「仅导入」（不带 activate）只入档，不动活动账号：
+// token.json 仍是原账号，账号口径缓存与日内状态一概不碰（否则仅导入一个备用账号也会
+// 让当前账号当天丢掉「已签到 / 已上报」），档案库则必须出现这条记录。
+func TestAccountImportOnlyKeepsActiveCredential(t *testing.T) {
+	h, st, _ := newGrowthTestHandler(t, "cn", true, &fakeGrowthAPI{}) // 活动账号 UID="u"
+	fs := &fakeSched{}
+	h.sched = fs
+	day := seedAccountDayState(t, st)
+
+	rec := postImportOnly(t, h, "uid-backup", "备用账号")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("仅导入应 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := h.toks.Get(); got == nil || got.UID != "u" {
+		t.Fatalf("仅导入不得更换活动凭证，得到 %+v", got)
+	}
+	metas, err := h.accountBook().List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAccountUID(metas, "uid-backup") {
+		t.Errorf("仅导入的账号应入档，列表=%+v", metas)
+	}
+	if fs.resetN != 0 || fs.reconfigureN != 0 {
+		t.Errorf("仅导入不应复位日内状态/重装配，得到 resetN=%d reconfigureN=%d", fs.resetN, fs.reconfigureN)
+	}
+	for _, row := range accountScopedCacheRows {
+		if _, _, ok := st.GetCache(row[0], row[1], 0); !ok {
+			t.Errorf("%s/%s 仅导入（账号未变）不应清除", row[0], row[1])
+		}
+	}
+	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyReportDay, 0); !ok || payload != day {
+		t.Errorf("仅导入不应清 report_day，得到 ok=%v payload=%q", ok, payload)
+	}
+}
+
+// TestAccountImportActivateSwitches 带 activate 的导入等同「导入并启用」：换活动凭证 + 清缓存 + 重装配。
+func TestAccountImportActivateSwitches(t *testing.T) {
+	h, st, _ := newGrowthTestHandler(t, "cn", true, &fakeGrowthAPI{})
+	fs := &fakeSched{}
+	h.sched = fs
+	seedAccountDayState(t, st)
+
+	rec := postImport(t, h, "uid-new", "新账号")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("导入并启用应 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := h.toks.Get(); got == nil || got.UID != "uid-new" {
+		t.Fatalf("导入并启用应落到新凭证，得到 %+v", got)
+	}
+	for _, row := range accountScopedCacheRows {
+		if payload, _, ok := st.GetCache(row[0], row[1], 0); ok && payload != "" {
+			t.Errorf("%s/%s 应随换账号清除，仍存在: %s", row[0], row[1], payload)
+		}
+	}
+	if fs.resetN != 1 || fs.reconfigureN != 1 {
+		t.Errorf("换账号应复位日内状态并重装配，得到 resetN=%d reconfigureN=%d", fs.resetN, fs.reconfigureN)
+	}
+	// 同时也要入档：启用后的账号在列表里可被切回
+	metas, err := h.accountBook().List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAccountUID(metas, "uid-new") {
+		t.Errorf("启用的账号应入档，列表=%+v", metas)
 	}
 }
 

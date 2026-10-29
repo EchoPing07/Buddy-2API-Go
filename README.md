@@ -187,7 +187,8 @@ curl http://127.0.0.1:10082/v1/embeddings \
 | `POST /admin/login` `POST /admin/logout` `GET /admin/session` | 密码登录 / 登出 / 会话状态 |
 | `GET /admin/account` `POST /admin/account/oauth/start` `GET /admin/account/oauth/poll` | 账号摘要 / OAuth 发起 / OAuth 轮询（登录成功即写凭证并清旧账号缓存） |
 | `POST /admin/account/refresh` `POST /admin/account/test` `DELETE /admin/account` | 手动刷新 / 测试凭证 / 清空凭证（仅清空会一并清旧账号缓存并复位调度器日内状态） |
-| `POST /admin/account/import` `GET /admin/account/export` | 导入凭证（JWT）/ 导出 `token.json`（导入与登录同口径：写凭证 + 清缓存） |
+| `POST /admin/account/import` `GET /admin/account/export` | 导入凭证（JWT，默认**仅导入**：只写账号档案、不动活动凭证）/ 导出 `token.json`。带 `"activate":true` 时等同「导入并启用」（写凭证 + 切缓存，与登录同口径） |
+| `GET /admin/accounts` `POST /admin/accounts/{uid}/activate` `DELETE /admin/accounts/{uid}` | 已存账号列表（仅元信息）/ 切换当前账号 / 移除档案（当前账号不可移除） |
 | `GET /admin/resources` | 官方余额（带缓存，`?force=1` 强刷） |
 | `GET /admin/checkin/status` `POST /admin/checkin/claim` | 签到状态 / 领取 |
 | `GET /admin/growth/overview` | 成长任务总览（连登 / 热力格 / 猫猫 / 抽奖聚合，60s 缓存，`?force=1` 强刷） |
@@ -224,7 +225,7 @@ curl http://127.0.0.1:10082/v1/embeddings \
 > `app.js` 拦截为软导航（切 view + `pushState` 换 URL），因此切页不重载文档、不重新请求资源、已加载数据保活。
 > 保活例外：任务 / 日志两页声明 `realtime`，**每次进入都会刷新**（这两页会被后端按天/定时改写），
 > 间隔 <5s 的重复进入退化为保活；会话过期（401）或退出登录会清空保活缓存，重新登录后当前页重新拉数据。
-> 另有一类保活例外与凭证有关：**导入凭证 / 扫码登录成功后立即强刷**账号、余额、签到与任务数据
+> 另有一类保活例外与凭证有关：**导入并启用 / 扫码登录成功后立即强刷**账号、余额、签到与任务数据
 > （后端同时清掉旧账号缓存并复位调度器日内状态），因此换账号不需要手动点刷新，也不会出现
 > 「新账号显示上一账号余额」或「新账号当天被判定已签到/已上报而不执行定时任务」；
 > **删除凭证**则就地把账号口径状态清空并撤销余额/任务两页的保活（此刻无凭证，重拉只会报错），
