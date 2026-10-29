@@ -10,6 +10,7 @@
 
 ### ✨ 新功能
 
+- **模型列表 chip 点击即复制模型 ID**：总览页「模型列表」的每个模型标签改为可点按钮，点一下把模型 `id` 复制到剪贴板（客户端接入填的是 id 而非显示名，同名模型消歧后的 `disp` 仍作展示），复用全站 `copy()` 实现（含 HTTP 局域网下的 `execCommand` 降级），并补 hover / `:active` / `:focus-visible` 反馈与 `aria-label`。
 - **OpenAI 兼容嵌入端点 `POST /v1/embeddings`（实验特性，默认关闭）**：新增侧边栏「实验」页，嵌入端点开关与调用示例集中于此（开关即时落库，走 `GET/PUT /admin/experiments`；env `BUDDY2API_EMBEDDINGS_ENABLED` 可强制覆盖）。关闭时端点返回 403 `embeddings_disabled` 且 `GET /v1/models` 不列出嵌入模型；开启后对接上游 `/v2/embeddings`（与 chat 模型注册表相互独立），`input` 支持字符串 / 字符串数组（token id 数组不支持，明确报 400），响应为标准 OpenAI 形状（`data[i]` 补 `index`，附 `usage`）。模型名透传上游，实测注册表仅 `bge-m3`（1024 维）可用：`/v3/config` 中的 `nes-gf` 等条目不属于嵌入注册表，调用将得到 404 `model_not_found`（附已知模型提示）。凭证链路与 chat 一致（token 过期预刷新 + 401 刷新重试一次）。
 - **多账号存档与手动切换**：账号页新增「账号切换」卡片。OAuth 登录 / 凭证导入成功后自动存档到 `data/accounts/<id>.json`（0600），列表显示昵称、uid、端点、有效期与当前标记，可一键切换或移除（当前账号不可移除）。活动账号始终只有 `data/token.json` 一份：切换 = 归档当前 → 用目标档案覆盖 → `invalidateAccountCaches()`，upstream / proxy / scheduler 无需感知；不含轮询、负载均衡或故障转移。切到同一账号不失效缓存（与 `accountSwitched` 同口径），避免当天活跃上报翻倍。新增 `GET /admin/accounts`、`POST /admin/accounts/{uid}/activate`、`DELETE /admin/accounts/{uid}`，列表只返回元信息、不含任何凭证。
 

@@ -71,11 +71,15 @@
           </div>
           <div x-show="!models.loading && modelChips.length">
             <div class="model-chips">
+              <!-- chip 用 <button>：点一下即复制模型 id（Alt: 复制 disp 里的显示名无意义，id 才是接入用的）。
+                   客户端接入时真正要填的是 id 而非显示名，故一律复制 m.id。 -->
               <template x-for="m in modelChips" :key="m.id">
-                <span class="model-chip" :title="m.id + (m.promo ? ' · ' + m.promo : '')">
+                <button type="button" class="model-chip" @click="copy(m.id)"
+                        :title="m.id + ' · 点击复制' + (m.promo ? ' · ' + m.promo : '')"
+                        :aria-label="'复制模型 ID ' + m.id">
                   <span class="model-chip-name" x-text="m.disp"></span>
                   <span class="model-chip-rate" x-show="m.credits" x-text="m.credits"></span>
-                </span>
+                </button>
               </template>
             </div>
           </div>
