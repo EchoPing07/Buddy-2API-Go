@@ -191,21 +191,40 @@ func (f *poolFixture) pin(headerValue, model, uid string) {
 	f.m.Bind("h:"+headerValue, model, uid)
 }
 
-// lastLog 取最后一条日志（异步 worker 写入，需等）。
-func (f *poolFixture) lastLog(t *testing.T) store.LogEntry {
+// lastLog 取**本次请求**写的那条日志（异步 worker 写入，需等）。
+//
+// afterID 是本请求之前库里最大的日志 id，取自发起请求前：日志 id 自增，
+// 只有 id > afterID 的才是本次请求产生的。**不能只等「库里有任意一条日志」**——
+// worker 是异步的，上一次请求的行往往还在库里，于是上一次的 account_uid 会被
+// 当成本次的结果返回，让「不同会话各占一个号」这类断言随机失败（CI 上必现）。
+func (f *poolFixture) lastLog(t *testing.T, afterID int64) store.LogEntry {
 	t.Helper()
 	for i := 0; i < 200; i++ {
 		logs, _, err := f.st.QueryLogs(store.LogFilter{Page: 1, PageSize: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(logs) > 0 {
+		if len(logs) > 0 && logs[0].ID > afterID {
 			return logs[0]
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("等不到日志落库")
+	t.Fatal("等不到本次请求的日志落库")
 	return store.LogEntry{}
+}
+
+// maxLogID 当前库里最大的日志 id（无日志时为 0）。发起请求前取一次，
+// 作为 lastLog 的「本次请求」分界线。
+func (f *poolFixture) maxLogID(t *testing.T) int64 {
+	t.Helper()
+	logs, _, err := f.st.QueryLogs(store.LogFilter{Page: 1, PageSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) == 0 {
+		return 0
+	}
+	return logs[0].ID
 }
 
 // TestPoolDisabledZeroChange 开关关闭：走单账号路径，account_uid 为空。
@@ -214,11 +233,12 @@ func TestPoolDisabledZeroChange(t *testing.T) {
 	if err := f.cfg.Update(func(c *config.Config) error { c.PoolEnabled = false; return nil }); err != nil {
 		t.Fatal(err)
 	}
+	before := f.maxLogID(t)
 	rr := f.chat(t, "s1", "glm")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("应成功，得到 %d: %s", rr.Code, rr.Body.String())
 	}
-	if got := f.lastLog(t).AccountUID; got != "" {
+	if got := f.lastLog(t, before).AccountUID; got != "" {
 		t.Errorf("号池关闭时 account_uid 应为空，得到 %q", got)
 	}
 	if f.up.hits["acc1"] != 1 || f.up.hits["acc2"] != 0 {
@@ -229,17 +249,19 @@ func TestPoolDisabledZeroChange(t *testing.T) {
 // TestPoolStickySameSession 同一 session key 两次请求走同一账号。
 func TestPoolStickySameSession(t *testing.T) {
 	f := newPoolFixture(t, "acc1", "acc2", "acc3", "acc4")
+	before := f.maxLogID(t)
 	if rr := f.chat(t, "sess-A", "glm"); rr.Code != http.StatusOK {
 		t.Fatalf("首次请求失败 %d", rr.Code)
 	}
-	uid1 := f.lastLog(t).AccountUID
+	uid1 := f.lastLog(t, before).AccountUID
 	if uid1 == "" {
 		t.Fatal("号池开启时 account_uid 必须有值")
 	}
+	before = f.maxLogID(t)
 	if rr := f.chat(t, "sess-A", "glm"); rr.Code != http.StatusOK {
 		t.Fatalf("第二次请求失败 %d", rr.Code)
 	}
-	if uid2 := f.lastLog(t).AccountUID; uid1 != uid2 {
+	if uid2 := f.lastLog(t, before).AccountUID; uid1 != uid2 {
 		t.Errorf("同一会话应粘同一账号：%q → %q", uid1, uid2)
 	}
 	if hit, _ := f.m.StickyStats(); hit < 1 {
@@ -252,10 +274,11 @@ func TestPoolDifferentSessionsSpread(t *testing.T) {
 	f := newPoolFixture(t, "acc1", "acc2", "acc3", "acc4")
 	seen := map[string]bool{}
 	for _, sess := range []string{"A", "B", "C", "D"} {
+		before := f.maxLogID(t)
 		if rr := f.chat(t, sess, "glm"); rr.Code != http.StatusOK {
 			t.Fatalf("%s 请求失败 %d", sess, rr.Code)
 		}
-		uid := f.lastLog(t).AccountUID
+		uid := f.lastLog(t, before).AccountUID
 		if seen[uid] {
 			t.Errorf("%s 与其他会话撞号 %q（idle-first 应各占一个）", sess, uid)
 		}
@@ -272,11 +295,12 @@ func TestPoolRetryOn6004(t *testing.T) {
 	f.up.plan("acc1", respErr(http.StatusTooManyRequests, errBody6004))
 	f.pin("sess", "glm", "acc1")
 
+	before := f.maxLogID(t)
 	rr := f.chat(t, "sess", "glm")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("应换号成功，得到 %d: %s", rr.Code, rr.Body.String())
 	}
-	if uid := f.lastLog(t).AccountUID; uid == "acc1" {
+	if uid := f.lastLog(t, before).AccountUID; uid == "acc1" {
 		t.Error("应在 acc2 上成功")
 	}
 	// acc1 的 glm 冷却，其它模型仍可用

@@ -335,6 +335,25 @@ func TestEagerDropSessionsOnAutoDisable(t *testing.T) {
 	}
 }
 
+// waitPersisted 等某 uid 的账号状态真的落到 DB（落库是异步队列，NoteError / 
+// probe 都不保证返回时已写库）。用于「重启」类断言。
+func waitPersisted(t *testing.T, st *store.Store, uid string) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		rows, err := st.LoadPoolAccounts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rows {
+			if r.UID == uid && (r.AutoDisabled != "" || r.ManualDisabled) {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s 的禁用状态等不到落库", uid)
+}
+
 // TestStatePersistsAcrossRestart 禁用状态必须落 SQLite（重启不能复活坏号）。
 func TestStatePersistsAcrossRestart(t *testing.T) {
 	m, st, cfg := newTestManager(t, "acc1", "acc2")
@@ -342,6 +361,10 @@ func TestStatePersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.NoteError("acc1", "glm", upstream.ErrKindCredential, nil)
+
+	// 落库是异步的（NoteError 只投递到队列），必须先等到写进 DB 再「重启」，
+	// 否则 New() 读到的是空状态——断言失败而其实是测试自己抢跑了。
+	waitPersisted(t, st, "acc1")
 
 	// 模拟重启：同一 DB + 同一档案目录重新构造
 	m2 := New(cfg, st, m.toks["acc1"], nil)
