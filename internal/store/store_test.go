@@ -141,3 +141,116 @@ func TestCacheDeleteKey(t *testing.T) {
 		t.Errorf("非法表应返回错误")
 	}
 }
+
+// TestEnsureColumnIdempotent 加列幂等：二次 Open 不能重复 ALTER（会报 duplicate column）。
+// 这条保护的是生产库就地升级：用户库里已有几千条日志，migrate 必须可重入。
+func TestEnsureColumnIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	for i := 0; i < 3; i++ {
+		st, err := Open(path)
+		if err != nil {
+			t.Fatalf("第 %d 次 Open 失败: %v", i+1, err)
+		}
+		st.Close()
+	}
+}
+
+// TestLogAccountUID 日志能写入并读回 account_uid（号池观测列的往返）。
+func TestLogAccountUID(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.InsertLog(&LogEntry{Model: "glm", StatusCode: 200, AccountUID: "acc-xyz"}); err != nil {
+		t.Fatal(err)
+	}
+	logs, total, err := st.QueryLogs(LogFilter{Page: 1, PageSize: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("total = %d，期望 1", total)
+	}
+	if logs[0].AccountUID != "acc-xyz" {
+		t.Errorf("account_uid = %q，期望 acc-xyz", logs[0].AccountUID)
+	}
+	// 按账号过滤
+	if _, total, err := st.QueryLogs(LogFilter{AccountUID: "acc-xyz", Page: 1, PageSize: 5}); err != nil || total != 1 {
+		t.Errorf("按 account_uid 过滤失败：total=%d err=%v", total, err)
+	}
+	if _, total, _ := st.QueryLogs(LogFilter{AccountUID: "other", Page: 1, PageSize: 5}); total != 0 {
+		t.Errorf("不匹配的 account_uid 应无结果，实际 %d", total)
+	}
+}
+
+// TestPoolStateRoundTrip 池状态表往返 + 过期冷却不返回。
+func TestPoolStateRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	row := PoolAccountRow{
+		UID: "u1", ManualDisabled: true, ManualDisabledAt: 100,
+		AutoDisabled: "quota", AutoDisabledAt: 200, AutoDisabledMsg: "额度已用尽",
+		QuotaFailStreak: 2, LastProbeAt: 300, LastProbeOK: false, LastProbeMsg: "credit=0",
+	}
+	if err := st.SavePoolAccount(&row); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.LoadPoolAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("应有 1 行，实际 %d", len(rows))
+	}
+	got := rows[0]
+	if !got.ManualDisabled || got.AutoDisabled != "quota" || got.QuotaFailStreak != 2 || got.AutoDisabledMsg != "额度已用尽" {
+		t.Errorf("往返后字段不符：%+v", got)
+	}
+	// UPSERT 覆盖
+	row.ManualDisabled = false
+	if err := st.SavePoolAccount(&row); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = st.LoadPoolAccounts()
+	if len(rows) != 1 || rows[0].ManualDisabled {
+		t.Error("UPSERT 应覆盖而不是插入新行")
+	}
+
+	// 冷却：过期的读不出来
+	if err := st.SavePoolCool(&PoolCoolRow{UID: "u1", Model: "glm", Until: 1000, ResetAt: 900, Code: "6004", Hits: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SavePoolCool(&PoolCoolRow{UID: "u1", Model: "ds", Until: 9000, Code: "429"}); err != nil {
+		t.Fatal(err)
+	}
+	cools, err := st.LoadPoolCools(5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cools) != 1 || cools[0].Model != "ds" {
+		t.Errorf("应只返回未过期的冷却，实际 %+v", cools)
+	}
+	// 清理过期
+	if n, err := st.CleanupPoolCools(5000); err != nil || n != 1 {
+		t.Errorf("应清理 1 条过期冷却，实际 %d err=%v", n, err)
+	}
+	// 删账号连带删冷却
+	if err := st.DeletePoolAccount("u1"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := st.LoadPoolAccounts(); len(rows) != 0 {
+		t.Error("删除账号后不应残留状态")
+	}
+	if cools, _ := st.LoadPoolCools(0); len(cools) != 0 {
+		t.Error("删除账号后不应残留冷却")
+	}
+}

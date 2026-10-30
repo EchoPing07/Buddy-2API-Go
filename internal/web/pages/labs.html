@@ -47,5 +47,94 @@
           </template>
         </div>
 
-        <p class="field-hint">实验特性依赖上游非公开接口，可能随时变动、失效或被移除；开关状态保存在 config.json，env <span class="mono">BUDDY2API_EMBEDDINGS_ENABLED</span> 可强制覆盖。</p>
+        <!-- ═══ 号池负载均衡 ═══
+             开关即时落库（PUT /admin/experiments）：关闭时 /v1/chat/completions 回到
+             「只走当前活动账号」，行为与未接号池前逐字一致。
+             后台任务（签到/成长/夜猫子/任务队列）与余额面板**仍然只走当前账号**，不参与池化。 -->
+        <div class="card">
+          <div class="card-head">
+            <h3>号池负载均衡</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-show="labs.pool_enabled && pool"
+                  x-text="poolEnabledDays()+' · '+(pool?pool.member_count:0)+' 个账号 · '+(pool?pool.available_now:0)+' 个可用 · '+(pool?pool.session_count:0)+' 个活跃会话'"></span>
+          </div>
+          <div class="switch-row">
+            <div>
+              <div class="sw-label">请求分发到全部已存账号</div>
+              <p class="field-hint" x-text="labs.pool_enabled
+                ? '已开启：/v1/chat/completions 分发到 data/accounts/ 下的全部账号，同一会话 180 分钟内粘同一账号；后台任务与余额面板仍走当前活动账号'
+                : '默认关闭；开启后 /v1/chat/completions 分发到全部已存账号，同一会话粘同一账号（滑动续期）'"></p>
+            </div>
+            <button type="button" class="switch" :class="{on:!!labs.pool_enabled}"
+                    @click="togglePool()" aria-label="切换号池负载均衡"></button>
+          </div>
+
+          <template x-if="labs.pool_enabled">
+            <div>
+              <div class="kv-grid">
+                <div class="kv">
+                  <span class="k">会话粘性 TTL（分钟）</span>
+                  <span class="v">
+                    <input class="input" type="number" min="5" max="1440" style="width:110px"
+                           x-model.number="labs.pool_session_ttl"
+                           @blur="savePoolParam('pool_session_ttl',5,1440,'会话粘性 TTL')">
+                  </span>
+                </div>
+                <div class="kv">
+                  <span class="k">网关内换号重试上限</span>
+                  <span class="v">
+                    <input class="input" type="number" min="0" max="5" style="width:110px"
+                           x-model.number="labs.pool_max_retry"
+                           @blur="savePoolParam('pool_max_retry',0,5,'重试上限')">
+                  </span>
+                </div>
+                <div class="kv">
+                  <span class="k">模型冷却截断上限（分钟）</span>
+                  <span class="v">
+                    <input class="input" type="number" min="5" max="2880" style="width:110px"
+                           x-model.number="labs.pool_cool_max_min"
+                           @blur="savePoolParam('pool_cool_max_min',5,2880,'冷却上限')">
+                  </span>
+                </div>
+                <div class="kv">
+                  <span class="k">探测 cron（6 段含秒）</span>
+                  <span class="v">
+                    <input class="input mono" type="text" style="width:230px"
+                           x-model="labs.pool_probe_cron"
+                           @blur="savePoolCron()">
+                  </span>
+                </div>
+              </div>
+
+              <div class="kv">
+                <span class="k">粘性命中率</span>
+                <span class="v" x-text="poolHitRate()"></span>
+                <span class="muted-xs" x-text="'（命中率偏低时调大 TTL）'"></span>
+                <button class="btn btn-ghost btn-sm" @click="go('/account')">查看号池状态</button>
+              </div>
+
+              <div class="field-hint code-hint">
+                <div>* <b>6004</b>（使用量已超出频率限制）= 该账号<b>仅对这个模型</b>限额，其它模型仍可用</div>
+                <div>* <b>14018 / 额度已用尽</b> = <b>整个账号</b>被禁用，等探测自动恢复（探测时间为上面 cron）</div>
+                <div>* <b>5xx / 网络错误不会禁用账号</b>：实测这类错误都是 DNS 与 http2 超时，按失败禁用会让一次断网把全池打成禁用</div>
+              </div>
+
+              <div class="label code-label">客户端接入（让会话键稳定，强烈建议）</div>
+              <div class="code-wrap">
+                <button class="btn btn-ghost btn-sm code-copy" @click="copy(poolModelsJsonSample)"
+                        title="复制 models.json 片段" aria-label="复制 models.json 片段">
+                  <span class="ic" x-html="ic('copy')"></span>
+                </button>
+                <pre class="code-block"><code x-text="poolModelsJsonSample"></code></pre>
+              </div>
+              <div class="field-hint code-hint">
+                <div>* 不配 <span class="mono">compat</span> 也能粘住，但只能靠「首条 user 文本」派生会话键；上下文压缩后首条会被替换为摘要 → 粘性打断一次</div>
+                <div>* 配上 <span class="mono">sendSessionAffinityHeaders</span> 后每次请求都带固定会话头，压缩、换模型、resume 全不受影响</div>
+                <div>* 环境变量 <span class="mono">PI_CACHE_RETENTION=long</span> 会让客户端额外发 <span class="mono">prompt_cache_key</span>（同样可用作会话键）</div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <p class="field-hint">实验特性依赖上游非公开接口，可能随时变动、失效或被移除；开关状态保存在 config.json，env <span class="mono">BUDDY2API_EMBEDDINGS_ENABLED</span> / <span class="mono">BUDDY2API_POOL_ENABLED</span> 可强制覆盖。</p>
       </section>

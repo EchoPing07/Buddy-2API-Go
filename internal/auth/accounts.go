@@ -42,6 +42,10 @@ type AccountMeta struct {
 // AccountBook 账号档案目录（<data>/accounts）。
 type AccountBook struct{ dir string }
 
+// DataDir 返回数据目录（账号档案目录的上一级，即 token.json / config.json 所在目录）。
+// 号池枚举成员时需要它来拼 token.json 与 accounts/*.json 两个来源。
+func (b *AccountBook) DataDir() string { return filepath.Dir(b.dir) }
+
 // NewAccountBook 创建档案库；目录在首次 Save 时按需创建。
 func NewAccountBook(dataDir string) *AccountBook {
 	return &AccountBook{dir: filepath.Join(dataDir, "accounts")}

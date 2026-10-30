@@ -345,3 +345,98 @@ func TestTaskScheduleEnvOverride(t *testing.T) {
 		t.Errorf("env 字段不应被 PUT 覆盖，得到 %d / %q", cfg.TaskSweepMinutes, cfg.BlackcatCron)
 	}
 }
+
+// TestPoolDefaults 号池默认值：实验特性必须默认关闭且参数给可用默认。
+func TestPoolDefaults(t *testing.T) {
+	dir := t.TempDir()
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := m.Get()
+	if c.PoolEnabled {
+		t.Error("号池实验特性应默认关闭")
+	}
+	if c.PoolSessionTTL != 180 {
+		t.Errorf("pool_session_ttl = %d，期望 180（3h）", c.PoolSessionTTL)
+	}
+	if c.PoolMaxRetry != 2 {
+		t.Errorf("pool_max_retry = %d，期望 2", c.PoolMaxRetry)
+	}
+	if c.PoolCoolMaxMin != 360 {
+		t.Errorf("pool_cool_max_min = %d，期望 360（6h）", c.PoolCoolMaxMin)
+	}
+	if c.PoolProbeCron != DefaultPoolProbeCron {
+		t.Errorf("pool_probe_cron = %q，期望 %q", c.PoolProbeCron, DefaultPoolProbeCron)
+	}
+}
+
+// TestPoolNormalizeClamp 参数超界被钳制（envInt 只挡 <=0）。
+func TestPoolNormalizeClamp(t *testing.T) {
+	c := Config{
+		PoolSessionTTL: 99999,
+		PoolMaxRetry:   999,
+		PoolCoolMaxMin: 99999,
+	}
+	c.Normalize()
+	if c.PoolSessionTTL != PoolSessionTTLMax {
+		t.Errorf("ttl 应钳到 %d，得到 %d", PoolSessionTTLMax, c.PoolSessionTTL)
+	}
+	if c.PoolMaxRetry != PoolMaxRetryMax {
+		t.Errorf("max_retry 应钳到 %d，得到 %d", PoolMaxRetryMax, c.PoolMaxRetry)
+	}
+	if c.PoolCoolMaxMin != PoolCoolMaxMinMax {
+		t.Errorf("cool_max_min 应钳到 %d，得到 %d", PoolCoolMaxMinMax, c.PoolCoolMaxMin)
+	}
+
+	// <=0 回落到默认
+	c = Config{PoolSessionTTL: 0, PoolMaxRetry: -1, PoolCoolMaxMin: 0}
+	c.Normalize()
+	if c.PoolSessionTTL != 180 {
+		t.Errorf("ttl<=0 应回落 180，得到 %d", c.PoolSessionTTL)
+	}
+	if c.PoolMaxRetry != 0 {
+		t.Errorf("max_retry<0 应回落 0，得到 %d", c.PoolMaxRetry)
+	}
+	if c.PoolCoolMaxMin != 360 {
+		t.Errorf("cool_max_min<=0 应回落 360，得到 %d", c.PoolCoolMaxMin)
+	}
+}
+
+// TestPoolEnvOverride env 可强制开关与参数。
+func TestPoolEnvOverride(t *testing.T) {
+	t.Setenv("BUDDY2API_POOL_ENABLED", "true")
+	t.Setenv("BUDDY2API_POOL_SESSION_TTL", "60")
+	t.Setenv("BUDDY2API_POOL_MAX_RETRY", "1")
+	m, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := m.Get()
+	if !c.PoolEnabled {
+		t.Error("env 应能开启号池")
+	}
+	if c.PoolSessionTTL != 60 || c.PoolMaxRetry != 1 {
+		t.Errorf("env 参数未生效：ttl=%d retry=%d", c.PoolSessionTTL, c.PoolMaxRetry)
+	}
+	// env 锁定的字段不能被 Update 覆盖
+	if err := m.Update(func(cc *Config) error { cc.PoolEnabled = false; cc.PoolSessionTTL = 999; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	c = m.Get()
+	if !c.PoolEnabled || c.PoolSessionTTL != 60 {
+		t.Errorf("env 锁定字段不应被 Update 改动：enabled=%v ttl=%d", c.PoolEnabled, c.PoolSessionTTL)
+	}
+}
+
+// TestPoolEnvClampedAfterOverride env 给超界值也要钳制（envInt 只挡 <=0）。
+func TestPoolEnvClampedAfterOverride(t *testing.T) {
+	t.Setenv("BUDDY2API_POOL_SESSION_TTL", "99999")
+	m, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Get().PoolSessionTTL; got > PoolSessionTTLMax {
+		t.Errorf("env 超界未钳制：%d", got)
+	}
+}

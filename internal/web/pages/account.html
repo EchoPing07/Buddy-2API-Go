@@ -101,6 +101,90 @@
             </table>
           </div>
         </div>
+        <!-- ═══ 号池状态（实验特性；仅开关开启时渲染） ═══
+             数据来自 GET /admin/pool（内存快照）+ /admin/accounts（档案元信息）。
+             与上面「账号切换」的区别：那一块是切换**当前活动账号**（后台任务跟着走），
+             这一块只是分发策略，切换这里不会改当前账号。 -->
+        <div class="card" x-show="labs.pool_enabled">
+          <div class="card-head">
+            <h3>号池状态</h3>
+            <span class="muted-xs" x-show="pool"
+                  x-text="(pool?pool.member_count:0)+' 个账号 · '+(pool?pool.available_now:0)+' 个可用 · '+(pool?pool.session_count:0)+' 个活跃会话'"></span>
+            <div class="spacer"></div>
+            <button class="btn btn-ghost btn-sm" @click="poolProbeAll()" :disabled="loading">全部探测</button>
+            <button class="btn btn-ghost btn-sm" @click="poolResetSessions()" :disabled="loading">重置会话绑定</button>
+          </div>
+          <p class="field-hint">
+            只有 <span class="mono">/v1/chat/completions</span> 走号池；签到 / 成长任务 / 余额面板仍走<b>当前活动账号</b>（即下方「账号切换」里标「当前」那个）。
+          </p>
+          <div class="empty" x-show="pool && !pool.accounts.length">
+            <span class="ic ic-lg" x-html="ic('account')"></span>
+            号池里还没有账号
+          </div>
+          <div class="table-wrap" x-show="pool && pool.accounts.length">
+            <table>
+              <thead><tr><th>账号</th><th>状态</th><th>额度</th><th>限额中的模型</th><th>会话</th><th>成功 / 失败</th><th>操作</th></tr></thead>
+              <tbody>
+                <template x-for="a in (pool?pool.accounts:[])" :key="a.uid">
+                  <tr>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <span x-text="a.nickname||'未命名'"></span>
+                        <span class="badge badge-ok" x-show="a.active" title="当前活动账号（后台任务与余额面板走它）">当前</span>
+                        <span class="badge badge-warn" x-show="!a.region_match" title="凭证属于另一端点">端点不匹配</span>
+                      </div>
+                      <div class="muted-xs mono" x-text="(a.uid||'').slice(-10)"></div>
+                    </td>
+                    <td>
+                      <span class="badge" :class="poolStateClass(a)" x-text="poolStateText(a)"></span>
+                      <div class="muted-xs" x-show="a.auto_disabled_msg" :title="a.auto_disabled_msg"
+                           x-text="a.auto_disabled_msg.slice(0,40)"></div>
+                    </td>
+                    <td>
+                      <template x-if="a.credits>0"><span x-text="fmtDosage(a.credits)"></span></template>
+                      <template x-if="!(a.credits>0)"><span class="muted-xs">—</span></template>
+                    </td>
+                    <td>
+                      <template x-for="c in (a.model_cooldowns||[])" :key="c.model">
+                        <div class="row" style="gap:6px;flex-wrap:nowrap">
+                          <span class="mono" x-text="c.model"></span>
+                          <span class="muted-xs" :title="'上游重置时间 '+ts(c.reset_at)+'；实际生效截止 '+ts(c.until)+(c.reset_at&&c.reset_at!==c.until?'（已被上限截断）':'')"
+                                x-text="'剩 '+coolLeft(c.until)"></span>
+                          <button class="btn btn-ghost btn-sm" @click="poolClearCool(a,c)"
+                                  :disabled="loading" title="我知道它好了，让我试试">清除</button>
+                        </div>
+                      </template>
+                      <span class="muted-xs" x-show="!(a.model_cooldowns||[]).length">—</span>
+                    </td>
+                    <td x-text="a.bound_sessions"></td>
+                    <td>
+                      <span class="mono" x-text="a.success_count+' / '+a.error_count"></span>
+                      <div class="muted-xs" x-show="a.last_probe_at"
+                           :title="a.last_probe_msg"
+                           x-text="'探测 '+ts(a.last_probe_at)"></div>
+                    </td>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <button class="btn btn-ghost btn-sm" x-show="!a.manual_disabled"
+                                style="color:var(--destructive)" @click="poolDisable(a)" :disabled="loading">禁用</button>
+                        <button class="btn btn-secondary btn-sm" x-show="a.manual_disabled"
+                                @click="poolEnable(a)" :disabled="loading">启用</button>
+                        <button class="btn btn-ghost btn-sm" @click="poolProbe(a)"
+                                :disabled="loading||a.manual_disabled" title="调 billing 接口查凭证与额度">探测</button>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="field-hint code-hint" x-show="pool">
+            <div>* 粘性命中率 <span class="mono" x-text="pool?pool.sticky_hit_total+' / '+(pool.sticky_hit_total+pool.sticky_miss_total):'—'"></span>
+                 （低命中率说明会话键不稳定，去「实验」页看客户端接入示例）</div>
+            <div>* 「限额中的模型」只影响该模型；整个账号被禁用看「状态」列</div>
+          </div>
+        </div>
+
       </section>
 
 <!-- ═══ 导出凭证弹窗 ═══ -->

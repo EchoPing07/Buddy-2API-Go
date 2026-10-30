@@ -20,7 +20,9 @@ import (
 
 	"buddy2api-go/internal/apikey"
 	"buddy2api-go/internal/auth"
+	"buddy2api-go/internal/billing"
 	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/scheduler"
 	"buddy2api-go/internal/store"
 	"buddy2api-go/internal/taskops"
@@ -59,6 +61,8 @@ type Handler struct {
 	sched   SchedulerControl
 	session *Session
 	tasks   *taskops.Runner // 任务动作执行器（New() 中创建，见 tasks.go）
+	// pool 号池（实验特性）。nil = 开关关闭：所有池端点回空视图，不产生任何额外开销。
+	pool *pool.Manager
 }
 
 // New 创建处理器。
@@ -132,6 +136,15 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Put("/settings", h.putSettings)
 			r.Get("/experiments", h.getExperiments)
 			r.Put("/experiments", h.putExperiments)
+
+			// ── 号池负载均衡（实验特性；开关关闭时回空视图）──
+			r.Get("/pool", h.poolView)
+			r.Post("/pool/accounts/{uid}/disable", h.poolDisable)
+			r.Post("/pool/accounts/{uid}/enable", h.poolEnable)
+			r.Post("/pool/accounts/{uid}/probe", h.poolProbe)
+			r.Post("/pool/probe_all", h.poolProbeAll)
+			r.Post("/pool/cool/{uid}/{model}/clear", h.poolClearCool)
+			r.Post("/pool/reset", h.poolReset)
 			r.Get("/models", h.listModels)
 			r.Post("/models/refresh", h.refreshModels)
 		})
@@ -359,9 +372,21 @@ func (h *Handler) accountTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) accountDelete(w http.ResponseWriter, r *http.Request) {
+	// 先记下 uid：Clear 之后 h.toks.Get() 就是 nil 了，事后取不到。
+	var clearedUID string
+	if t := h.toks.Get(); t != nil {
+		clearedUID = t.UID
+	}
 	if err := h.toks.Clear(); err != nil {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 号池为每个账号自持一份 TokenStore（含 refresh_token），Clear 只清了
+	// token.json 那一份。不摘掉池成员，用户「退出登录」后 chat 仍会继续以该账号
+	// 发请求（还可能把刷新的 token 写回已删除的文件）——既是隐私问题，
+	// 也让「登出后不该再用这个号」的预期失效。
+	if h.pool != nil && clearedUID != "" {
+		h.pool.DeleteAccount(clearedUID)
 	}
 	h.invalidateAccountCaches()
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
@@ -752,6 +777,11 @@ type accountItem struct {
 	Expired      bool   `json:"expired"`
 	Active       bool   `json:"active"`
 	RegionMatch  bool   `json:"region_match"`
+	// 号池只读字段（开关关闭时恒为默认值）。放在列表里是为了让账号页
+	// 不必为一个开关多拉一次 /admin/pool 才能显示"这个号在池里但被禁用了"。
+	InPool           bool   `json:"in_pool"`
+	PoolAvailable    bool   `json:"pool_available"`
+	PoolAutoDisabled string `json:"pool_auto_disabled"`
 }
 
 // newAccountItem 元信息 → 列表项。active 为当前 token.json（nil = 未登录）。
@@ -789,7 +819,15 @@ func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
 	regionDomain := config.EndpointOf(h.cfg.Get().Region).Domain
 	items := make([]accountItem, 0, len(metas))
 	for _, m := range metas {
-		items = append(items, newAccountItem(m, active, regionDomain))
+		item := newAccountItem(m, active, regionDomain)
+		if h.pool != nil && h.cfg.Get().PoolEnabled {
+			if st, ok := h.pool.AccountStateOf(m.UID); ok {
+				item.InPool = true
+				item.PoolAvailable = st.Available()
+				item.PoolAutoDisabled = st.AutoDisabled
+			}
+		}
+		items = append(items, item)
 	}
 	// 当前账号置顶（List 已按 SavedAt 倒序，但刚归档的旧账号会排到前面）。
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Active && !items[j].Active })
@@ -830,6 +868,11 @@ func (h *Handler) activateAccount(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
 		return
 	}
+	// 池成员里 token.json 那一份会被 EnsureValid 持续刷新；切号后重新加载一次，
+	// 让池用的凭证与「当前活动账号」保持一致（否则池可能还在用切换前的旧 token）。
+	if h.pool != nil {
+		h.pool.ReloadMembers()
+	}
 	h.invalidateAccountCaches()
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": next.UID, "nickname": next.Nickname})
 }
@@ -855,6 +898,11 @@ func (h *Handler) deleteAccountProfile(w http.ResponseWriter, r *http.Request) {
 	if err := book.Delete(id); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "删除账号档案失败: "+err.Error())
 		return
+	}
+	// 一并清掉池状态：否则删了号又重新导入同一个账号，会继承旧的
+	// 「额度耗尽」标记而立刻被跳过（pool_account_state 是独立于档案的）。
+	if h.pool != nil {
+		h.pool.DeleteAccount(t.UID)
 	}
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1175,10 +1223,11 @@ func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.LogFilter{
-		Model:    strings.TrimSpace(q.Get("model")),
-		Status:   0,
-		Page:     atoiDefault(q.Get("page"), 1),
-		PageSize: atoiDefault(q.Get("page_size"), 20),
+		Model:      strings.TrimSpace(q.Get("model")),
+		AccountUID: strings.TrimSpace(q.Get("account_uid")),
+		Status:     0,
+		Page:       atoiDefault(q.Get("page"), 1),
+		PageSize:   atoiDefault(q.Get("page_size"), 20),
 	}
 	if v := q.Get("key_id"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -1470,28 +1519,82 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 // 不进设置页的大表单契约（设置页整单 PUT，字段增删会牵连前端提交体）。
 func (h *Handler) getExperiments(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Get()
-	jsonWrite(w, http.StatusOK, map[string]any{"embeddings_enabled": cfg.EmbeddingsEnabled})
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"embeddings_enabled": cfg.EmbeddingsEnabled,
+		"pool_enabled":       cfg.PoolEnabled,
+		"pool_session_ttl":   cfg.PoolSessionTTL,
+		"pool_max_retry":     cfg.PoolMaxRetry,
+		"pool_cool_max_min":  cfg.PoolCoolMaxMin,
+		"pool_probe_cron":    cfg.PoolProbeCron,
+	})
 }
 
-// putExperiments 改实验特性开关（PUT /admin/experiments，{embeddings_enabled}）。
+// putExperiments 改实验特性开关（PUT /admin/experiments）。
+//
+// 请求体**逐字段可选**：每个字段用指针，nil 表示「本次不改」。
+// 不能要求必填——实验开关是按特性逐个挂的，多一个特性就让老前端提交 400，
+// 每加一个开关都要改前端才能不报错。
+//
 // env 锁定的字段由 cfg.Update 保持 env 值（与设置页同口径），响应恒回服务端真值。
 func (h *Handler) putExperiments(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EmbeddingsEnabled *bool `json:"embeddings_enabled"`
+		EmbeddingsEnabled *bool   `json:"embeddings_enabled"`
+		PoolEnabled       *bool   `json:"pool_enabled"`
+		PoolSessionTTL    *int    `json:"pool_session_ttl"`
+		PoolMaxRetry      *int    `json:"pool_max_retry"`
+		PoolCoolMaxMin    *int    `json:"pool_cool_max_min"`
+		PoolProbeCron     *string `json:"pool_probe_cron"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
-	if req.EmbeddingsEnabled == nil {
-		jsonErr(w, http.StatusBadRequest, "缺少 embeddings_enabled 字段")
+	// 一个字段都没给：仍回 400（空请求没有意义，且能挡住前端拼错字段名的静默无效）
+	if req.EmbeddingsEnabled == nil && req.PoolEnabled == nil && req.PoolSessionTTL == nil &&
+		req.PoolMaxRetry == nil && req.PoolCoolMaxMin == nil && req.PoolProbeCron == nil {
+		jsonErr(w, http.StatusBadRequest, "未提供任何可修改的字段")
+		return
+	}
+	if req.PoolProbeCron != nil && !validCron(*req.PoolProbeCron) {
+		jsonErr(w, http.StatusBadRequest, "探测 cron 表达式非法（需 6 段含秒，如 0 0 0,6,12,18 * * *）")
 		return
 	}
 	if err := h.cfg.Update(func(c *config.Config) error {
-		c.EmbeddingsEnabled = *req.EmbeddingsEnabled
+		if req.EmbeddingsEnabled != nil {
+			c.EmbeddingsEnabled = *req.EmbeddingsEnabled
+		}
+		if req.PoolEnabled != nil {
+			c.PoolEnabled = *req.PoolEnabled
+			if *req.PoolEnabled && c.PoolEnabledAt == 0 {
+				c.PoolEnabledAt = time.Now().Unix()
+			}
+		}
+		if req.PoolSessionTTL != nil {
+			c.PoolSessionTTL = *req.PoolSessionTTL
+		}
+		if req.PoolMaxRetry != nil {
+			c.PoolMaxRetry = *req.PoolMaxRetry
+		}
+		if req.PoolCoolMaxMin != nil {
+			c.PoolCoolMaxMin = *req.PoolCoolMaxMin
+		}
+		if req.PoolProbeCron != nil {
+			c.PoolProbeCron = *req.PoolProbeCron
+		}
 		return nil
 	}); err != nil {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	// 号池开关变化：重扫池成员（刚导入的账号要立刻参与分发）。
+	// Manager 常驻（main 构造），开关只控制行为，因此这里不需要重建——
+	// 重建会丢掉内存里的粘性表与观测计数，且改动期间请求会短暂退化。
+	nowEnabled := h.cfg.Get().PoolEnabled
+	if nowEnabled && h.pool != nil {
+		h.pool.ReloadMembers()
+	}
+	if h.sched != nil {
+		h.sched.Reconfigure() // 号池探测 cron 跟着开关挂/摘
 	}
 	h.getExperiments(w, r)
 }
@@ -1564,85 +1667,12 @@ func number(v any) float64 {
 	return 0
 }
 
-// numField 按优先级依次尝试 keys，返回首个“有值”字段的解析结果，与参考实现
-// _to_float(precise, _to_float(nonPrecise)) 语义一致：nil / 空串 / 解析失败视为无值
-// 并回退到下一个 key；"0" 是合法零值，不触发回退。用于额度包的 capacity 数值字段，
-// 上游对免费/裂变包常只返回非 Precise 字段或 Precise 为空串，缺少回退会导致
-// “已用/剩余/总量”恒为 0。
+// numField 转发到 billing.NumField（实现与注释见该包：必须处理上游的字符串形态）。
 func numField(acc map[string]any, keys ...string) float64 {
-	for _, k := range keys {
-		switch n := acc[k].(type) {
-		case nil:
-			continue
-		case string:
-			if strings.TrimSpace(n) == "" {
-				continue
-			}
-			var f float64
-			if _, err := fmt.Sscanf(n, "%g", &f); err == nil {
-				return f
-			}
-		case float64:
-			return n
-		}
-	}
-	return 0
+	return billing.NumField(acc, keys...)
 }
 
-// resolveExpireTime 按上游契约回退选取到期时间：ExpiredTime → DeductionEndTime → CycleEndTime。
-// 实测 CodeBuddy 免费/裂变包 ExpiredTime 常为空字符串，真正到期信息落在 DeductionEndTime
-// （毫秒时间戳）或 CycleEndTime（日期串）。返回 (展示串, 时间, 是否有效)；空值/0/9999-99-99
-// 哨兵跳过，数字时间戳格式化为本地可读串，字符串原样返回。
+// resolveExpireTime 转发到 billing.ResolveExpireTime（实现与注释见该包）。
 func resolveExpireTime(acc map[string]any) (string, time.Time, bool) {
-	for _, key := range []string{"ExpiredTime", "DeductionEndTime", "CycleEndTime"} {
-		raw := acc[key]
-		switch v := raw.(type) {
-		case string:
-			if v == "" || strings.HasPrefix(v, "9999-99-99") {
-				continue
-			}
-		case float64:
-			if v == 0 {
-				continue
-			}
-		}
-		if et, ok := parseFlexibleTime(raw); ok && !et.IsZero() {
-			if s, ok := raw.(string); ok {
-				return s, et, true
-			}
-			return et.Local().Format("2006-01-02 15:04:05"), et, true
-		}
-	}
-	return "", time.Time{}, false
-}
-
-// billingTZ 上游 billing 日期串（"2006-01-02 15:04:05" 等无时区格式）为腾讯云
-// 北京时间（UTC+8，无夏令时，实测周期边界如 CycleStartTime "2026-08-01 00:00:00"
-// 印证），与部署时区无关。若用 time.Local 解析，非 +8 时区部署（Docker TZ 覆盖）的
-// 到期判定会偏差最多 8 小时；Expired 现在直接决定包是否计入可用额度聚合。
-// 用 FixedZone 而非 LoadLocation，避免运行环境缺 tzdata 时解析失败。
-var billingTZ = time.FixedZone("UTC+8", 8*60*60)
-
-// parseFlexibleTime 宽容解析时间：数字（秒/毫秒）、RFC3339、常见格式。
-// 无时区格式的日期串按 billingTZ（北京时间）解析；RFC3339 自带偏移不受影响。
-func parseFlexibleTime(v any) (time.Time, bool) {
-	switch t := v.(type) {
-	case float64:
-		sec := int64(t)
-		if sec > 1e12 { // 毫秒
-			return time.Unix(sec/1e3, 0), true
-		}
-		return time.Unix(sec, 0), true
-	case string:
-		if t == "" {
-			return time.Time{}, false
-		}
-		layouts := []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02"}
-		for _, layout := range layouts {
-			if ts, err := time.ParseInLocation(layout, t, billingTZ); err == nil {
-				return ts, true
-			}
-		}
-	}
-	return time.Time{}, false
+	return billing.ResolveExpireTime(acc)
 }

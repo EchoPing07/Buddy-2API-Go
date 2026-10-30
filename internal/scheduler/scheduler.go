@@ -13,6 +13,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/store"
 	"buddy2api-go/internal/taskops"
 	"buddy2api-go/internal/upstream"
@@ -58,11 +59,13 @@ type Scheduler struct {
 	growthMu           sync.Mutex // 成长链互斥：cron 触发 vs 手动触发 vs 补跑，同一时刻只允许一条链在跑
 	growthState        growthDay  // 日内状态（growthMu 保护，跨 CST 日自动重置）
 	growth             growthClient
-	growthReportID     cron.EntryID // 上报+奖励链 cron entry
-	growthTravelID     cron.EntryID // 旅行巡检 cron entry
-	growthQueueID      cron.EntryID // 任务队列 cron entry
-	blackcatID         cron.EntryID // 夜猫子 cron entry
-	growthCatchupTimer *time.Timer  // 启动补跑 timer（s.mu 保护；Stop 时取消，重入重置不叠加）
+	growthReportID     cron.EntryID  // 上报+奖励链 cron entry
+	growthTravelID     cron.EntryID  // 旅行巡检 cron entry
+	growthQueueID      cron.EntryID  // 任务队列 cron entry
+	blackcatID         cron.EntryID  // 夜猫子 cron entry
+	poolProbeID        cron.EntryID  // 号池探测 cron entry
+	pool               *pool.Manager // 号池（nil = 实验未开启，探测不挂载）
+	growthCatchupTimer *time.Timer   // 启动补跑 timer（s.mu 保护；Stop 时取消，重入重置不叠加）
 
 	// 任务侧钩子（admin 在构造后注入；启动期写、运行期读，用 mutex 保护）
 	hookMu        sync.Mutex
@@ -98,6 +101,16 @@ func New(cfg *config.Manager, client *upstream.Client, st *store.Store, models *
 // Runner 返回任务执行器（admin 应把它注入 Handler，共用同一把互斥锁）。
 func (s *Scheduler) Runner() *taskops.Runner { return s.runner }
 
+// SetPool 注入号池（nil = 实验未开启）。
+//
+// 必须在 Start 之后、开关切换后由 admin 调 Reconfigure 重装配（main 与
+// admin.putExperiments 各调一次），让探测 cron 跟着开关走。
+func (s *Scheduler) SetPool(p *pool.Manager) {
+	s.mu.Lock()
+	s.pool = p
+	s.mu.Unlock()
+}
+
 // SetRunner 用外部创建的执行器替换内置实例（admin 先构造 Handler 再注入 scheduler 时用）。
 // 传 nil 不生效——内置实例始终存在，避免 tickBlackcat 拿到 nil。
 func (s *Scheduler) SetRunner(r *taskops.Runner) {
@@ -126,17 +139,26 @@ func (s *Scheduler) Reconfigure() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 先摘旧 entry（签到 + 成长四类 + 夜猫子），再按开关重挂
-	old := []cron.EntryID{s.tickID, s.growthReportID, s.growthTravelID, s.growthQueueID, s.blackcatID}
+	old := []cron.EntryID{s.tickID, s.growthReportID, s.growthTravelID, s.growthQueueID, s.blackcatID, s.poolProbeID}
 	for _, id := range old {
 		if id != 0 {
 			s.c.Remove(id)
 		}
 	}
 	s.tickID, s.growthReportID, s.growthTravelID = 0, 0, 0
-	s.growthQueueID, s.blackcatID = 0, 0
+	s.growthQueueID, s.blackcatID, s.poolProbeID = 0, 0, 0
 	s.ck = checkinDay{}
 
 	cfg := s.cfg.Get()
+	// 号池探测：与其它任务平级挂载。开关关闭或未注入 pool 时不挂。
+	if cfg.PoolEnabled && s.pool != nil {
+		if id, err := s.c.AddFunc(cfg.PoolProbeCron, s.tickPoolProbe); err != nil {
+			slog.Error("注册号池探测失败", "error", err, "cron", cfg.PoolProbeCron)
+		} else {
+			s.poolProbeID = id
+			slog.Info("号池探测已开启", "cron", cfg.PoolProbeCron)
+		}
+	}
 	if cfg.AutoCheckin {
 		id, err := s.c.AddFunc(checkinTickSpec, s.tickCheckin)
 		if err != nil {
@@ -524,4 +546,45 @@ func (s *Scheduler) cleanupLogs() {
 	if m > 0 {
 		slog.Info("已按大小上限清理日志", "count", m, "max_mb", cfg.LogMaxSizeMB)
 	}
+}
+
+// ── 号池探测 ──
+
+// tickPoolProbe 每 6 小时探测一次全池账号（cron 由 pool_probe_cron 决定）。
+//
+// 每个号加 0–5 分钟随机抖动：4 个号散在 5 分钟窗口内，而不是同一秒一起打上游
+// （billing 接口有频率限制，并发同一时刻更容易被限）。用 time.AfterFunc 而不是
+// sleep 串行：串行 4×5=20 分钟会跨过下一个整点，与签到/成长撞车。
+func (s *Scheduler) tickPoolProbe() {
+	s.mu.Lock()
+	p := s.pool
+	s.mu.Unlock()
+	if p == nil || !p.Enabled() {
+		return
+	}
+	for _, uid := range p.Members() {
+		uid := uid
+		delay := time.Duration(rand.IntN(300)) * time.Second
+		time.AfterFunc(delay, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			res := p.Probe(ctx, uid)
+			switch {
+			case res.Skipped:
+				// 手动禁用：不探测是正常的，不打日志噪音
+			case res.OK:
+				slog.Info("号池探测成功", "uid", uidTail(uid), "msg", res.Msg)
+			default:
+				slog.Warn("号池探测未恢复", "uid", uidTail(uid), "reason", res.Reason, "msg", res.Msg)
+			}
+		})
+	}
+}
+
+// uidTail 日志里只打 uid 后缀（uid 是账号标识，完整打进日志没有额外价值）。
+func uidTail(uid string) string {
+	if len(uid) <= 8 {
+		return uid
+	}
+	return uid[len(uid)-8:]
 }

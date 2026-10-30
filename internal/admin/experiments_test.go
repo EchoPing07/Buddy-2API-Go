@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"buddy2api-go/internal/config"
 )
 
 // TestExperimentsDefaultOff 读接口默认必须回 false（实验特性出厂关闭）。
@@ -79,5 +81,93 @@ func TestPutExperimentsEnvLocked(t *testing.T) {
 	}
 	if !h.cfg.Get().EmbeddingsEnabled {
 		t.Error("env 锁定下配置不应被 PUT 关闭")
+	}
+}
+
+// TestPutExperimentsPartialFields 逐字段可选：只提交一个字段不应 400。
+// 实验开关是按特性逐个挂的，多挂一个特性不能让老前端提交失败。
+func TestPutExperimentsPartialFields(t *testing.T) {
+	h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/admin/experiments", strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		h.putExperiments(rr, req)
+		return rr
+	}
+
+	// 只开号池，不动嵌入
+	if rr := put(`{"pool_enabled":true}`); rr.Code != http.StatusOK {
+		t.Fatalf("只提交 pool_enabled 应成功，得到 %d: %s", rr.Code, rr.Body.String())
+	}
+	if !h.cfg.Get().PoolEnabled {
+		t.Error("pool_enabled 未落库")
+	}
+	if h.cfg.Get().EmbeddingsEnabled {
+		t.Error("未提交的 embeddings_enabled 不应被改动")
+	}
+
+	// 只改参数，不动开关
+	if rr := put(`{"pool_session_ttl":60}`); rr.Code != http.StatusOK {
+		t.Fatalf("只提交 ttl 应成功，得到 %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := h.cfg.Get().PoolSessionTTL; got != 60 {
+		t.Errorf("pool_session_ttl = %d，期望 60", got)
+	}
+	if !h.cfg.Get().PoolEnabled {
+		t.Error("未提交的 pool_enabled 不应被改动")
+	}
+}
+
+// TestPutExperimentsPoolParamsClamped 参数超界被钳制（envInt 只挡 <=0）。
+func TestPutExperimentsPoolParamsClamped(t *testing.T) {
+	h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+	req := httptest.NewRequest(http.MethodPut, "/admin/experiments",
+		strings.NewReader(`{"pool_session_ttl":999999,"pool_max_retry":999,"pool_cool_max_min":999999}`))
+	rr := httptest.NewRecorder()
+	h.putExperiments(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", rr.Code, rr.Body.String())
+	}
+	cfg := h.cfg.Get()
+	if cfg.PoolSessionTTL > config.PoolSessionTTLMax {
+		t.Errorf("ttl 未钳制：%d", cfg.PoolSessionTTL)
+	}
+	if cfg.PoolMaxRetry > config.PoolMaxRetryMax {
+		t.Errorf("max_retry 未钳制：%d", cfg.PoolMaxRetry)
+	}
+	if cfg.PoolCoolMaxMin > config.PoolCoolMaxMinMax {
+		t.Errorf("cool_max_min 未钳制：%d", cfg.PoolCoolMaxMin)
+	}
+}
+
+// TestPutExperimentsInvalidProbeCron 非法 cron 应 400 且不改配置。
+func TestPutExperimentsInvalidProbeCron(t *testing.T) {
+	h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+	before := h.cfg.Get().PoolProbeCron
+	req := httptest.NewRequest(http.MethodPut, "/admin/experiments",
+		strings.NewReader(`{"pool_probe_cron":"not a cron"}`))
+	rr := httptest.NewRecorder()
+	h.putExperiments(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("非法 cron 应 400，得到 %d", rr.Code)
+	}
+	if h.cfg.Get().PoolProbeCron != before {
+		t.Error("失败请求不得改变 cron")
+	}
+}
+
+// TestGetExperimentsIncludesPool 读接口应带号池字段，默认全关。
+func TestGetExperimentsIncludesPool(t *testing.T) {
+	h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+	req := httptest.NewRequest(http.MethodGet, "/admin/experiments", nil)
+	rr := httptest.NewRecorder()
+	h.getExperiments(rr, req)
+	body := rr.Body.String()
+	for _, want := range []string{`"pool_enabled":false`, `"pool_session_ttl":180`,
+		`"pool_max_retry":2`, `"pool_cool_max_min":360`, `"pool_probe_cron"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("响应缺少 %s：%s", want, body)
+		}
 	}
 }

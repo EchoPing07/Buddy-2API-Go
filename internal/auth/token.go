@@ -125,12 +125,23 @@ type TokenStore struct {
 
 // NewTokenStore 创建并尝试加载 data/token.json。
 func NewTokenStore(dataDir string) (*TokenStore, error) {
-	s := &TokenStore{path: filepath.Join(dataDir, "token.json")}
+	return NewTokenStorePath(filepath.Join(dataDir, "token.json"))
+}
+
+// NewTokenStorePath 从显式路径加载一份凭证（号池每账号一份档案文件）。
+//
+// 与 NewTokenStore 的差别只在路径：每个实例自带 refreshMu，因此
+// 「每号一个 TokenStore」天然按账号单飞刷新，不会串到别的号。
+func NewTokenStorePath(path string) (*TokenStore, error) {
+	s := &TokenStore{path: path}
 	if err := s.Load(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
+
+// Path 返回凭证文件绝对/相对路径（号池用于把同一份档案去重）。
+func (s *TokenStore) Path() string { return s.path }
 
 // DataDir 返回凭证所在数据目录（账号档案 data/accounts 与之同级）。
 func (s *TokenStore) DataDir() string { return filepath.Dir(s.path) }

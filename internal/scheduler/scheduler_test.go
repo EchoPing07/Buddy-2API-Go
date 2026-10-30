@@ -1,8 +1,15 @@
 package scheduler
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
+
+	"buddy2api-go/internal/auth"
+	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
+	"buddy2api-go/internal/store"
+	"buddy2api-go/internal/upstream"
 )
 
 // at 构造 2026-08-22（周六）当地时刻。
@@ -114,5 +121,54 @@ func TestMinuteOfDay(t *testing.T) {
 	}
 	if got := minuteOfDay(at(15, 30), 0); got != at(0, 0) {
 		t.Errorf("0 分钟应为零点，得到 %v", got)
+	}
+}
+
+// TestSetPoolThenReconfigureRegistersProbe SetPool 之后必须能挂上探测 cron。
+//
+// 回归：scheduler.New 内部那次 Reconfigure 运行时 s.pool 还是 nil，探测挂不上；
+// 若 main 只调 SetPool 不补 Reconfigure，「env 开启号池」或「上次 UI 开过然后重启」
+// 的部署自动探测完全失效 —— auto_disabled 的号永远探不回来。
+func TestSetPoolThenReconfigureRegistersProbe(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Update(func(c *config.Config) error { c.PoolEnabled = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	toks, err := auth.NewTokenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := upstream.New(toks, func() string { return "cn" }, 30)
+
+	s := New(cfg, client, st, nil)
+	t.Cleanup(s.Stop)
+	// New 之后（s.pool == nil）不应注册
+	if s.poolProbeID != 0 {
+		t.Fatal("未注入 pool 时不应注册探测")
+	}
+	m := pool.New(cfg, st, toks, client)
+	t.Cleanup(func() { m.Close() })
+	s.SetPool(m)
+	s.Reconfigure()
+	if s.poolProbeID == 0 {
+		t.Fatal("SetPool + Reconfigure 后应注册探测 cron")
+	}
+
+	// 关闭开关后 Reconfigure 应摘掉
+	if err := cfg.Update(func(c *config.Config) error { c.PoolEnabled = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconfigure()
+	if s.poolProbeID != 0 {
+		t.Error("关闭号池后应摘掉探测 cron")
 	}
 }

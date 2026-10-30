@@ -76,6 +76,15 @@ type Config struct {
 	// EmbeddingsEnabled 实验特性：OpenAI 兼容嵌入端点 /v1/embeddings 的总开关，默认关闭。
 	// 管理后台「实验」页切换（PUT /admin/experiments），env BUDDY2API_EMBEDDINGS_ENABLED 可强制。
 	EmbeddingsEnabled bool `json:"embeddings_enabled"`
+	// ── 号池负载均衡（实验特性，默认关闭）──
+	// 开启后 /v1/chat/completions 分发到全部已存账号；后台任务与余额面板仍走当前活动账号。
+	// 关闭时零行为变化（proxy 侧持 nil Manager，不读档案、不读写池状态表）。
+	PoolEnabled    bool   `json:"pool_enabled"`
+	PoolSessionTTL int    `json:"pool_session_ttl"`  // 会话粘性 TTL（分钟，滑动续期），默认 180 = 3h
+	PoolMaxRetry   int    `json:"pool_max_retry"`    // 网关内换号重试上限，默认 2
+	PoolCoolMaxMin int    `json:"pool_cool_max_min"` // 模型冷却截断上限（分钟），默认 360
+	PoolProbeCron  string `json:"pool_probe_cron"`   // 探测 cron（6 段含秒），默认 "0 0 0,6,12,18 * * *"
+	PoolEnabledAt  int64  `json:"pool_enabled_at"`   // 首次开启时间（UI 显示「已运行 N 天」）
 }
 
 // 默认 cron 表达式（defaults() 与 admin 存量兜底共用，避免字面量两处漂移）。
@@ -90,6 +99,18 @@ const (
 	DefaultTaskSweepMinutes = 15
 	// TaskSweepMinutesMax 清扫间隔上限（再长就失去「及时领掉」的意义）。
 	TaskSweepMinutesMax = 24 * 60
+
+	// DefaultPoolProbeCron 号池探测 cron：每天 0/6/12/18 点各探一次。
+	// 探测是「凭证可用吗 + 还有额度吗」的唯一自动恢复手段（14018 无重置时间）。
+	DefaultPoolProbeCron = "0 0 0,6,12,18 * * *"
+	// PoolSessionTTLMax 会话粘性 TTL 上限（分钟）。
+	PoolSessionTTLMax = 24 * 60
+	// PoolMaxRetryMax 网关重试上限。这是与客户端重试相乘的值：
+	// 实测 pi 对 429 会重试 3 次，网关取 2 → 一次失败最多 12 次上游调用。
+	PoolMaxRetryMax = 5
+	// PoolCoolMaxMinMax 模型冷却截断上限（分钟）。上游可能给一个很远的重置时间，
+	// 但要防一个异常文案把模型永久封死。
+	PoolCoolMaxMinMax = 48 * 60
 )
 
 func defaults() Config {
@@ -115,6 +136,10 @@ func defaults() Config {
 		LogRetentionDays:     90,
 		LogMaxSizeMB:         50,
 		ChatTimeoutSeconds:   60,
+		PoolSessionTTL:       180,
+		PoolMaxRetry:         2,
+		PoolCoolMaxMin:       360,
+		PoolProbeCron:        DefaultPoolProbeCron,
 	}
 }
 
@@ -183,6 +208,29 @@ func (c *Config) Normalize() {
 	}
 	if c.ChatTimeoutSeconds > MaxChatTimeoutSeconds {
 		c.ChatTimeoutSeconds = MaxChatTimeoutSeconds
+	}
+	// 号池参数：envInt 只挡 <=0，超界需重钳（与 ChatTimeoutSeconds 同口径）
+	if c.PoolSessionTTL < 5 {
+		c.PoolSessionTTL = d.PoolSessionTTL
+	}
+	if c.PoolSessionTTL > PoolSessionTTLMax {
+		c.PoolSessionTTL = PoolSessionTTLMax
+	}
+	if c.PoolMaxRetry < 0 {
+		c.PoolMaxRetry = 0
+	}
+	if c.PoolMaxRetry > PoolMaxRetryMax {
+		c.PoolMaxRetry = PoolMaxRetryMax
+	}
+	if c.PoolCoolMaxMin < 5 {
+		c.PoolCoolMaxMin = d.PoolCoolMaxMin
+	}
+	if c.PoolCoolMaxMin > PoolCoolMaxMinMax {
+		c.PoolCoolMaxMin = PoolCoolMaxMinMax
+	}
+	// cron 合法性由 admin putExperiments / scheduler 注册时校验，这里只补空（与 checkin_cron 同策略）
+	if strings.TrimSpace(c.PoolProbeCron) == "" {
+		c.PoolProbeCron = d.PoolProbeCron
 	}
 }
 
@@ -330,6 +378,11 @@ func Load(dataDir string) (*Manager, error) {
 	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
 	envInt("BUDDY2API_CHAT_TIMEOUT_SECONDS", "chat_timeout_seconds", &cfg.ChatTimeoutSeconds)
 	envBool("BUDDY2API_EMBEDDINGS_ENABLED", "embeddings_enabled", &cfg.EmbeddingsEnabled)
+	envBool("BUDDY2API_POOL_ENABLED", "pool_enabled", &cfg.PoolEnabled)
+	envInt("BUDDY2API_POOL_SESSION_TTL", "pool_session_ttl", &cfg.PoolSessionTTL)
+	envInt("BUDDY2API_POOL_MAX_RETRY", "pool_max_retry", &cfg.PoolMaxRetry)
+	envInt("BUDDY2API_POOL_COOL_MAX_MIN", "pool_cool_max_min", &cfg.PoolCoolMaxMin)
+	envStr("BUDDY2API_POOL_PROBE_CRON", "pool_probe_cron", &cfg.PoolProbeCron)
 	// env 覆盖发生在上面的 Normalize 之后（envInt 只挡 <=0），超界值在此钳制，
 	// 防止 Duration 换算溢出为负导致所有 chat 请求立即超时并被落盘
 	if cfg.ChatTimeoutSeconds > MaxChatTimeoutSeconds {
@@ -341,6 +394,16 @@ func Load(dataDir string) (*Manager, error) {
 	}
 	if cfg.GrowthReportJitter > GrowthReportJitterMax {
 		cfg.GrowthReportJitter = GrowthReportJitterMax
+	}
+	// 号池参数同理（envInt 只挡 <=0）
+	if cfg.PoolSessionTTL > PoolSessionTTLMax {
+		cfg.PoolSessionTTL = PoolSessionTTLMax
+	}
+	if cfg.PoolMaxRetry > PoolMaxRetryMax {
+		cfg.PoolMaxRetry = PoolMaxRetryMax
+	}
+	if cfg.PoolCoolMaxMin > PoolCoolMaxMinMax {
+		cfg.PoolCoolMaxMin = PoolCoolMaxMinMax
 	}
 
 	// 默认管理密码：env > 文件 hash > 内置 "password"（生产请尽快修改）。
@@ -467,6 +530,21 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["embeddings_enabled"] {
 		nc.EmbeddingsEnabled = m.cfg.EmbeddingsEnabled
+	}
+	if m.envSets["pool_enabled"] {
+		nc.PoolEnabled = m.cfg.PoolEnabled
+	}
+	if m.envSets["pool_session_ttl"] {
+		nc.PoolSessionTTL = m.cfg.PoolSessionTTL
+	}
+	if m.envSets["pool_max_retry"] {
+		nc.PoolMaxRetry = m.cfg.PoolMaxRetry
+	}
+	if m.envSets["pool_cool_max_min"] {
+		nc.PoolCoolMaxMin = m.cfg.PoolCoolMaxMin
+	}
+	if m.envSets["pool_probe_cron"] {
+		nc.PoolProbeCron = m.cfg.PoolProbeCron
 	}
 	nc.Normalize()
 	old := m.cfg

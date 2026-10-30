@@ -190,6 +190,8 @@ PAGE('account', {
           ? '，可在「账号切换」中启用'
           : '（当前无活动账号，请在下方列表点「切换」启用）'),'ok');
       }
+      // 号池开启时，新导入的账号要立刻参与分发（后端 ReloadMembers 只在下一次开关变更时跑）
+      this.loadPool();
     })();
   },
 
@@ -284,6 +286,7 @@ PAGE('account', {
       }else{
         this.toast('已导入 '+r.imported+' 个账号'+ow+'，可在「账号切换」中启用','ok');
       }
+      this.loadPool();
     })();
   },
 
@@ -313,7 +316,91 @@ PAGE('account', {
         await this.api('/admin/accounts/'+encodeURIComponent(a.uid),{method:'DELETE'});
         this.toast('已移除','ok');
         this.loadAccounts();
+        this.loadPool();   // 后端已一并清理该号的池状态
       })(), {okText:'移除'});
+  },
+
+    /* ═══ 号池状态 ═══
+       只在开关开启时渲染；关闭时整块不显示，也不发 /admin/pool 请求。 */
+  async loadPool(){
+    if(!this.labs.pool_enabled){ this.pool = null; return; }
+    try{ this.pool = await this.api('/admin/pool'); }catch(e){ this.pool = null; }
+  },
+  /** 号池账号行的状态键：三色语义（绿可用 / 黄部分限额 / 红整号不可用） */
+  poolStateKey(a){
+    if(a.manual_disabled || a.auto_disabled) return 'down';
+    if(a.model_cooldowns && a.model_cooldowns.length) return 'partial';
+    return 'ok';
+  },
+  poolStateText(a){
+    if(a.manual_disabled) return '手动禁用';
+    if(a.auto_disabled === 'quota') return '额度用尽';
+    if(a.auto_disabled === 'credential') return '凭证失效';
+    if(a.auto_disabled) return a.auto_disabled;
+    if(a.model_cooldowns && a.model_cooldowns.length) return '部分模型限额';
+    return '可用';
+  },
+  poolStateClass(a){
+    const k = this.poolStateKey(a);
+    return k === 'ok' ? 'badge-ok' : (k === 'partial' ? 'badge-warn' : 'badge-err');
+  },
+  /** 冷却剩余时间文案（前端算，避免后端为每个模型返回一个「还剩多久」的易变字段） */
+  coolLeft(until){
+    const s = Math.max(0, until - Math.floor(Date.now()/1000));
+    if(s <= 0) return '已到期';
+    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+    return h > 0 ? (h+'h '+m+'m') : (m+'m');
+  },
+  poolDisable(a){
+    this.askConfirm('禁用账号',
+      '在号池中禁用「'+(a.nickname||a.uid.slice(-8))+'」？',
+      ()=>this.busy(async()=>{
+        await this.api('/admin/pool/accounts/'+encodeURIComponent(a.uid)+'/disable',{method:'POST'});
+        this.toast('已禁用','ok');
+        this.loadPool(); this.loadAccounts();
+      })(),
+      {detail:'手动禁用后探测**不会**自动恢复这个账号，需要手动点「启用」。', okText:'禁用'});
+  },
+  poolEnable(a){
+    this.busy(async()=>{
+      await this.api('/admin/pool/accounts/'+encodeURIComponent(a.uid)+'/enable',{method:'POST'});
+      this.toast('已启用','ok');
+      this.loadPool(); this.loadAccounts();
+    })();
+  },
+  poolProbe(a){
+    this.busy(async()=>{
+      const r = await this.api('/admin/pool/accounts/'+encodeURIComponent(a.uid)+'/probe',{method:'POST'});
+      if(r.skipped) this.toast('该账号已手动禁用，探测不会恢复它','err');
+      else if(r.ok) this.toast('探测成功：额度 '+r.credits,'ok');
+      else this.toast('探测未恢复：'+(r.msg||r.reason||''),'err');
+      this.loadPool(); this.loadAccounts();
+    })();
+  },
+  poolClearCool(a, c){
+    this.busy(async()=>{
+      await this.api('/admin/pool/cool/'+encodeURIComponent(a.uid)+'/'+encodeURIComponent(c.model)+'/clear',{method:'POST'});
+      this.toast('已清除 '+c.model+' 的冷却','ok');
+      this.loadPool();
+    })();
+  },
+  poolResetSessions(){
+    this.askConfirm('重置会话绑定',
+      '清空全部会话粘性绑定？下一次请求会重新分配账号。',
+      ()=>this.busy(async()=>{
+        const r = await this.api('/admin/pool/reset',{method:'POST'});
+        this.toast('已清空 '+r.cleared+' 条绑定','ok');
+        this.loadPool();
+      })(), {okText:'重置', danger:false});
+  },
+  poolProbeAll(){
+    this.busy(async()=>{
+      const r = await this.api('/admin/pool/probe_all',{method:'POST'});
+      const ok = (r.items||[]).filter(x=>x.ok).length;
+      const skipped = (r.items||[]).filter(x=>x.skipped).length;
+      this.toast('探测完成：'+ok+' 个可用'+(skipped?('，'+skipped+' 个手动禁用跳过'):''),'ok');
+      this.loadPool(); this.loadAccounts();
+    })();
   },
 
     /* ── OAuth 设备流 ── */
@@ -338,7 +425,7 @@ PAGE('account', {
         this.oauthStop();
         this.toast('登录成功：'+(r.account.nickname||r.account.uid),'ok');
         // 换账号，同导入；loadModels 单独留着：模型列表跟 region 走不跟账号走
-        this.refreshAccountData(); this.loadModels(); this.loadAccounts();
+        this.refreshAccountData(); this.loadModels(); this.loadAccounts(); this.loadPool();
       }else if(r.status==='error'){
         this.oauthStop(r.message);
       }else{
@@ -354,5 +441,5 @@ PAGE('account', {
   oauthCancel(){ this.oauthStop(); },
 
   /* ── 进场：本页所需数据 ── */
-  load(){ this.loadAccount(); this.loadAccounts(); },
+  load(){ this.loadAccount(); this.loadAccounts(); this.loadPool(); },
 });

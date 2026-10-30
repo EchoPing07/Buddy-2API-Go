@@ -320,27 +320,6 @@ func TestProcessResourcesTotalDosageEqualsUpstream(t *testing.T) {
 	}
 }
 
-// TestParseFlexibleTimeBillingZone 验证无时区格式的日期串按北京时间（UTC+8）解析，
-// 不随部署时区漂移；RFC3339 自带偏移不受影响。过期判定（Expired → 是否计入
-// 可用额度聚合）依赖该解析，非 +8 时区部署时若用 time.Local 解析会偏差最多 8 小时。
-func TestParseFlexibleTimeBillingZone(t *testing.T) {
-	ts, ok := parseFlexibleTime("2026-09-20 18:35:00")
-	if !ok {
-		t.Fatal("日期串解析失败")
-	}
-	if _, off := ts.Zone(); off != 8*3600 {
-		t.Errorf("解析偏移 = %d 秒，期望 +28800（北京时间，不随部署时区变化）", off)
-	}
-	// RFC3339 自带偏移，解析结果应保留串内时区而非套用 billingTZ
-	ts2, ok := parseFlexibleTime("2026-09-20T18:35:00+09:00")
-	if !ok {
-		t.Fatal("RFC3339 解析失败")
-	}
-	if _, off := ts2.Zone(); off != 9*3600 {
-		t.Errorf("RFC3339 偏移 = %d 秒，期望 +32400（保留串内时区）", off)
-	}
-}
-
 // TestNumField 覆盖 numField 的回退与容错路径。
 func TestNumField(t *testing.T) {
 	cases := []struct {

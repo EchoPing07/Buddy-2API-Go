@@ -104,7 +104,7 @@ func newEmbeddingsHandler(t *testing.T) (*Handler, *config.Manager) {
 		t.Fatal(err)
 	}
 	client := upstream.New(toks, func() string { return "cn" }, 60)
-	h := New(client, &upstream.ModelCache{}, apikey.New(st), st, cfg)
+	h := New(client, &upstream.ModelCache{}, apikey.New(st), st, cfg, nil)
 	return h, cfg
 }
 

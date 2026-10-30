@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"buddy2api-go/internal/apikey"
 	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/store"
 	"buddy2api-go/internal/upstream"
 )
@@ -40,6 +42,8 @@ type Handler struct {
 	keys   *apikey.Manager
 	st     *store.Store
 	cfg    *config.Manager
+	// pool 号池（实验特性）。nil = 关闭：走单账号路径，零行为变化。
+	pool *pool.Manager
 
 	// 日志写入队列（带缓冲，避免请求路径上同步写库）
 	logCh   chan *store.LogEntry
@@ -47,14 +51,17 @@ type Handler struct {
 }
 
 // New 创建处理器并启动异步日志 worker。
-func New(client *upstream.Client, models *upstream.ModelCache, keys *apikey.Manager, st *store.Store, cfg *config.Manager) *Handler {
+func New(client *upstream.Client, models *upstream.ModelCache, keys *apikey.Manager, st *store.Store, cfg *config.Manager, p *pool.Manager) *Handler {
 	h := &Handler{
-		client: client, models: models, keys: keys, st: st, cfg: cfg,
+		client: client, models: models, keys: keys, st: st, cfg: cfg, pool: p,
 		logCh: make(chan *store.LogEntry, 256),
 	}
 	h.logOnce.Do(func() { go h.logWorker() })
 	return h
 }
+
+// Pool 返回号池管理器（nil = 实验未开启）。admin 用它接号池管理端点。
+func (h *Handler) Pool() *pool.Manager { return h.pool }
 
 func (h *Handler) logWorker() {
 	for l := range h.logCh {
@@ -83,16 +90,29 @@ func openaiError(w http.ResponseWriter, status int, errType, code, msg string) {
 
 // upstreamErrorMessage 解析上游错误体提取可读信息；非 JSON 或解析失败时回退截断原文，
 // 避免把上游 HTML/非 JSON 错误体原样当作 JSON 透传给客户端。
-func upstreamErrorMessage(raw []byte, status int) string {
-	var env struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
+//
+// 用 upstream.BizCode 统一解包（顶层的 {code,msg} 与嵌套的 {error:{data:{code,msg}}}
+// 都能解），否则 14018 这类额度耗尽的错误会解析失败，前端只能看到一大段截断原文。
+// isErrorFrame 判断流内 error 字段是否是**真实**错误帧。
+//
+// "error":null 会被 json.RawMessage 解析成字面量 null（4 字节），
+// 许多 OpenAI 兼容上游在正常 chunk 里就这么写。不排除它会让第一个正常帧
+// 就把「本流已记过错误」的标志置位，后续真正的错误帧冷却被吞掉。
+func isErrorFrame(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
 	}
-	if err := json.Unmarshal(raw, &env); err == nil && (env.Code != 0 || env.Msg != "") {
-		if env.Msg != "" {
-			return fmt.Sprintf("上游返回 %d（code=%d）: %s", status, env.Code, trunc(env.Msg, 300))
+	t := strings.TrimSpace(string(raw))
+	return t != "" && t != "null"
+}
+
+func upstreamErrorMessage(raw []byte, status int) string {
+	code, msg := upstream.BizCode(raw)
+	if code != 0 || msg != "" {
+		if msg != "" {
+			return fmt.Sprintf("上游返回 %d（code=%d）: %s", status, code, trunc(msg, 300))
 		}
-		return fmt.Sprintf("上游返回 %d（code=%d）", status, env.Code)
+		return fmt.Sprintf("上游返回 %d（code=%d）", status, code)
 	}
 	s := strings.TrimSpace(string(raw))
 	if s == "" {
@@ -104,6 +124,9 @@ func upstreamErrorMessage(raw []byte, status int) string {
 // ── chat/completions ──
 
 // Chat 处理 POST /v1/chat/completions。
+//
+// 号池开关关闭时走原路径（chatSingle），行为逐字不变；开启时按会话粘性分发并
+// 允许换号重试。两个分支共享同一套 body 解析 / 日志收尾，只差「用哪份凭证请求」。
 func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	key := apikey.FromContext(r.Context())
@@ -142,6 +165,16 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// 号池关闭（或未构造）：单账号路径，不加任何额外分支开销。
+	if h.pool == nil || !h.pool.Enabled() {
+		h.chatSingle(w, r, upBody, body, streamWanted, logEntry)
+		return
+	}
+	h.chatPooled(w, r, upBody, body, streamWanted, logEntry, key)
+}
+
+// chatSingle 单账号 chat（号池关闭时的唯一路径，也是号池耗尽后的参考行为）。
+func (h *Handler) chatSingle(w http.ResponseWriter, r *http.Request, upBody []byte, body map[string]any, streamWanted bool, logEntry *store.LogEntry) {
 	resp, err := h.client.DoChat(r.Context(), upBody)
 	if err != nil {
 		logEntry.StatusCode = http.StatusServiceUnavailable
@@ -160,10 +193,147 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if streamWanted {
-		h.passthroughSSE(w, r, resp.Body, logEntry)
+		h.passthroughSSE(w, r, resp.Body, logEntry, nil)
 	} else {
-		h.aggregate(r, resp.Body, body, upBody, logEntry, w)
+		h.aggregate(r, resp.Body, body, upBody, logEntry, w, nil, h.client.DoChat)
 	}
+}
+
+// chatPooled 号池 chat：按会话粘性选号，遇到可重试错误时换号重试。
+//
+// 重试只给 429/402/401（上游明确拒绝、未开工），5xx 与网络中断**不重试**：
+// 上游可能已计费，重试有重复扣费风险，交给调用方按自己的退避决定
+// （pi 对 429/5xx 都会重试）。这个取值也叫「网关重试 × pi 重试」的乘法上限：
+// 实测 pi 对 429 会重试 3 次，网关取 2 → 一次失败最多 12 次上游调用。
+func (h *Handler) chatPooled(w http.ResponseWriter, r *http.Request, upBody []byte, body map[string]any,
+	streamWanted bool, logEntry *store.LogEntry, key *apikey.KeyInfo) {
+
+	// routeModel 是**路由与冷却的唯一口径**，取自客户端请求体里声明的 model。
+	//
+	// 不能用 logEntry.Model：流式路径会把它覆盖成上游 chunk 回报的 model（可能是
+	// "glm-5.3" 这种别名，也可能为空串）。若冷却记在别名上，而选号查询用的是请求
+	// model，冷却就对路由完全不可见——被限流的号会被反复分配。空 model 还会把冷却
+	// 写到 "" 这个键上，污染整个池。
+	routeModel, _ := body["model"].(string)
+	sessKey := pool.SessionKey(r.Header.Get, body, keyID(key))
+	tried := map[string]bool{}
+	maxRetry := h.pool.MaxRetry()
+
+	// lastStatus/lastRaw 保存最后一次上游错误：候选耗尽时优先透传它。
+	// 没有这两个变量的话，「账号数 ≤ 1+maxRetry」这种最常见的小池配置会让
+	// 真实 429 被改写成网关自造的 503 —— pi 靠状态码决定要不要重试，
+	// 改码会改变它的行为，也会让用户看不到上游原文（含 requestId）。
+	lastStatus := 0
+	var lastRaw []byte
+	attempts := 0
+
+	for attempt := 0; ; attempt++ {
+		uid, ok := h.pool.Resolve(sessKey, routeModel, tried)
+		if !ok {
+			// 无候选：若已经打过上游并拿到错误，透传那个错误而不是自造 503
+			if lastStatus != 0 {
+				h.writeUpstreamFailure(w, logEntry, lastStatus, lastRaw, attempts)
+				return
+			}
+			h.writePoolExhausted(w, logEntry, routeModel, len(tried))
+			return
+		}
+		tried[uid] = true
+		attempts++
+		logEntry.AccountUID = uid // 每轮覆盖，最后一次即最终生效号
+
+		ts, err := h.pool.TokenStore(uid)
+		if err != nil {
+			if lastStatus != 0 {
+				h.writeUpstreamFailure(w, logEntry, lastStatus, lastRaw, attempts)
+				return
+			}
+			h.writePoolExhausted(w, logEntry, routeModel, len(tried))
+			return
+		}
+		resp, err := h.client.DoChatWith(r.Context(), ts, upBody)
+		if err != nil {
+			// transport 类（DNS / 连接 / 超时 / http2）：不重试、不惩罚账号，直接透传。
+			// 实测库里 73 条 503 全是这类，按失败禁用会让一次断网把全池打成禁用。
+			logEntry.StatusCode = http.StatusServiceUnavailable
+			logEntry.ErrorMsg = trunc(err.Error(), 500)
+			openaiError(w, http.StatusServiceUnavailable, "upstream_error", "upstream_unavailable", err.Error())
+			return
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			h.pool.NoteSuccess(uid, routeModel)
+			// 成功即重绑：让后续轮次收敛到持续成功的号，而不是跳回已被冷却的原号。
+			h.pool.Bind(sessKey, routeModel, uid)
+			if streamWanted {
+				h.passthroughSSE(w, r, resp.Body, logEntry, func(kind upstream.ChatErrKind, raw []byte) {
+					// 流内错误帧：不重试（字节已发出），但**必须记冷却**，否则下一轮
+					// 还会被分到同一个已限额的号上。
+					h.pool.NoteError(uid, routeModel, kind, raw)
+				})
+			} else {
+				// 工具停转重试必须复用同一个 uid 的凭证（见 aggregate 的 doChat 说明）
+				doChatWith := func(ctx context.Context, b []byte) (*http.Response, error) {
+					return h.client.DoChatWith(ctx, ts, b)
+				}
+				h.aggregate(r, resp.Body, body, upBody, logEntry, w, func(kind upstream.ChatErrKind, raw []byte) {
+					h.pool.NoteError(uid, routeModel, kind, raw)
+				}, doChatWith)
+			}
+			resp.Body.Close()
+			return
+		}
+
+		// 非 200：读完错误体（限量）后分类。必须读完并关闭，否则连接不能复用。
+		errRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		kind := upstream.ClassifyChatError(resp.StatusCode, errRaw)
+		h.pool.NoteError(uid, routeModel, kind, errRaw)
+		lastStatus, lastRaw = resp.StatusCode, errRaw
+
+		if !kind.Retryable() || attempt >= maxRetry {
+			h.writeUpstreamFailure(w, logEntry, resp.StatusCode, errRaw, attempts)
+			return
+		}
+		// 可重试：只解绑「失败的正是本会话绑定的号」，其它号的失败不影响本会话绑定。
+		h.pool.UnbindIf(sessKey, routeModel, uid)
+		slog.Info("号池换号重试", "model", routeModel, "failed_uid", shortUID(uid),
+			"kind", kind.String(), "attempt", attempt+1)
+	}
+}
+
+// writeUpstreamFailure 透传上游错误。HTTP 状态码与错误体尽量原样：
+// pi 靠状态码决定要不要重试，改码会改变它的行为，也会让用户看不到上游原文。
+func (h *Handler) writeUpstreamFailure(w http.ResponseWriter, logEntry *store.LogEntry,
+	status int, raw []byte, attempts int) {
+	logEntry.StatusCode = status
+	logEntry.ErrorMsg = trunc(string(raw), 500)
+	msg := upstreamErrorMessage(raw, status)
+	if attempts > 1 {
+		msg = fmt.Sprintf("%s（号池：已尝试 %d 个账号均失败）", msg, attempts)
+	}
+	openaiError(w, status, "upstream_error", "upstream_error", msg)
+}
+
+// writePoolExhausted 全池无可用账号：网关自造的 503。
+//
+// 这是唯一用 503 的场景：此时没有任何上游错误可透传，必须自己说清是号池状态
+// 而非上游故障，否则用户会去找 CodeBuddy 客服。pi 收到 503 会重试 4 次，
+// 但每次都被网关立即拒绝（无上游成本），可接受。
+func (h *Handler) writePoolExhausted(w http.ResponseWriter, logEntry *store.LogEntry, model string, triedCount int) {
+	msg := fmt.Sprintf("号池内没有可用于 %s 的账号（共 %d 个账号，已检查 %d 个）。",
+		model, len(h.pool.Members()), triedCount)
+	msg += "可能原因：账号被禁用、额度用尽、或该模型正在限额冷却中。请到管理后台「账号」页查看号池状态。"
+	logEntry.StatusCode = http.StatusServiceUnavailable
+	logEntry.ErrorMsg = msg
+	openaiError(w, http.StatusServiceUnavailable, "upstream_error", "pool_exhausted", msg)
+}
+
+func shortUID(uid string) string {
+	if len(uid) <= 8 {
+		return uid
+	}
+	return uid[len(uid)-8:]
 }
 
 // buildUpstreamBody 白名单透传 + 强制 stream:true + include_usage。
@@ -203,6 +373,10 @@ type sseChunk struct {
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *usageJSON `json:"usage"`
+	// Error 流内错误帧（HTTP 200 已开流，上游在流里报错）。
+	// 实测形态：{"error":{"message":"...","code":"6004","requestId":"..."}}，
+	// code 是字符串而非数字，故用 BizCode 统一解（见 upstream.ClassifyChatError）。
+	Error json.RawMessage `json:"error"`
 }
 
 type usageJSON struct {
@@ -214,7 +388,9 @@ type usageJSON struct {
 
 // passthroughSSE 流式透传：逐行转发（Flusher 实时），末尾补全 finish_reason。
 // 写失败/客户端断开统一标记 clientGone 并在循环出口记录 ErrorMsg，避免日志误判成功。
-func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io.Reader, logEntry *store.LogEntry) {
+// onError 流内错误帧回调（号池用；nil = 关闭号池，零开销）。
+// 只在侦测到 "error" 键时才调用，不改变任何转发行为。
+func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io.Reader, logEntry *store.LogEntry, onError func(upstream.ChatErrKind, []byte)) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -228,6 +404,7 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 
 	reader := bufio.NewReaderSize(body, 64<<10)
 	sawFinish := false
+	notedError := false
 	var lastChunk sseChunk
 	clientGone := false
 
@@ -284,6 +461,22 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 				data := trimmed[6:]
 				var chunk sseChunk
 				if json.Unmarshal([]byte(data), &chunk) == nil {
+					// 流内错误帧：原样透传（字节已发出，不可回滚重发），
+					// 但钩子会把它记成冷却，让下一轮请求换个号。
+					// noted 保证同一流只记一次：上游可能连发多帧，
+					// 重复计数会把「额度连续失败 2 次」的门槛一次推满而误禁用。
+					// "error":null 是正常帧的常见写法（json.RawMessage 会存下 null 四字节）。
+					// 必须在判类型之前排除：否则第一个 null 帧就把 notedError 置位，
+					// 后面真正的错误帧冷却被吞掉（已实测复现）。
+					// notedError 也只在该帧确实可惩罚时置位——不可惩罚的帧不该挡住
+					// 后面真正的 6004。
+					if onError != nil && !notedError && isErrorFrame(chunk.Error) {
+						kind := upstream.ClassifyChatError(http.StatusOK, []byte(data))
+						if kind.Punishes() {
+							notedError = true
+							onError(kind, []byte(data))
+						}
+					}
 					if chunk.Model != "" {
 						lastChunk.Model = chunk.Model
 						logEntry.Model = chunk.Model
@@ -337,8 +530,13 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 }
 
 // aggregate 非流式聚合 + finish_reason 修正 + 工具停转防护。
-func (h *Handler) aggregate(r *http.Request, body io.Reader, reqBody map[string]any, upBody []byte, logEntry *store.LogEntry, w http.ResponseWriter) {
-	agg := scanSSE(body)
+// onError 流内错误帧回调（号池用；nil = 关闭号池）。
+//
+// doChat 决定工具停转重试用哪份凭证：号池必须复用**同一个账号**的凭证，
+// 否则重试会打到「当前活动账号」——那个号可能已被禁用/额度耗尽，
+// 而且它的费用与日志会记到另一个 uid 名下。
+func (h *Handler) aggregate(r *http.Request, body io.Reader, reqBody map[string]any, upBody []byte, logEntry *store.LogEntry, w http.ResponseWriter, onError func(upstream.ChatErrKind, []byte), doChat func(context.Context, []byte) (*http.Response, error)) {
+	agg := scanSSE(body, onError)
 	if agg == nil {
 		logEntry.StatusCode = http.StatusBadGateway
 		logEntry.ErrorMsg = "上游未返回有效 SSE"
@@ -355,9 +553,11 @@ func (h *Handler) aggregate(r *http.Request, body io.Reader, reqBody map[string]
 		if err := json.Unmarshal(upBody, &retryBody); err == nil {
 			retryBody["tool_choice"] = "required"
 			if raw, err := json.Marshal(retryBody); err == nil {
-				if resp, err := h.client.DoChat(r.Context(), raw); err == nil {
+				if resp, err := doChat(r.Context(), raw); err == nil {
 					if resp.StatusCode == http.StatusOK {
-						agg2 := scanSSE(resp.Body)
+						// 工具停转重试复用同一个 uid（轮转在调用方已结束），
+						// 故 onError 仍指向同一账号；错误同样记冷却。
+						agg2 := scanSSE(resp.Body, onError)
 						resp.Body.Close()
 						// 重试无论是否采用其结果，上游都已计费：累计 token，避免漏计费
 						if agg2 != nil && agg2.Usage != nil {
@@ -413,8 +613,9 @@ type aggregated struct {
 }
 
 // scanSSE 扫描上游 SSE 流聚合成单个 chat.completion。
-func scanSSE(body io.Reader) *aggregated {
+func scanSSE(body io.Reader, onError func(upstream.ChatErrKind, []byte)) *aggregated {
 	agg := &aggregated{}
+	notedError := false
 	reader := bufio.NewReaderSize(body, 64<<10)
 	for {
 		line, err := reader.ReadString('\n')
@@ -427,6 +628,18 @@ func scanSSE(body io.Reader) *aggregated {
 				}
 				var chunk sseChunk
 				if json.Unmarshal([]byte(data), &chunk) == nil {
+					// "error":null 是正常帧的常见写法（json.RawMessage 会存下 null 四字节）。
+					// 必须在判类型之前排除：否则第一个 null 帧就把 notedError 置位，
+					// 后面真正的错误帧冷却被吞掉（已实测复现）。
+					// notedError 也只在该帧确实可惩罚时置位——不可惩罚的帧不该挡住
+					// 后面真正的 6004。
+					if onError != nil && !notedError && isErrorFrame(chunk.Error) {
+						kind := upstream.ClassifyChatError(http.StatusOK, []byte(data))
+						if kind.Punishes() {
+							notedError = true
+							onError(kind, []byte(data))
+						}
+					}
 					agg.sawAny = true
 					if chunk.ID != "" {
 						agg.ID = chunk.ID

@@ -25,6 +25,7 @@ import (
 	"buddy2api-go/internal/apikey"
 	"buddy2api-go/internal/auth"
 	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/proxy"
 	"buddy2api-go/internal/scheduler"
 	"buddy2api-go/internal/store"
@@ -75,7 +76,21 @@ func main() {
 	client := upstream.New(toks, func() string { return cfg.Get().Region }, cfg.Get().ChatTimeoutSeconds)
 	models := upstream.NewModelCache(cfg.Get().Region, client)
 	keys := apikey.New(st)
+
+	// 号池（实验特性，默认关闭）。
+	//
+	// Manager 常驻构造而不是「开关开了才建」：构造只做两次 SQLite 读 + 一次档案目录
+	// 扫描（个位数账号，<1ms），换来的是「开关切换不需要重建」——重建会丢内存粘性表
+	// 与观测计数，且热建路径要额外在 admin 与 proxy 之间接线。
+	// 关闭时 proxy 侧每个请求只多一次 `h.pool.Enabled()`（一次原子级配置读）。
+	poolMgr := pool.New(cfg, st, toks, client)
 	sched := scheduler.New(cfg, client, st, models)
+	// SetPool 之后必须再 Reconfigure 一次：scheduler.New 内部那次 Reconfigure
+	// 运行时 s.pool 还是 nil，探测 cron 挂不上。不补这一下的话，
+	// 「env 开启号池」或「上次 UI 开过然后重启」的部署，自动探测完全失效——
+	// auto_disabled=quota 的号永远探不回来，只能等用户进实验页点一下开关。
+	sched.SetPool(poolMgr)
+	sched.Reconfigure()
 
 	session, err := admin.NewSession(dataDirAbs)
 	if err != nil {
@@ -83,8 +98,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	proxyH := proxy.New(client, models, keys, st, cfg)
+	proxyH := proxy.New(client, models, keys, st, cfg, poolMgr)
 	adminH := admin.New(cfg, st, toks, client, models, keys, sched, session)
+	adminH.SetPool(poolMgr)
 
 	// 任务侧两个回调由 admin 实现（编排在 taskops，scheduler 只负责到点触发）：
 	//   - 补领清扫：分钟级 ticker，只 accept/claim，把「已达标未领」的奖励领掉；
@@ -177,6 +193,9 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	sched.Stop()
+	// 先停号池落库 worker 并等它刷完，再关数据库：
+	// 否则排队中的禁用状态写入会报「database is closed」，重启后坏号会复活。
+	poolMgr.Close()
 	if err := st.Close(); err != nil { // 显式关闭，避免 os.Exit 跳过 defer
 		slog.Error("关闭数据库失败", "error", err)
 	}

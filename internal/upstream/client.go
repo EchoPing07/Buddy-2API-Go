@@ -25,13 +25,25 @@ type Client struct {
 	toks           *auth.TokenStore
 	regionProvider func() string
 
-	// GrowthBaseOverride / WebBaseOverride / MPBaseOverride / AuthBaseOverride 覆盖
-	// 成长域、Web 域、小程序上报域与 token 刷新域的主机。空值 = 使用端点表 / 官方固定值
-	// （生产恒为空）。用途：指向自建镜像、本地桩服务器（端到端测试），以及逆代期间的流量对照。
+	// GrowthBaseOverride / WebBaseOverride / MPBaseOverride / AuthBaseOverride / ChatBaseOverride
+	// 覆盖成长域、Web 域、小程序上报域、token 刷新域与 chat 域的主机。空值 = 使用端点表 /
+	// 官方固定值（生产恒为空）。用途：指向自建镜像、本地桩服务器（端到端测试），
+	// 以及逆代期间的流量对照。
 	GrowthBaseOverride string
 	WebBaseOverride    string
 	MPBaseOverride     string
 	AuthBaseOverride   string
+	ChatBaseOverride   string
+	// BillingBaseOverride 覆盖 billing 域（余额 / 签到）主机，测试用。
+	BillingBaseOverride string
+}
+
+// billingBase billing 端点主机（测试可覆盖）。
+func (c *Client) billingBase() string {
+	if c.BillingBaseOverride != "" {
+		return c.BillingBaseOverride
+	}
+	return c.ep().Upstream
 }
 
 // New 创建上游客户端。chatTimeoutSeconds 设置 chat 上游的响应头超时（上游多久不开始
@@ -108,8 +120,16 @@ func (c *Client) Chat(ctx context.Context, body []byte) (*http.Response, error) 
 	return c.chatOnce(ctx, body, t)
 }
 
+// chatBase chat 端点主机（测试可覆盖）。
+func (c *Client) chatBase() string {
+	if c.ChatBaseOverride != "" {
+		return c.ChatBaseOverride
+	}
+	return c.ep().Upstream
+}
+
 func (c *Client) chatOnce(ctx context.Context, body []byte, t *auth.Token) (*http.Response, error) {
-	url := c.ep().Upstream + "/v2/chat/completions"
+	url := c.chatBase() + "/v2/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -167,28 +187,76 @@ func sendOnce(cl *http.Client, build func() (*http.Request, error)) (int, []byte
 }
 
 // DoChat 完整 chat 流程：确保 token 有效 → 请求 → 401 则刷新重试一次。
+//
+// 401 且刷不动时返回 error（`token 已失效且刷新失败，请重新登录`）——这是单账号路径
+// 既有的可见文案（proxy 会把它变成 503 + 这句话），不能为号池改变它，
+// 否则关闭号池时会看到不一致的报错。号池走 DoChatWith，那里返回合成的 401 响应。
 func (c *Client) DoChat(ctx context.Context, body []byte) (*http.Response, error) {
-	if _, err := c.token(); err != nil {
-		return nil, err
+	return c.doChatWith(ctx, c.toks, body, false)
+}
+
+// DoChatWith 用指定账号的凭证发 chat（号池专用）。
+//
+// 与 DoChat 的差异有三处：
+//   - 凭证源从 c.toks（当前活动账号）换成传入的 ts；
+//   - 刷新走该 ts 自己的 refreshMu——这就是「每号一个 TokenStore」的回报，
+//     保证 A 号的 token 刷新不会串到 B 号，也不会全校串行；
+//   - 401 且刷不动时返回**合成的 401 响应**而不是 error。原因：号池需要把这个
+//     结果分类成「凭证类账号错误」（可换号重试 + 自动禁用此号），而 error 会被
+//     当成 transport 失败（不重试、不惩罚）——症状是一个死号永远不自愈。
+//
+// 刻意不把 c.toks 改成 map：scheduler / admin / growth 全都依赖
+// 「当前活动账号」语义，改 map 会牵连一大片（见 docs/POOL-LOADBALANCE.md §9.1）。
+func (c *Client) DoChatWith(ctx context.Context, ts *auth.TokenStore, body []byte) (*http.Response, error) {
+	if ts == nil {
+		return nil, ErrNoToken
+	}
+	return c.doChatWith(ctx, ts, body, true)
+}
+
+// doChatWith chat 主流程：ts 决定用哪份凭证、走哪个刷新单飞。
+func (c *Client) doChatWith(ctx context.Context, ts *auth.TokenStore, body []byte, synth401 bool) (*http.Response, error) {
+	t := ts.Get()
+	if t == nil {
+		return nil, ErrNoToken
 	}
 	// 过期则刷新（best-effort，失败仍尝试请求）
-	_ = c.toks.EnsureValid(c.RefreshFn)
+	_ = ts.EnsureValid(c.RefreshFn)
+	if nt := ts.Get(); nt != nil {
+		t = nt
+	}
 
-	resp, err := c.Chat(ctx, body)
+	resp, err := c.chatOnce(ctx, body, t)
 	if err != nil {
 		return nil, fmt.Errorf("上游请求失败: %w", err)
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		resp.Body.Close()
-		if err := c.toks.ForceRefresh(c.RefreshFn); err != nil {
-			return nil, fmt.Errorf("token 已失效且刷新失败，请重新登录: %w", err)
+		if rerr := ts.ForceRefresh(c.RefreshFn); rerr != nil {
+			if synth401 {
+				return synthesizedResponse(http.StatusUnauthorized), nil
+			}
+			return nil, fmt.Errorf("token 已失效且刷新失败，请重新登录: %w", rerr)
 		}
-		resp, err = c.Chat(ctx, body)
+		if nt := ts.Get(); nt != nil {
+			t = nt
+		}
+		resp, err = c.chatOnce(ctx, body, t)
 		if err != nil {
 			return nil, fmt.Errorf("上游请求失败: %w", err)
 		}
 	}
 	return resp, nil
+}
+
+// synthesizedResponse 构造一个无网络来源的响应，供「上游已拒绝但本端不给 body」的场景使用。
+// 调用方负责关闭 Body。
+func synthesizedResponse(status int) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Body:       io.NopCloser(bytes.NewReader(nil)),
+		Header:     make(http.Header),
+	}
 }
 
 // Ping 发最小 chat 验证凭证可用。
@@ -367,26 +435,43 @@ type BillingResult struct {
 }
 
 func (c *Client) billing(path string) (*BillingResult, int, error) {
-	t, err := c.token()
-	if err != nil {
-		return nil, 0, err
+	return c.billingWith(c.toks, path)
+}
+
+// billingWith 用指定凭证存储发 billing 类请求（号池探测专用）。
+//
+// 抽出来而不是让调用方改 c.toks：Client 被 scheduler / admin / growth 共用，
+// 「当前活动账号」语义是既有契约，改它牵连一大片。
+func (c *Client) billingWith(toks *auth.TokenStore, path string) (*BillingResult, int, error) {
+	if toks == nil {
+		return nil, 0, ErrNoToken
+	}
+	if toks.Get() == nil {
+		return nil, 0, ErrNoToken
 	}
 	// billing 前也确保 token 有效
-	if err := c.toks.EnsureValid(c.RefreshFn); err != nil {
+	if err := toks.EnsureValid(c.RefreshFn); err != nil {
 		return nil, 0, err
 	}
-	t = c.toks.Get()
+	t := toks.Get()
 	if t == nil { // EnsureValid 与 Get 之间可能被并发登出清空
 		return nil, 0, ErrNoToken
 	}
 	old := *t
 	old.Domain = orDefault(t.Domain, c.ep().Domain)
-	status, raw, err := postJSON(c.short, c.ep().Upstream+path, "{}", billingHeaders(&old))
+	status, raw, err := postJSON(c.short, c.billingBase()+path, "{}", billingHeaders(&old))
 	if err != nil {
 		return nil, status, err
 	}
 	var env envelope
 	_ = json.Unmarshal(raw, &env)
+	if status == http.StatusUnauthorized {
+		// 401 用哨兵错误包一层：调用方（号池探测）需要把「凭证不可用」与
+		// 「网络/上游故障」分开处理——前者要禁用该号等重新登录，后者不能改任何状态，
+		// 否则一次断网会把好号永久禁掉。
+		return &BillingResult{Raw: raw}, status,
+			fmt.Errorf("%w: billing 返回 401", ErrUpstreamUnauthorized)
+	}
 	if status != http.StatusOK {
 		return &BillingResult{Raw: raw}, status, fmt.Errorf("billing 返回 %d: %s", status, truncStr(string(raw), 300))
 	}
@@ -399,6 +484,16 @@ func (c *Client) billing(path string) (*BillingResult, int, error) {
 // Resources 官方余额（get-user-resource）。
 func (c *Client) Resources() (*BillingResult, error) {
 	r, _, err := c.billing("/v2/billing/meter/get-user-resource")
+	return r, err
+}
+
+// ResourcesWith 用指定账号的凭证查官方余额（号池探测专用）。
+//
+// 一次调用同时回答「凭证可用吗」和「还有额度吗」，且内部已 EnsureValid，
+// 所以探测本身就把过期 token 刷回来了——这是自动恢复能覆盖「凭证过期」的原因。
+// 号池每号一份 TokenStore，各自的 refreshMu 保证刷新单飞互不干扰。
+func (c *Client) ResourcesWith(toks *auth.TokenStore) (*BillingResult, error) {
+	r, _, err := c.billingWith(toks, "/v2/billing/meter/get-user-resource")
 	return r, err
 }
 
@@ -546,3 +641,9 @@ func truncStr(s string, n int) string {
 
 // ErrUpstreamAuth 判断是否为需要重新登录的错误。
 func ErrUpstreamAuth(err error) bool { return errors.Is(err, ErrNoToken) }
+
+// ErrUpstreamUnauthorized 上游明确回了 401（凭证不可用）。
+//
+// 与 ErrNoToken（本地没有凭证）分开：前者要「禁用该号等重新登录」，
+// 后者是本地配置问题。两者都不能与网络错误混为一谈。
+var ErrUpstreamUnauthorized = errors.New("上游返回 401（凭证不可用）")

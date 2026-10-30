@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"buddy2api-go/internal/auth"
+	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/store"
 	"buddy2api-go/internal/upstream"
 )
@@ -320,5 +324,52 @@ func TestAccountRefreshNeverInvalidates(t *testing.T) {
 	}
 	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyReportDay, 0); !ok || payload != day {
 		t.Errorf("续期不应清 report_day，得到 ok=%v payload=%q", ok, payload)
+	}
+}
+
+// TestAccountDeleteRemovesFromPool 「退出登录」必须把该账号从号池摘掉。
+//
+// 回归：号池为每个账号自持一份 TokenStore（含 refresh_token），而
+// TokenStore.Clear() 只清 token.json 那一份。不摘成员的话，用户登出后
+// chat 仍会继续以该账号发请求（还可能把刷新的 token 写回已删除的文件）。
+func TestAccountDeleteRemovesFromPool(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Update(func(c *config.Config) error { c.PoolEnabled = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	toks, err := auth.NewTokenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := toks.Save(&auth.Token{UID: "u1", AccessToken: "at-u1", Domain: "www.codebuddy.cn",
+		ExpiresAt: time.Now().Add(time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	client := upstream.New(toks, func() string { return "cn" }, 30)
+	m := pool.New(cfg, st, toks, client)
+	t.Cleanup(func() { m.Close() })
+
+	h := &Handler{cfg: cfg, st: st, toks: toks, client: client, growth: &fakeGrowthAPI{}, sched: &fakeSched{}, pool: m}
+	if len(m.Members()) != 1 {
+		t.Fatalf("初始应有 1 个成员，实际 %v", m.Members())
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/account", nil)
+	rr := httptest.NewRecorder()
+	h.accountDelete(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("登出失败 %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := m.Members(); len(got) != 0 {
+		t.Errorf("登出后号池不应还持有该账号，实际 %v", got)
 	}
 }

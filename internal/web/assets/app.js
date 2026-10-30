@@ -66,6 +66,7 @@ function appShell(){
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{name:'',custom_key:''}, keyModal:false,
     resources:{accounts:[],loaded:false},
+    pool:null,   // 号池状态快照（GET /admin/pool；仅开关开启时有值）
     _resourceRefetch:false,   // 在途期间到来的强刷意图（见 pages/resources.js loadResources）
     /* 账号代次：换账号 / 删凭证时 +1。账号口径加载器发请求前捕获代次、响应落地时比对，
        不一致则丢弃 —— 否则旧账号响应晚于新账号落地会把新数据覆盖回旧值（last-write-wins）。
@@ -82,7 +83,10 @@ function appShell(){
     growthBusy:false,           // 上报/领养等长动作锁（与全局 loading 分开：上报要 10s）
     growthRunT:0,               // 总览防抖 timer
     settings:{}, pwForm:{old_password:'',new_password:''},
-    labs:{embeddings_enabled:false},  // 实验特性开关（见 pages/labs.js）
+    /* 实验特性开关（见 pages/labs.js）。号池字段默认全关 + 默认参数，
+       与后端 config.defaults() 同一组默认值（不一致会让开关看起来"自己变了"）。 */
+    labs:{embeddings_enabled:false, pool_enabled:false, pool_session_ttl:180,
+          pool_max_retry:2, pool_cool_max_min:360, pool_probe_cron:'0 0 0,6,12,18 * * *'},
     models:{models:[],ids:[],state:null,loading:false},
     importModal:false, importMode:'single',
     importForm:{access_token:'',refresh_token:'',domain:'',filename:''},
