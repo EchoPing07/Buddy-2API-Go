@@ -8,15 +8,35 @@
 
 ## [Unreleased]
 
+### ⚠️ 升级注意
+
+- **`GET /admin/account/export` 响应由裸 `token.json` 改为凭证包**（`{format:"buddy2api.accounts", version, exported_at, active_uid, accounts[]}`），新增 `?scope=current|selected` 与 `uids`，不再兼容旧格式。第三方脚本若解析导出结果需同步；已保存的旧 `token.json` 仍可通过「导入凭证 → 单个账号」继续导入。
+
 ### ✨ 新功能
 
+- **导出凭证改为弹窗，分「单个导出 / 批量导出」**：账号页「导出凭证」不再点一下直接下载 `token.json`，而是打开弹窗选择方式。**单个导出**导当前活动账号（无活动账号时置灰）；**批量导出**在账号列表中勾选，且**默认全选**，配合「全选 / 取消全选」按钮即可覆盖旧「全部账号」的用法 —— 因此**不再单设「全部账号」第三种范围**（多一条分支就多一处口径要维护，且多选与全选复用同一条 `selected` 路径才能保证两者等价）。两种导出**统一输出凭证包**（`auth.Bundle`：`format` / `version` / `exported_at` / `active_uid` / `accounts[]`），**单账号导出也改用该格式，不再兼容旧的裸 `token.json`** —— 两种形状并存时导入侧要猜「收到的是一份凭证还是一个包」，猜错会把 `{format,accounts}` 当成一份凭证存进档案（`access_token` 为空）。`GET /admin/account/export` 新增 `?scope=current|selected`（`selected` 配 `uids=a,b`），响应带 `X-Export-Count` / `X-Export-Missing`，文件名走 `Content-Disposition`（uid 经 `safeFileToken` 过滤，避免头注入）。
+- **导入凭证新增「批量导入」**：导入弹窗分「单个账号 / 批量导入」两种模式。批量导入选凭证包后本地先解析并预览包里有哪些账号（uid/昵称从 JWT 现解），确认后 `POST /admin/account/import/batch` 一次性入档，**语义恒为「仅导入」：不切换当前账号**（一次导入多个账号时该启用哪个无从判断），导入后到「账号切换」卡片点切换启用。逐条尽力而为：一条坏凭证只让该条报错（结果逐条展示在弹窗里），不让整包失败；全部失败才回 400。整包按 `format` / `version` 硬校验，旧裸 `token.json` 与任意 JSON 一律拒收。两种模式自适应切换：单个模式选到凭证包自动转批量，批量模式选到 `token.json` 自动转单个并回填。
 - **导入凭证拆为「仅导入」与「导入并启用」**：`POST /admin/account/import` 新增 `activate` 字段。默认（不带该字段）为「仅导入」：只把凭证写入账号档案 `data/accounts/<id>.json`，**不改动当前活动账号 `token.json`**，也不再清账号口径缓存或复位调度器日内状态 —— 一次导入多个备用账号时，当前账号的余额 / 签到 / 「今日已上报」都不受影响；弹窗内提示后可到「账号切换」卡片点「切换」启用。带 `"activate":true` 则为「导入并启用」，行为与此前一致（写凭证 → 入档 → 真换账号才 `invalidateAccountCaches()`）。导入弹窗底部因此由单一「导入」改为「仅导入」+「导入并启用」两个按钮（回车默认走「仅导入」）；仅导入时前端只 `loadAccounts()` 刷新档案列表，不触发 `refreshAccountData()`。仅导入路径下档案写入失败会直接回 500（档案是唯一产物），而登录 / 启用路径的入档失败仍只留痕（凭证已落盘）。仅导入的凭证「端点不匹配」提示照常出现在列表里。
 - **模型列表 chip 点击即复制模型 ID**：总览页「模型列表」的每个模型标签改为可点按钮，点一下把模型 `id` 复制到剪贴板（客户端接入填的是 id 而非显示名，同名模型消歧后的 `disp` 仍作展示），复用全站 `copy()` 实现（含 HTTP 局域网下的 `execCommand` 降级），并补 hover / `:active` / `:focus-visible` 反馈与 `aria-label`。
 - **OpenAI 兼容嵌入端点 `POST /v1/embeddings`（实验特性，默认关闭）**：新增侧边栏「实验」页，嵌入端点开关与调用示例集中于此（开关即时落库，走 `GET/PUT /admin/experiments`；env `BUDDY2API_EMBEDDINGS_ENABLED` 可强制覆盖）。关闭时端点返回 403 `embeddings_disabled` 且 `GET /v1/models` 不列出嵌入模型；开启后对接上游 `/v2/embeddings`（与 chat 模型注册表相互独立），`input` 支持字符串 / 字符串数组（token id 数组不支持，明确报 400），响应为标准 OpenAI 形状（`data[i]` 补 `index`，附 `usage`）。模型名透传上游，实测注册表仅 `bge-m3`（1024 维）可用：`/v3/config` 中的 `nes-gf` 等条目不属于嵌入注册表，调用将得到 404 `model_not_found`（附已知模型提示）。凭证链路与 chat 一致（token 过期预刷新 + 401 刷新重试一次）。
 - **多账号存档与手动切换**：账号页新增「账号切换」卡片。OAuth 登录 / 凭证导入成功后自动存档到 `data/accounts/<id>.json`（0600），列表显示昵称、uid、端点、有效期与当前标记，可一键切换或移除（当前账号不可移除）。活动账号始终只有 `data/token.json` 一份：切换 = 归档当前 → 用目标档案覆盖 → `invalidateAccountCaches()`，upstream / proxy / scheduler 无需感知；不含轮询、负载均衡或故障转移。切到同一账号不失效缓存（与 `accountSwitched` 同口径），避免当天活跃上报翻倍。新增 `GET /admin/accounts`、`POST /admin/accounts/{uid}/activate`、`DELETE /admin/accounts/{uid}`，列表只返回元信息、不含任何凭证。
 
+### 🐞 修复
+
+- **分段控件（导入 / 导出弹窗的方式切换）选中项 hover 时文字消失**：`.seg-btn:hover` 无条件把字色改成 `--fg`，而选中项的背景已是主色（`--primary`，浅色模式下即深色），两者同色导致文字看不见。改为 hover 只作用于未选中项（`:not(.is-active)`），选中项 hover 只降不透明度；同时给未选中项 hover 补一层淡背景，与全站按钮的 hover 反馈一致。
+
+- **批量导入的实测缺陷修复（自查发现）**：
+  1. 请求体上限从继承 `readJSON` 的 1MB 提到 **8MB**，超限回 **413 +「凭证包过大」**。原先 `io.LimitReader(body, 1<<20)` 会把超限请求静默截成半截 JSON，报「不是合法 JSON: unexpected end of JSON input」；而一条真实凭证缩进后约 5KB、导出侧不限条数，**约 200 个账号就撞上「导得出、导不回」**。实现上多读 1 字节以区分「恰好到上限」与「被截断」。
+  2. **同一包内重复 uid** 原先两条都报「已导入」（实际后者覆盖前者、`imported` 虚高）。现按重复跳过并说明「与第 N 条是同一账号」。
+  3. 覆盖已存在档案的条目标 `overwrote`（汇总同步给计数）。回复旧备份时本地较新的凭证被静默替换，不标出来用户无从察觉。
+  4. 前端：**全部失败时逐条明细被丢弃**。后端回 400 + `items`，而 `api()` 只抛 `error` 字符串，用户只看到「HTTP 400」——恰是最需要看明细的场景。现 `api()` 把响应体挂上 `error.body`，`importBatch` 据此渲染明细。
+  5. 前端：整包失败后重试成功，红色错误与「导入完成」同时显示。成功路径与每次提交前均清 `error`/`result`。
+  6. 前端：**「取消全选」的意图被静默还原成全选**。`setExportScope` 原在 `uids` 为空时无条件全选，用户清空选择 → 切单个 → 切回批量后又被填满，一点导出就把全部账号导出去。改用 `exportForm.touched` 区分「首次进入的默认全选」与「用户主动清空」。
+  回归用例：`TestAccountImportBatchTooLarge`、`TestAccountImportBatchAcceptsMultipleMB`、`TestAccountImportBatchFlagsDuplicateUID`、`TestAccountImportBatchFlagsOverwrite`（Go 侧），harness 14d/14e/14f/14g（前端）；均已在回退对应修复后确认会失败。
+
 ### 🔧 工程与文档
 
+- 新增 `internal/auth/bundle.go` 与 `bundle_test.go`（凭证包往返 / 快照拷贝 / JWT 补齐 / 非法输入拒收 / 坏凭证留待逐条判定）；新增 `internal/admin/export_import_test.go`（两种导出范围、`selected` 部分缺失、未入档活动账号经列表自愈后仍可全选导出、`scope=all` 已移除、导出→导入闭环、批量导入部分失败 / 全失败 / 非法请求体、缓存不被触碰、文件片段与响应头归一）。前端 harness 新增第 13～16 组断言（导出范围与 URL、文件名回退、失败不关弹窗、批量导入不带 `activate`、模式自适应），Web 侧新增 `TestAccountPageNoDanglingHandlers` / `TestAccountPageExportImportUI`。
 - 新增 `TestAccountImportOnlyKeepsActiveCredential`（仅导入：活动凭证不变、档案出现、缓存与日内状态均不碰）与 `TestAccountImportActivateSwitches`（导入并启用：换凭证 + 清缓存 + `ResetAccountState`→`Reconfigure`）；原有换账号用例改用 `activate:true`。前端行为用例（`TestFrontendInitialLoad` 第 10 组）拆为 10a / 10a-2，分别断言两个按钮发出的 `activate` 值与是否强刷账号口径数据。
 - 新增 `internal/upstream/embeddings_test.go`（请求形状 / 404 模型缺失 / 401 刷新重试 / 条数不符防御 / 200 包错误码防御）、`internal/proxy/embeddings_test.go`（input 归一、响应契约、实验开关门控 403 与 `/v1/models` 条件追加）与 `internal/admin/experiments_test.go`（默认关闭、开关节奏、缺字段 400、env 锁定不生效）；`RefreshFn` 的请求主机改经 `authBase` 变量（生产行为不变），供单测以 httptest 替换。README 端点表 / 使用示例 / env 表补 `/v1/embeddings` 与实验页口径；web_test 页面数断言随「实验」页 7→8。
 - 新增 `internal/auth/accounts_test.go`（存档 / 列表 / 读取 / 删除 / 非法 UID 归一）与 `internal/admin/accounts_test.go`（切换生效、旧账号归档、缓存失效、同账号不清缓存）；README / DEVELOPMENT 同步「单一活动账号 + 手动切换」的定位口径。

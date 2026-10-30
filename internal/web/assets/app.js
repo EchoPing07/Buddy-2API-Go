@@ -84,8 +84,13 @@ function appShell(){
     settings:{}, pwForm:{old_password:'',new_password:''},
     labs:{embeddings_enabled:false},  // 实验特性开关（见 pages/labs.js）
     models:{models:[],ids:[],state:null,loading:false},
-    importModal:false, importForm:{access_token:'',refresh_token:'',domain:'',filename:''},
+    importModal:false, importMode:'single',
+    importForm:{access_token:'',refresh_token:'',domain:'',filename:''},
     importActivate:false,      // 导入弹窗当前在跑的是哪一个动作（"仅导入"/"导入并启用"），仅用于按钮 loading 态
+    batchForm:{filename:'',items:[],error:'',bundle:null},   // 批量导入：已解析的凭证包（bundle 原样回传服务端）
+    batchResult:null,          // 批量导入逐条结果（null = 本轮还没执行过）
+    exportModal:false,
+    exportForm:{scope:'current',uids:[],touched:false},   // 导出方式：current（单个）/ selected（批量）；touched=用户是否动过勾选
     confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},
     oauth:{state:'',auth_url:'',poll_msg:'等待授权中…',_timer:null,_deadline:0},
     _chartGeom:null,
@@ -203,7 +208,13 @@ function appShell(){
       // 若一并当作会话过期，用户看到的是「登录已过期」，而服务端返回的「密码错误」被吞掉。
       if(r.status===401 && path!=='/admin/login'){ this.loggedIn=false; this.resetSession(); throw new Error('登录已过期'); }
       const data = await r.json().catch(()=>({}));
-      if(!r.ok) throw new Error(data.error||('HTTP '+r.status));
+      if(!r.ok){
+        const err = new Error(data.error||('HTTP '+r.status));
+        // 挂上原始响应体：部分端点（如批量导入）在非 2xx 时仍返回逐条明细 items，
+        // 只抛 error 字符串会把最该看的内容丢掉（见 pages/account.js importBatch）。
+        err.body = data; err.status = r.status;
+        throw err;
+      }
       return data;
     },
     /* 会话边界：清空「已进场」缓存。401 或退出后再登录属新会话，数据已失效；

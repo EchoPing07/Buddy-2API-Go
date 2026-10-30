@@ -88,6 +88,7 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Delete("/account", h.accountDelete)
 			r.Get("/account/export", h.accountExport)
 			r.Post("/account/import", h.accountImport)
+			r.Post("/account/import/batch", h.accountImportBatch)
 			// 多账号档案：手动切换到某个已存账号（无轮询 / 无故障转移）。
 			r.Get("/accounts", h.listAccounts)
 			r.Post("/accounts/{uid}/activate", h.activateAccount)
@@ -366,21 +367,154 @@ func (h *Handler) accountDelete(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// accountExport 导出当前账号凭证为 token.json（下载附件）。
+// 导出范围（GET /admin/account/export?scope=）。
+//
+// 只有两种：单个（当前活动账号）与批量（uids 指定）。刻意不提供「全部账号」这种第三种 ——
+// 批量导出在前端默认全选（且 /admin/accounts 会自愈补存未入档的活动账号），
+// 「全选 + 导出」已经完全覆盖它，多一个分支只是多一处口径要维护。
+const (
+	exportScopeCurrent  = "current"  // 只导当前活动账号（token.json）
+	exportScopeSelected = "selected" // 导出 uids 指定的账号
+)
+
+// accountExport 导出凭证包（下载附件）。
+//
+// 两种范围统一输出 auth.Bundle（见 auth/bundle.go）：单账号导出与批量导出同构，导入侧只需
+// 一条路径。刻意不再兼容旧的 token.json 裸格式 —— 两种形状并存时，导入侧要猜「收到的到底是
+// 一份凭证还是一个包」，而猜错会把 {format, accounts} 当成一份凭证存进档案（access_token 为空）。
+//
+//   - scope=current（默认）：只导 token.json 里那一份
+//   - scope=selected：uids 用逗号分隔（可重复传参）；档案不存在的按缺失报错
 func (h *Handler) accountExport(w http.ResponseWriter, r *http.Request) {
-	t := h.toks.Get()
-	if t == nil {
-		jsonErr(w, http.StatusBadRequest, "尚未登录，无凭证可导出")
+	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	if scope == "" {
+		scope = exportScopeCurrent
+	}
+	active := h.toks.Get()
+	activeUID := ""
+	if active != nil {
+		activeUID = active.UID
+	}
+
+	var toks []*auth.Token
+	switch scope {
+	case exportScopeCurrent:
+		if active == nil {
+			jsonErr(w, http.StatusBadRequest, "尚未登录，无凭证可导出")
+			return
+		}
+		toks = []*auth.Token{active}
+	case exportScopeSelected:
+		uids := exportUIDs(r)
+		if len(uids) == 0 {
+			jsonErr(w, http.StatusBadRequest, "未指定要导出的账号")
+			return
+		}
+		var missing []string
+		for _, uid := range uids {
+			// 活动账号以 token.json 为准：档案是旁挂副本，刷新后可能落后于 token.json
+			if active != nil && active.UID == uid {
+				toks = append(toks, active)
+				continue
+			}
+			t, err := h.accountBook().Load(uid)
+			if err != nil {
+				if errors.Is(err, auth.ErrAccountNotFound) {
+					missing = append(missing, uid)
+					continue
+				}
+				jsonErr(w, http.StatusInternalServerError, "读取账号档案失败: "+err.Error())
+				return
+			}
+			toks = append(toks, t)
+		}
+		if len(toks) == 0 {
+			jsonErr(w, http.StatusBadRequest, "所选账号不存在，无凭证可导出")
+			return
+		}
+		// 部分缺失但仍有可导的：照导，前端据 missing 提示（不静默少导账号）
+		// 值含 uid（JWT sub，可控）：经 headerSafe 剔除控制字符，否则构成响应头注入
+		if len(missing) > 0 {
+			w.Header().Set("X-Export-Missing", headerSafe(strings.Join(missing, ",")))
+		}
+	default:
+		jsonErr(w, http.StatusBadRequest, "未知的导出范围: "+scope)
 		return
 	}
-	data, err := json.MarshalIndent(t, "", "  ")
+
+	now := time.Now()
+	b := auth.NewBundle(now.Unix(), activeUID, toks)
+	data, err := json.MarshalIndent(b, "", "  ")
 	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 文件名纯 ASCII（账号昵称可能含中文，塞进 header 需要 RFC 5987 编码，得不偿失）
+	name := "buddy2api-accounts-" + now.Format("20060102-150405") + ".json"
+	if scope == exportScopeCurrent {
+		name = "buddy2api-account-" + safeFileToken(activeUID) + ".json"
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="token.json"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	w.Header().Set("X-Export-Count", strconv.Itoa(len(b.Accounts)))
 	w.Write(data)
+}
+
+// exportUIDs 解析 scope=selected 的 uids 参数：支持 uids=a,b 与重复的 uids=a&uids=b，去重保序。
+func exportUIDs(r *http.Request) []string {
+	q := r.URL.Query()
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range q["uids"] {
+		for _, uid := range strings.Split(raw, ",") {
+			uid = strings.TrimSpace(uid)
+			if uid == "" || seen[uid] {
+				continue
+			}
+			seen[uid] = true
+			out = append(out, uid)
+		}
+	}
+	return out
+}
+
+// headerSafe 过滤要放进 HTTP 头的值：只留可打印 ASCII，其余（控制字符、CR/LF、非 ASCII）化为 '?'。
+//
+// 这些值可能来自 uid（JWT sub，攻击者可控），直接 Set 会让 CR/LF 剖断头部形成响应头注入。
+// 不做 URL 编码：结果只用于前端提示文案，可读性优先于可逆性。
+func headerSafe(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 0x20 && r < 0x7f {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('?')
+		}
+		if b.Len() >= 512 { // 头长度上限：异常 uid 不应无限制撑大响应头
+			break
+		}
+	}
+	return b.String()
+}
+
+// safeFileToken 把 uid 归一为可安全放进文件名 / header 的片段。
+// 昵称与 uid 都可能含任意字符，此处不允许任何非 ASCII 字母数字，其余一律下划线。
+func safeFileToken(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+		if b.Len() >= 32 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
 }
 
 // accountImport 导入账号凭证，必须含 access_token（合法 JWT），其余可选。
@@ -389,41 +523,14 @@ func (h *Handler) accountExport(w http.ResponseWriter, r *http.Request) {
 // 用户可一次导入多个账号，再在「账号切换」里挑一个启用。activate=true 时才写 token.json
 // （立即启用），与切换档案同口径：清账号口径缓存 + 复位调度器日内状态。
 func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		TokenType    string `json:"token_type"`
-		ExpiresAt    int64  `json:"expires_at"`
-		Domain       string `json:"domain"`
-		Nickname     string `json:"nickname"`
-		Activate     bool   `json:"activate"`
-	}
+	var req importRequest
 	if !readJSON(w, r, &req) {
 		return
 	}
-	req.AccessToken = strings.TrimSpace(req.AccessToken)
-	if req.AccessToken == "" {
-		jsonErr(w, http.StatusBadRequest, "access_token 不能为空")
+	t, errMsg := h.importedToken(req)
+	if t == nil {
+		jsonErr(w, http.StatusBadRequest, errMsg)
 		return
-	}
-	if _, _, _, _, _, err := auth.ParseJWT(req.AccessToken); err != nil {
-		jsonErr(w, http.StatusBadRequest, "access_token 不是合法 JWT: "+err.Error())
-		return
-	}
-	t := &auth.Token{
-		AccessToken:  req.AccessToken,
-		RefreshToken: strings.TrimSpace(req.RefreshToken),
-		TokenType:    strings.TrimSpace(req.TokenType),
-		ExpiresAt:    req.ExpiresAt,
-		Domain:       strings.TrimSpace(req.Domain),
-		Nickname:     strings.TrimSpace(req.Nickname),
-	}
-	t.EnrichFromJWT()
-	if t.TokenType == "" {
-		t.TokenType = "Bearer"
-	}
-	if t.Domain == "" {
-		t.Domain = config.EndpointOf(h.cfg.Get().Region).Domain
 	}
 	if !req.Activate {
 		// 仅导入：唯一产出就是这份档案，所以存档失败必须报错（启用路径可以只留痕，
@@ -457,6 +564,163 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		"nickname": t.Nickname,
 		"domain":   t.Domain,
 		"activate": true,
+	})
+}
+
+// importRequest 单账号导入请求体；也是批量包里单条的宽松形式（两者字段一一对应）。
+type importRequest struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresAt    int64  `json:"expires_at"`
+	Domain       string `json:"domain"`
+	Nickname     string `json:"nickname"`
+	Activate     bool   `json:"activate"`
+}
+
+// importedToken 校验并归一一份待导入凭证（单导入与批量导入共用）。
+// 失败返回 (nil, 给用户看的原因)；成功后 token_type 默认 Bearer、domain 缺省按当前端点。
+func (h *Handler) importedToken(req importRequest) (*auth.Token, string) {
+	tok := strings.TrimSpace(req.AccessToken)
+	if tok == "" {
+		return nil, "access_token 不能为空"
+	}
+	if _, _, _, _, _, err := auth.ParseJWT(tok); err != nil {
+		return nil, "access_token 不是合法 JWT: " + err.Error()
+	}
+	t := &auth.Token{
+		AccessToken:  tok,
+		RefreshToken: strings.TrimSpace(req.RefreshToken),
+		TokenType:    strings.TrimSpace(req.TokenType),
+		ExpiresAt:    req.ExpiresAt,
+		Domain:       strings.TrimSpace(req.Domain),
+		Nickname:     strings.TrimSpace(req.Nickname),
+	}
+	t.EnrichFromJWT()
+	if t.TokenType == "" {
+		t.TokenType = "Bearer"
+	}
+	if t.Domain == "" {
+		t.Domain = config.EndpointOf(h.cfg.Get().Region).Domain
+	}
+	return t, ""
+}
+
+// bundleImportMaxBytes 批量导入请求体上限。
+//
+// 刻意比 readJSON 的 1MB 宽松：一条真实凭证（access_token ~1.4KB + refresh_token ~1.1KB，
+// 缩进 JSON 后约 5KB）意味着 1MB 只能装 ~200 个账号，而「导出全部」不限条数 —— 导出能产出、
+// 导入却装不下的包是最难解释的一类失败。8MB 可容纳上千个账号，同时仍防住内存放大。
+const bundleImportMaxBytes = 8 << 20
+
+// accountImportBatch 批量导入凭证包（POST /admin/account/import/batch，body 即 auth.Bundle）。
+//
+// 与单导入的「仅导入」完全同口径：**只入档，不换活动账号**。刻意不提供 activate ——
+// 一次导入多个账号时该启用哪个无从判断，切账号统一由「账号切换」卡片承担。
+//
+// 语义是逐条独立尽力而为之（不是全或无）：一条坏掉不应让整包失败，否则用户得先手工清理
+// 包里的脏数据才能导入剩下的九十九条。每条结果（ok / error）都回给前端逐条展示。
+func (h *Handler) accountImportBatch(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength > bundleImportMaxBytes {
+		jsonErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"凭证包过大（%.1f MB）：单次导入上限 %.0f MB，请拆分后再导入",
+			float64(r.ContentLength)/(1<<20), float64(bundleImportMaxBytes)/(1<<20)))
+		return
+	}
+	// 多读 1 字节：用来区分「恰好到上限」与「被截断」——
+	// 直接 LimitReader 到上限会让超限请求变成半截 JSON，用户看到的是
+	// 「不是合法 JSON: unexpected end of JSON input」，完全指不出真正原因。
+	raw, err := io.ReadAll(io.LimitReader(r.Body, bundleImportMaxBytes+1))
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, "读取请求体失败")
+		return
+	}
+	if len(raw) > bundleImportMaxBytes {
+		jsonErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"凭证包过大：单次导入上限 %.0f MB，请拆分后再导入",
+			float64(bundleImportMaxBytes)/(1<<20)))
+		return
+	}
+	bundle, err := auth.UnmarshalBundle(raw)
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	book := h.accountBook()
+	type importResult struct {
+		UID      string `json:"uid,omitempty"`
+		Nickname string `json:"nickname,omitempty"`
+		Domain   string `json:"domain,omitempty"`
+		OK       bool   `json:"ok"`
+		Error    string `json:"error,omitempty"`
+		// Overwrote 本条目覆盖了已存在的同名档案（重复导入 / 回复旧备份时会出现）。
+		// 结果里必须显式标出来：否则用户无法意识到本地较新的凭证已被包里的旧数据替换。
+		Overwrote bool `json:"overwrote,omitempty"`
+	}
+	results := make([]importResult, 0, len(bundle.Accounts))
+	// 先取现存档案的 uid 集合：Save 是「同名覆盖」，不先查就只能事后猜。
+	// List 失败不阻断导入（档案目录可能尚不存在），此时按「都是新账号」处理。
+	existing := map[string]bool{}
+	if metas, err := book.List(); err == nil {
+		for _, m := range metas {
+			existing[m.UID] = true
+		}
+	}
+	imported, failed, overwrote := 0, 0, 0
+	// seen 记录本包内已出现过的 uid：同一包里同一账号出现两次时后者会静默覆盖前者，
+	// 若不报出来，用户会以为导入成功了两份不同账号（imported 也会虚高）。
+	seen := map[string]int{}
+	for i, item := range bundle.Accounts {
+		t, errMsg := h.importedToken(importRequest{
+			AccessToken:  item.AccessToken,
+			RefreshToken: item.RefreshToken,
+			TokenType:    item.TokenType,
+			ExpiresAt:    item.ExpiresAt,
+			Domain:       item.Domain,
+			Nickname:     item.Nickname,
+		})
+		if t == nil {
+			failed++
+			results = append(results, importResult{Error: fmt.Sprintf("第 %d 条：%s", i+1, errMsg)})
+			continue
+		}
+		if prev, dup := seen[t.UID]; dup {
+			// 不算失败（凭证本身合法），但不能计入 imported 的新增数，且必须提示覆盖了哪一条
+			failed++
+			results = append(results, importResult{UID: t.UID, Nickname: t.Nickname,
+				Error: fmt.Sprintf("第 %d 条：与第 %d 条是同一账号（uid %s），已跳过；请确认包里是否重复",
+					i+1, prev, t.UID)})
+			continue
+		}
+		if err := book.Save(t); err != nil {
+			failed++
+			results = append(results, importResult{UID: t.UID, Nickname: t.Nickname,
+				Error: "保存账号档案失败: " + err.Error()})
+			continue
+		}
+		seen[t.UID] = i + 1
+		imported++
+		was := existing[t.UID]
+		if was {
+			overwrote++
+		}
+		results = append(results, importResult{UID: t.UID, Nickname: t.Nickname, Domain: t.Domain,
+			OK: true, Overwrote: was})
+	}
+	// 全部失败时给 400：前端就能用统一的错误气泡，而不是弹一个「成功」再列全红。
+	// 部分成功则以 200 + 逐条结果返回，前端展示明细。
+	status := http.StatusOK
+	if imported == 0 {
+		status = http.StatusBadRequest
+	}
+	jsonWrite(w, status, map[string]any{
+		"ok":        imported > 0,
+		"imported":  imported,
+		"failed":    failed,
+		"overwrote": overwrote,
+		"total":     len(results),
+		"active":    false, // 批量导入恒不切换活动账号（与单导入「仅导入」一致）
+		"items":     results,
 	})
 }
 

@@ -27,6 +27,7 @@
 | ----------- | ------------------------------------------------------- |
 | 单一活动账号      | 同一时刻只有一份活动凭证（`data/token.json`），OAuth 登录              |
 | 多账号切换       | 登录 / 导入的凭证自动存档到 `data/accounts/`，账号页一键切换（手动，不轮询） |
+| 凭证导入导出      | 导出弹窗可选「当前 / 全部 / 选择」账号，统一输出凭证包；导入分「单个账号」（token.json / 手填 JWT）与「批量导入」（凭证包一次入档，不切换当前账号） |
 | OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/embeddings`（实验，默认关）、`/v1/models`、`/health` |
 | 多 API Key   | 随机 / 自定义 Key，支持备注、启停、使用量统计                              |
 | 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期，可一键隐藏已用完 / 已过期额度包 |
@@ -187,7 +188,8 @@ curl http://127.0.0.1:10082/v1/embeddings \
 | `POST /admin/login` `POST /admin/logout` `GET /admin/session` | 密码登录 / 登出 / 会话状态 |
 | `GET /admin/account` `POST /admin/account/oauth/start` `GET /admin/account/oauth/poll` | 账号摘要 / OAuth 发起 / OAuth 轮询（登录成功即写凭证并清旧账号缓存） |
 | `POST /admin/account/refresh` `POST /admin/account/test` `DELETE /admin/account` | 手动刷新 / 测试凭证 / 清空凭证（仅清空会一并清旧账号缓存并复位调度器日内状态） |
-| `POST /admin/account/import` `GET /admin/account/export` | 导入凭证（JWT，默认**仅导入**：只写账号档案、不动活动凭证）/ 导出 `token.json`。带 `"activate":true` 时等同「导入并启用」（写凭证 + 切缓存，与登录同口径） |
+| `POST /admin/account/import` `POST /admin/account/import/batch` | 导入凭证：单账号（JWT，`"activate":true` 为「导入并启用」，缺省仅导入）/ 批量导入凭证包（**恒只入档**，不切换当前账号） |
+| `GET /admin/account/export?scope=current\|selected` | 导出凭证包（JSON，内含 `access_token`）。单账号与多账号同构：`current`=单个（当前活动账号）、`selected`=批量（配 `uids=a,b`） |
 | `GET /admin/accounts` `POST /admin/accounts/{uid}/activate` `DELETE /admin/accounts/{uid}` | 已存账号列表（仅元信息）/ 切换当前账号 / 移除档案（当前账号不可移除） |
 | `GET /admin/resources` | 官方余额（带缓存，`?force=1` 强刷） |
 | `GET /admin/checkin/status` `POST /admin/checkin/claim` | 签到状态 / 领取 |

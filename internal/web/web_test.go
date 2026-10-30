@@ -603,6 +603,8 @@ Object.keys(PAGES).forEach(function (k) {
 });
 inst.loadHealth = function () { loads.push('loadHealth'); };
 inst.$nextTick = function (fn) { fn(); }; // Alpine magic（onPop 的滚动回位用）
+// api() 保留真实现：14f 要验证它把响应体挂到 error 上（明细靠这条链路传给 importBatch）
+real.api = inst.api;
 
 function fail(msg) {
   console.error('FAIL: ' + msg + ' | loads=' + JSON.stringify(loads) +
@@ -934,6 +936,246 @@ if (inst.checkin.random_target !== '20:00') {
 }
 global.fetch = savedFetch;
 
+// 13) 导出弹窗：三种范围（当前 / 全部 / 选择），统一走凭证包端点
+// 回归：导出原先是「点一下就下载当前 token.json」，无法备份整批账号；现在开弹窗选范围。
+inst.account = { logged_in: true, nickname: '当前账号', uid: 'uid-cur', has_refresh: true, expired: false };
+inst.accounts = { loaded: true, items: [
+  { uid: 'uid-cur', nickname: '当前账号', active: true },
+  { uid: 'uid-b',   nickname: '账号B',  active: false },
+  { uid: 'uid-c',   nickname: '账号C',  active: false, expired: true },
+] };
+
+// 13a) 打开弹窗默认「当前账号」（用户最常导的就是这一份）
+inst.openExport();
+if (!inst.exportModal) fail('openExport 未打开弹窗');
+if (inst.exportForm.scope !== 'current') fail('导出弹窗默认方式应为单个导出（current），得到 ' + inst.exportForm.scope);
+if (inst.exportCount() !== 1) fail('单个导出应导出 1 个账号，得到 ' + inst.exportCount());
+
+// 13b) 切到「批量导出」自动全选（取消勾选比逐个勾更省事），
+// 全选按钮的文案与 exportCount 随勾选变化
+inst.setExportScope('selected');
+if (inst.exportForm.uids.length !== 3) fail('切到批量导出应自动全选，得到 ' + JSON.stringify(inst.exportForm.uids));
+if (inst.exportCount() !== 3) fail('全选后应导出 3 个，得到 ' + inst.exportCount());
+if (!inst.exportAllSelected()) fail('exportAllSelected 应为 true（3/3）');
+inst.toggleExportUID('uid-b');
+if (inst.exportForm.uids.indexOf('uid-b') >= 0) fail('toggleExportUID 未能取消勾选');
+if (inst.exportCount() !== 2) fail('取消一个后应剩 2 个，得到 ' + inst.exportCount());
+if (inst.exportAllSelected()) fail('取消一项后 exportAllSelected 应为 false（全选按钮应显示「全选」）');
+inst.exportSelectAll();   // 非全选 → 全选
+if (inst.exportForm.uids.length !== 3) fail('全选按钮应补满：' + JSON.stringify(inst.exportForm.uids));
+inst.exportSelectAll();   // 已全选 → 取消全选
+if (inst.exportForm.uids.length !== 0) fail('全选按钮在全选状态应为「取消全选」：' + JSON.stringify(inst.exportForm.uids));
+if (inst.exportCount() !== 0) fail('空选择时导出数应为 0（主按钮据此置灰），得到 ' + inst.exportCount());
+
+// 13c) 未登录时默认退到批量导出（单个无内容可导）；单个导出数为 0
+inst.account = { logged_in: false };
+inst.openExport();
+if (inst.exportForm.scope !== 'selected') fail('未登录时默认应为批量导出，得到 ' + inst.exportForm.scope);
+inst.setExportScope('current');
+if (inst.exportCount() !== 0) fail('无活动账号时单个导出数应为 0，得到 ' + inst.exportCount());
+let idleUrls = [];
+global.fetch = async function (url) { idleUrls.push(String(url)); return { ok: true, status: 200, json: async function () { return {}; } }; };
+await inst.exportAccounts();
+if (idleUrls.length !== 0) fail('0 个账号时不应发导出请求: ' + JSON.stringify(idleUrls));
+
+// 13d) 导出请求带正确的 scope / uids，文件名取服务端 Content-Disposition，成功后关弹窗
+inst.account = { logged_in: true, nickname: '当前账号', uid: 'uid-cur' };
+let exportUrls = [];
+let downloaded = null;
+const realCreate = global.URL.createObjectURL;
+global.URL.createObjectURL = function () { return 'blob:x'; };
+global.URL.revokeObjectURL = function () {};
+inst.download = function (blob, filename) { downloaded = filename; };   // 不碰真实 DOM
+function exportFetch(headers) {
+  global.fetch = async function (url) {
+    exportUrls.push(String(url));
+    return { ok: true, status: 200, blob: async function () { return 'x'; },
+             headers: { get: function (k) {
+               const h = headers || {};
+               return h[k] || null;
+             } } };
+  };
+}
+exportFetch({'Content-Disposition': 'attachment; filename="buddy2api-account-uid-cur.json"', 'X-Export-Count': '1'});
+inst.setExportScope('current');
+await inst.exportAccounts();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (exportUrls.length !== 1) fail('导出应发 1 个请求，得到 ' + JSON.stringify(exportUrls));
+if (!/[?&]scope=current/.test(exportUrls[0])) fail('单个导出应带 scope=current: ' + exportUrls[0]);
+if (/uids=/.test(exportUrls[0])) fail('单个导出不必带 uids: ' + exportUrls[0]);
+if (downloaded !== 'buddy2api-account-uid-cur.json') fail('文件名应取服务端返回，得到 ' + downloaded);
+if (inst.exportModal) fail('导出成功后应关闭弹窗');
+
+exportUrls = [];
+inst.setExportScope('selected');
+inst.exportForm.uids = ['uid-b', 'uid-c'];
+exportFetch({'X-Export-Count': '2'});
+await inst.exportAccounts();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (!/[?&]scope=selected/.test(exportUrls[0])) fail('批量导出应带 scope=selected: ' + exportUrls[0]);
+if (!/uids=uid-b%2Cuid-c/.test(exportUrls[0])) fail('批量导出应带逗号分隔的 uids: ' + exportUrls[0]);
+if (downloaded !== 'buddy2api-accounts.json') fail('无 Content-Disposition 时应回退通用文件名，得到 ' + downloaded);
+
+// 13e) 导出失败（后台报错）应抛错且不下载、不关弹窗
+exportUrls = [];
+global.fetch = async function () { return { ok: false, status: 400, json: async function () { return { error: '所选账号不存在' }; } }; };
+inst.openExport();
+downloaded = null;
+await inst.exportAccounts();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (!inst.exportModal) fail('导出失败时不该关弹窗（用户要能重试/改选）');
+if (downloaded !== null) fail('导出失败时不应触发下载，得到 ' + downloaded);
+global.URL.createObjectURL = realCreate;
+
+// 14) 批量导入：只入档、不切换当前账号；逐条结果展示
+inst.openImport();
+if (inst.importMode !== 'single') fail('导入弹窗默认应为单个账号模式，得到 ' + inst.importMode);
+inst.setImportMode('batch');
+if (inst.importMode !== 'batch') fail('setImportMode 未切到 batch');
+if (inst.batchResult) fail('打开批量导入时不该有上一轮结果');
+
+// 14a) 未选包时不得发请求
+let batchBodies = [];
+inst.api = async function (path, opts) {
+  if (path === '/admin/account/import/batch') { batchBodies.push(JSON.parse(opts.body)); return { imported: 2, failed: 0, total: 2, active: false, items: [] }; }
+  return {};
+};
+inst.toast = function () {};
+await inst.importBatch();
+if (batchBodies.length !== 0) fail('未选凭证包时就发了批量导入请求');
+
+// 14b) 有包时 POST 原始凭证包，并刷新账号列表
+loads.length = 0;
+inst.batchForm = {
+  filename: 'pkg.json', error: '',
+  items: [{ uid: 'uid-b', nickname: '账号B', domain: 'copilot.tencent.com' }, { uid: 'uid-c', nickname: '账号C' }],
+  bundle: { format: 'buddy2api.accounts', version: 1, accounts: [{ access_token: 'a' }, { access_token: 'b' }] },
+};
+inst.api = async function (path, opts) {
+  if (path === '/admin/account/import/batch') {
+    batchBodies.push(JSON.parse(opts.body));
+    return { imported: 2, failed: 0, total: 2, active: false,
+             items: [{ uid: 'uid-b', ok: true }, { uid: 'uid-c', ok: true }] };
+  }
+  if (path === '/admin/accounts') { loads.push('loadAccounts'); return { items: [] }; }
+  return {};
+};
+await inst.importBatch();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (batchBodies.length !== 1) fail('应发 1 次批量导入请求，得到 ' + batchBodies.length);
+if (batchBodies[0].format !== 'buddy2api.accounts') fail('请求体应是原始凭证包: ' + JSON.stringify(batchBodies[0]));
+if (batchBodies[0].activate !== undefined) fail('批量导入不得带 activate（恒不切换活动账号）: ' + JSON.stringify(batchBodies[0]));
+if (count('loadAccounts') !== 1) fail('批量导入后必须刷新账号列表（唯一产出）');
+['loadResources(true)', 'loadResources(false)', 'loadGrowth(true)', 'loadCheckin', 'loadAccount']
+  .forEach(function (m) { if (count(m) !== 0) fail('批量导入不得强刷「' + m + '」（当前账号未变）: ' + JSON.stringify(loads)); });
+if (!inst.batchResult || inst.batchResult.imported !== 2) fail('应保存逐条结果: ' + JSON.stringify(inst.batchResult));
+if (inst.batchForm.items.length !== 0) fail('导入成功后应清空已选列表（防重复提交）');
+if (!inst.importModal) fail('批量导入后应留在弹窗看逐条结果');
+
+// 14c) 整包被拒（格式/版本错）时把错误留在弹窗里，而不是只弹一个飘走的 toast
+inst.batchForm = { filename: 'bad.json', error: '', items: [{ uid: 'x' }], bundle: { format: 'other' } };
+inst.api = async function () { throw new Error('不是凭证包（format 应为 "buddy2api.accounts"）'); };
+await inst.importBatch();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (!/不是凭证包/.test(inst.batchForm.error)) fail('整包失败应把原因写入 batchForm.error，得到 ' + JSON.stringify(inst.batchForm.error));
+
+// 14d) 整包失败后重试成功，旧的红色错误必须被清掉
+// 回归：error 只在抛错时写、成功路径从不清，于是弹窗里会同时显示「导入完成」和「网关超时」。
+inst.batchForm = { filename: 'r.json', error: '', items: [{ uid: 'a' }], bundle: { format: 'buddy2api.accounts' } };
+inst.api = async function () { throw new Error('网关超时'); };
+await inst.importBatch();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (!inst.batchForm.error) fail('首次失败应写入 error');
+inst.batchForm = { filename: 'r.json', error: '网关超时', items: [{ uid: 'a' }], bundle: { format: 'buddy2api.accounts' } };
+inst.api = async function () {
+  return { imported: 1, failed: 0, total: 1, overwrote: 0, items: [{ uid: 'a', ok: true }] };
+};
+await inst.importBatch();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (inst.batchForm.error) fail('重试成功后残留了旧错误（会与「导入完成」同时显示）: ' + JSON.stringify(inst.batchForm.error));
+
+// 14e) 全部失败（400 + 逐条明细）时必须展示明细，而不是只报一个「HTTP 400」
+// 回归：api() 只抛 error 字符串，400 响应里的 items（逐条失败原因）被丢弃 ——
+// 而这恰恰是用户最需要看的内容（哪一条凭证坏了、为什么坏）。
+const failErr = new Error('HTTP 400');
+failErr.status = 400;
+failErr.body = { ok: false, imported: 0, failed: 2, total: 2, active: false, items: [
+  { ok: false, error: '第 1 条：access_token 不能为空' },
+  { ok: false, error: '第 2 条：access_token 不是合法 JWT' },
+] };
+inst.batchForm = { filename: 'f.json', error: '', items: [{ uid: 'a' }, { uid: 'b' }], bundle: { format: 'buddy2api.accounts' } };
+inst.api = async function () { throw failErr; };
+await inst.importBatch();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (!inst.batchResult || (inst.batchResult.items || []).length !== 2) {
+  fail('全失败时应展示后端逐条明细，得到 ' + JSON.stringify(inst.batchResult));
+}
+if (!/不能为空/.test(JSON.stringify(inst.batchResult.items))) {
+  fail('逐条明细应包含后端原文: ' + JSON.stringify(inst.batchResult.items));
+}
+if (inst.batchForm.error) fail('全失败已由明细展示时不应再写 error: ' + JSON.stringify(inst.batchForm.error));
+
+// 14f) api() 必须把响应体挂在 error 上（14e 的前置能力），否则明细根本拿不到
+inst.api = real.api;   // 跑真实现
+let apiErrBody = null;
+const savedFetchForErr = global.fetch;
+global.fetch = async function () {
+  return { ok: false, status: 400, json: async function () { return { error: '坏了', items: [{ ok: false }] }; } };
+};
+try { await inst.api('/admin/account/import/batch', { method: 'POST' }); }
+catch (e) { apiErrBody = e.body; }
+if (!apiErrBody || !Array.isArray(apiErrBody.items)) fail('api() 未把响应体挂到 error.body（逐条明细会丢失）: ' + JSON.stringify(apiErrBody));
+inst.api = real.api;
+global.fetch = savedFetchForErr;
+
+// 14g) 用户「取消全选」后再切换导出方式，不得把选择静默还原成全选
+// 回归：setExportScope 在 uids 为空时无条件全选，用户清空选择 → 切单个 → 切回批量，
+// 选择被自动填满，一点导出就把所有账号导了出去。
+inst.account = { logged_in: true, nickname: '当前', uid: 'uid-cur' };
+inst.accounts = { loaded: true, items: [
+  { uid: 'uid-cur', nickname: '当前', active: true },
+  { uid: 'uid-b', nickname: 'B' },
+] };
+inst.openExport();
+inst.setExportScope('selected');
+if (inst.exportForm.uids.length !== 2) fail('首次进入批量应默认全选');
+inst.exportSelectAll();                       // 取消全选（用户想自己挑）
+if (inst.exportForm.uids.length !== 0) fail('取消全选后应为空');
+inst.setExportScope('current');
+inst.setExportScope('selected');              // 切回批量
+if (inst.exportForm.uids.length !== 0) {
+  fail('「取消全选」的意图被静默还原成全选（会误导出全部账号）: ' + JSON.stringify(inst.exportForm.uids));
+}
+if (inst.exportCount() !== 0) fail('用户清空后导出数应为 0，得到 ' + inst.exportCount());
+
+// 15) 页面层与共享层不得重叠：openExport / exportAccounts / importBatch 只在页面层
+// （appShell 里出现同名成员会被静默顶掉，由 shadowHarness 兜住；这里断言接线本身）
+['openExport', 'exportAccounts', 'setExportScope', 'exportCount', 'importBatch', 'onBatchFile',
+ 'parseBatchBundle', 'openImport']
+  .forEach(function (m) {
+    if (typeof inst[m] !== 'function') fail('账号页缺少动作 ' + m);
+  });
+
+// 16) 选错文件时的自适应：单个模式选到凭证包 → 自动切批量；批量模式选到 token.json → 自动切单个。
+// 否则用户得到的是一个「格式不对」的死胡同，还得自己回头改模式重选。
+inst.openImport();
+inst.parseBatchBundle('pkg.json', JSON.stringify({
+  format: 'buddy2api.accounts', version: 1,
+  accounts: [{ access_token: 'a.b.c' }],
+}));
+if (inst.batchForm.items.length !== 1) fail('合法凭证包应解析出预览项: ' + JSON.stringify(inst.batchForm));
+
+inst.setImportMode('batch');
+inst.parseBatchBundle('token.json', JSON.stringify({ access_token: 'aa.bb.cc', refresh_token: 'rt' }));
+if (inst.importMode !== 'single') fail('批量模式选到 token.json 应自动切到单个模式，得到 ' + inst.importMode);
+if (inst.importForm.access_token !== 'aa.bb.cc') fail('切回单个模式应回填 access_token: ' + JSON.stringify(inst.importForm));
+if (inst.importForm.filename !== 'token.json') fail('应记住文件名: ' + inst.importForm.filename);
+
+inst.setImportMode('batch');
+inst.parseBatchBundle('weird.json', JSON.stringify({ hello: 'world' }));
+if (!inst.batchForm.error) fail('缺 format 标识时应就地报错，不发请求');
+if (inst.batchForm.items.length !== 0) fail('非法包不该产生预览项');
+
 console.log('OK ' + JSON.stringify(loads));
 })().catch(function (e) { console.error('FAIL: harness 异常: ' + ((e && e.stack) || e)); process.exit(1); });
 `
@@ -1167,6 +1409,110 @@ func TestGrowthPageTaskCenter(t *testing.T) {
 		if !strings.Contains(string(settingsJS), want) {
 			t.Errorf("settings.js 未下发 %q", want)
 		}
+	}
+}
+
+// TestAccountPageNoDanglingHandlers account.html 里绑定的 @click / @change 处理函数都必须在
+// account.js 或共享层里定义（否则点击时静默报 Alpine 未定义错误）。
+// 导出 / 导入弹窗新增了若干动作（openExport / setExportScope / toggleExportUID …），
+// 之前的 page 无此守卫，改模板时漏改脚本不会被任何用例发现。
+func TestAccountPageNoDanglingHandlers(t *testing.T) {
+	html, err := pageFS.ReadFile("pages/account.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := assetFS.ReadFile("assets/pages/account.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := assetFS.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, pageScript, sharedScript := string(html), string(js), string(shared)
+
+	re := regexp.MustCompile(`@(?:click|change|submit)(?:\.\w+)?="([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+	seen := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(page, -1) {
+		name := m[1]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if strings.Contains(pageScript, name+"(") || strings.Contains(pageScript, name+":") {
+			continue
+		}
+		if strings.Contains(sharedScript, name+"(") || strings.Contains(sharedScript, name+":") {
+			continue
+		}
+		t.Errorf("account.html 绑定了 %s()，但页面脚本与共享层都没有定义", name)
+	}
+	if len(seen) == 0 {
+		t.Error("未在 account.html 中解析到任何处理器（正则或页面结构变了？）")
+	}
+	// 弹窗内的模板方法（x-text / x-show / @change 里调用的取值函数）同样要存在
+	for _, name := range []string{"exportCount", "toggleExportUID", "exportSelectAll"} {
+		if !strings.Contains(page, name+"(") {
+			continue // 模板未用即不要求
+		}
+		if !strings.Contains(pageScript, name+"(") {
+			t.Errorf("account.html 调用了 %s()，但 account.js 未定义", name)
+		}
+	}
+}
+
+// TestAccountPageExportImportUI 导出 / 导入弹窗的结构契约：导出口含三种范围，
+// 导入口含单个 / 批量两种模式，且两条请求分别打到 export（带 scope）与 import/batch。
+func TestAccountPageExportImportUI(t *testing.T) {
+	html, err := pageFS.ReadFile("pages/account.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := assetFS.ReadFile("assets/pages/account.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, script := string(html), string(js)
+
+	for _, want := range []string{
+		"导出凭证弹窗",
+		"openExport()",
+		"setExportScope('current')",
+		"setExportScope('selected')",
+		"单个导出",
+		"批量导出",
+		"exportAccounts()",
+		"exportForm.uids",
+		"exportSelectAll()",   // 全选按钮（取代了原先的「全部账号」第三种范围）
+		"exportAllSelected()", // 全选按钮的文案依据
+		"导入凭证弹窗",
+		"setImportMode('batch')",
+		"importBatch()",
+		"onBatchFile($event)",
+		"batchResult",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("account.html 缺少 %q", want)
+		}
+	}
+	// 「全部账号」这种第三种导出范围已移除：批量导出默认全选 + 全选按钮已完全覆盖它
+	if strings.Contains(page, "setExportScope('all')") || strings.Contains(page, "全部账号") {
+		t.Error("account.html 仍存在「全部账号」导出范围（应由批量导出 + 全选按钮承担）")
+	}
+	for _, want := range []string{
+		"/admin/account/export?scope=",
+		"/admin/account/import/batch",
+		"buddy2api.accounts", // 本地预校验用 format 标识
+		"X-Export-Missing",   // 部分所选账号不存在时提示
+		"importMode",         // 两种模式互斥
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("account.js 缺少 %q", want)
+		}
+	}
+	// 导出不得再兼容旧的裸 token.json 下载（按钮必须开弹窗，而非直接下载）
+	if strings.Contains(script, "a.download = 'token.json'") {
+		t.Error("account.js 仍在下载旧格式 token.json（导出应统一为凭证包）")
 	}
 }
 

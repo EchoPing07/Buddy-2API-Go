@@ -2,8 +2,8 @@
         <header class="page-head">
           <h1>账号</h1>
           <div class="page-actions">
-            <button class="btn btn-secondary btn-sm" @click="exportAccount()" :disabled="loading"><span class="ic" x-html="ic('upload')"></span>导出凭证</button>
-            <button class="btn btn-secondary btn-sm" @click="importModal=true"><span class="ic" x-html="ic('download')"></span>导入凭证</button>
+            <button class="btn btn-secondary btn-sm" @click="openExport()" :disabled="loading"><span class="ic" x-html="ic('upload')"></span>导出凭证</button>
+            <button class="btn btn-secondary btn-sm" @click="openImport()"><span class="ic" x-html="ic('download')"></span>导入凭证</button>
             <template x-if="account.logged_in">
               <button class="btn btn-secondary btn-sm" @click="refreshToken()" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新 Token</button>
             </template>
@@ -103,38 +103,151 @@
         </div>
       </section>
 
-<!-- ═══ 导入凭证弹窗 ═══ -->
-<template x-if="importModal">
-  <div class="overlay" @click.self="importModal=false">
-    <form class="modal" style="max-width:560px" @submit.prevent="importAccount(false)">
-      <div class="modal-title">导入凭证</div>
-      <p class="modal-msg">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。<br>「仅导入」只存入账号列表，当前账号不变；「导入并启用」会立即切换为当前账号。</p>
-      <div class="form-row">
-        <label class="label">从文件导入</label>
-        <div class="row">
-          <input x-ref="importFileInput" type="file" accept=".json,application/json" style="display:none" @change="onImportFile($event)">
-          <button type="button" class="btn btn-secondary btn-sm" @click="$refs.importFileInput.click()"><span class="ic" x-html="ic('download')"></span>选择文件</button>
+<!-- ═══ 导出凭证弹窗 ═══ -->
+<template x-if="exportModal">
+  <div class="overlay" @click.self="exportModal=false">
+    <div class="modal" style="max-width:560px" role="dialog" aria-label="导出凭证">
+      <div class="modal-title">导出凭证</div>
+      <p class="modal-msg">导出为凭证包（JSON，内含 access_token，请妥善保管），可经「导入凭证 → 批量」还原到任意实例。</p>
+      <div class="seg" role="tablist" aria-label="导出方式">
+        <button type="button" class="seg-btn" role="tab" :class="{'is-active':exportForm.scope==='current'}"
+                :disabled="!account.logged_in" @click="setExportScope('current')">单个导出</button>
+        <button type="button" class="seg-btn" role="tab" :class="{'is-active':exportForm.scope==='selected'}"
+                :disabled="!accounts.items.length" @click="setExportScope('selected')">
+          批量导出<span x-show="accounts.items.length" x-text="'（'+accounts.items.length+'）'"></span>
+        </button>
+      </div>
+      <div x-show="exportForm.scope==='current'" class="field-hint" style="margin-top:12px">
+        <template x-if="account.logged_in">
+          <span x-text="'将导出当前活动账号：'+(account.nickname||'未命名')+'（'+(account.uid||'—')+'）'"></span>
+        </template>
+        <template x-if="!account.logged_in"><span>当前没有活动账号，无可导出内容。</span></template>
+      </div>
+      <div x-show="exportForm.scope==='selected'">
+        <div class="row" style="margin:12px 0 8px;gap:8px">
+          <span class="label" style="margin:0">选择要导出的账号</span>
+          <div class="spacer"></div>
+          <button type="button" class="btn btn-ghost btn-sm" @click="exportSelectAll()"
+                  x-text="exportAllSelected()?'取消全选':'全选'"></button>
         </div>
-        <p class="field-hint" x-show="importForm.filename" x-text="'已选择：'+importForm.filename"></p>
-      </div>
-      <div class="form-row">
-        <label class="label">access_token</label>
-        <textarea class="input" rows="3" x-model="importForm.access_token" placeholder="eyJhbGciOi..." style="height:auto;resize:vertical;font-size:var(--fs-2xs)"></textarea>
-      </div>
-      <div class="form-grid c2">
-        <div class="form-row"><label class="label">refresh_token（可选）</label><input class="input mono" x-model="importForm.refresh_token" style="font-size:var(--fs-2xs)"></div>
-        <div class="form-row"><label class="label">domain（可选）</label><input class="input" x-model="importForm.domain" placeholder="留空按当前端点"></div>
+        <div class="pick-list">
+          <template x-for="a in accounts.items" :key="a.uid">
+            <label class="pick-row">
+              <input type="checkbox" :checked="exportForm.uids.includes(a.uid)" @change="toggleExportUID(a.uid)">
+              <span class="pick-name" x-text="a.nickname||'未命名'"></span>
+              <span class="mono muted-xs" x-text="'…'+(a.uid||'').slice(-8)"></span>
+              <span class="badge" :class="a.active?'badge-ok':'badge-muted'" x-show="a.active">当前</span>
+              <span class="badge badge-err" x-show="a.expired&&!a.active">已过期</span>
+              <span class="badge badge-warn" x-show="!a.region_match">端点不匹配</span>
+            </label>
+          </template>
+        </div>
+        <p class="field-hint" x-show="!exportForm.uids.length">尚未选择任何账号。</p>
+        <p class="field-hint" x-show="exportAllSelected()" x-text="'已全选 '+accounts.items.length+' 个账号'"></p>
       </div>
       <div class="modal-foot">
+        <button type="button" class="btn btn-secondary btn-sm" @click="exportModal=false">取消</button>
+        <button type="button" class="btn btn-sm" @click="exportAccounts()"
+                :disabled="loading || exportCount()===0">
+          <span class="spin" x-show="loading"></span>
+          <span x-text="'导出 '+exportCount()+' 个账号'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- ═══ 导入凭证弹窗（单个 / 批量） ═══ -->
+<template x-if="importModal">
+  <div class="overlay" @click.self="importModal=false">
+    <form class="modal" style="max-width:560px" @submit.prevent="importMode==='batch' ? importBatch() : importAccount(false)">
+      <div class="modal-title">导入凭证</div>
+      <div class="seg" role="tablist" aria-label="导入方式">
+        <button type="button" class="seg-btn" role="tab" :class="{'is-active':importMode==='single'}"
+                @click="setImportMode('single')">单个账号</button>
+        <button type="button" class="seg-btn" role="tab" :class="{'is-active':importMode==='batch'}"
+                @click="setImportMode('batch')">批量导入</button>
+      </div>
+
+      <!-- 单个账号：手动填写或选 token.json -->
+      <div x-show="importMode==='single'">
+        <p class="modal-msg" style="margin-top:12px">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。<br>「仅导入」只存入账号列表，当前账号不变；「导入并启用」会立即切换为当前账号。</p>
+        <div class="form-row">
+          <label class="label">从文件导入</label>
+          <div class="row">
+            <input x-ref="importFileInput" type="file" accept=".json,application/json" style="display:none" @change="onImportFile($event)">
+            <button type="button" class="btn btn-secondary btn-sm" @click="$refs.importFileInput.click()"><span class="ic" x-html="ic('download')"></span>选择文件</button>
+          </div>
+          <p class="field-hint" x-show="importForm.filename" x-text="'已选择：'+importForm.filename"></p>
+        </div>
+        <div class="form-row">
+          <label class="label">access_token</label>
+          <textarea class="input" rows="3" x-model="importForm.access_token" placeholder="eyJhbGciOi..." style="height:auto;resize:vertical;font-size:var(--fs-2xs)"></textarea>
+        </div>
+        <div class="form-grid c2">
+          <div class="form-row"><label class="label">refresh_token（可选）</label><input class="input mono" x-model="importForm.refresh_token" style="font-size:var(--fs-2xs)"></div>
+          <div class="form-row"><label class="label">domain（可选）</label><input class="input" x-model="importForm.domain" placeholder="留空按当前端点"></div>
+        </div>
+      </div>
+
+      <!-- 批量导入：凭证包一次性入档，恒不切换当前账号 -->
+      <div x-show="importMode==='batch'">
+        <p class="modal-msg" style="margin-top:12px">选择由「导出凭证」生成的凭证包（.json），可一次导入多个账号。<br><strong>批量导入只会存入账号列表，不会切换当前账号</strong>；导入完成后到「账号切换」卡片点「切换」启用。</p>
+        <div class="form-row">
+          <label class="label">凭证包文件</label>
+          <div class="row">
+            <input x-ref="batchFileInput" type="file" accept=".json,application/json" style="display:none" @change="onBatchFile($event)">
+            <button type="button" class="btn btn-secondary btn-sm" @click="$refs.batchFileInput.click()"><span class="ic" x-html="ic('download')"></span>选择凭证包</button>
+            <span class="muted-xs" x-show="batchForm.filename" x-text="batchForm.filename"></span>
+          </div>
+          <p class="field-hint" x-show="batchForm.error" style="color:var(--err-fg)" x-text="batchForm.error"></p>
+        </div>
+        <div x-show="batchForm.items.length">
+          <p class="field-hint" x-text="'已读取 '+batchForm.items.length+' 个账号，将全部仅导入到账号列表：'"></p>
+          <div class="pick-list">
+            <template x-for="(a,i) in batchForm.items" :key="i">
+              <div class="pick-row">
+                <span class="pick-name" x-text="a.nickname||'未命名'"></span>
+                <span class="mono muted-xs" x-text="'…'+String(a.uid||'').slice(-8)"></span>
+                <span class="muted-xs truncate" x-text="a.domain||''"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+        <div x-show="batchResult" class="result-box-wrap">
+          <p class="field-hint"
+             x-text="'导入完成：成功 '+batchResult.imported+' 个，失败 '+batchResult.failed+' 个'"></p>
+          <div class="result-box">
+            <template x-for="(r,i) in batchResult.items" :key="i">
+              <div class="row result-row">
+                <span class="badge" :class="r.ok?'badge-ok':'badge-err'" x-text="r.ok?'已导入':'失败'"></span>
+                <span class="muted-xs" style="flex:1" x-text="r.error || (r.nickname||'未命名')+'（…'+String(r.uid||'').slice(-8)+'）'"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-foot">
         <button type="button" class="btn btn-secondary btn-sm" @click="importModal=false">取消</button>
-        <button type="button" class="btn btn-secondary btn-sm" @click="importAccount(false)" :disabled="loading">
-          <span class="spin" x-show="loading && !importActivate"></span>
-          <span x-show="!loading || importActivate">仅导入</span>
-        </button>
-        <button type="button" class="btn btn-sm" @click="importAccount(true)" :disabled="loading">
-          <span class="spin" x-show="loading && importActivate"></span>
-          <span x-show="!loading || !importActivate">导入并启用</span>
-        </button>
+        <template x-if="importMode==='batch'">
+          <button type="submit" class="btn btn-sm" :disabled="loading || !batchForm.items.length">
+            <span class="spin" x-show="loading"></span>
+            <span x-text="batchForm.items.length ? '仅导入 '+batchForm.items.length+' 个账号' : '仅导入'"></span>
+          </button>
+        </template>
+        <template x-if="importMode==='single'">
+          <div class="row" style="gap:8px">
+            <button type="button" class="btn btn-secondary btn-sm" @click="importAccount(false)" :disabled="loading">
+              <span class="spin" x-show="loading && !importActivate"></span>
+              <span x-show="!loading || importActivate">仅导入</span>
+            </button>
+            <button type="button" class="btn btn-sm" @click="importAccount(true)" :disabled="loading">
+              <span class="spin" x-show="loading && importActivate"></span>
+              <span x-show="!loading || !importActivate">导入并启用</span>
+            </button>
+          </div>
+        </template>
       </div>
     </form>
   </div>

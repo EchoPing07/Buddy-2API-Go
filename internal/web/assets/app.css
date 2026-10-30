@@ -128,6 +128,25 @@ a{color:inherit;text-decoration:none}
 .switch.on::after{transform:translateX(16px)}
 .switch-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:2px 0 16px}
 .sw-label{font-size:var(--fs-sm)}
+/* 分段控件（弹窗内的互斥选择：导出方式 / 导入方式）。
+   用一排平铺按钮而非 tab：只有 2 项、无面板嵌套，tab 的语义（切换内容区）在这里会误导。
+   选中态走 .btn.is-active 同口径（主色填充），与全站开关型按钮一致。
+   hover 必须排除 .is-active：选中项的背景是主色（浅色模式下即深色），若 hover 也把字色
+   改成 --fg（同样深），字就与背景同色消失了。 */
+.seg{display:flex;gap:4px;padding:3px;border-radius:9px;background:var(--secondary);border:1px solid color-mix(in oklab,var(--border) 70%,transparent)}
+.seg-btn{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:28px;padding:0 10px;border:none;border-radius:7px;background:transparent;color:var(--muted-fg);font-size:var(--fs-xs);font-weight:500;font-family:inherit;cursor:pointer;white-space:nowrap;transition:background .15s,color .15s}
+.seg-btn:hover:not(:disabled):not(.is-active){background:color-mix(in oklab,var(--fg) 7%,transparent);color:var(--fg)}
+.seg-btn.is-active{background:var(--primary);color:var(--primary-fg)}
+.seg-btn.is-active:hover{opacity:.9}
+.seg-btn:disabled{opacity:.45;cursor:not-allowed}
+/* 可选列表（导出/批量导入弹窗里的账号清单）：限高滚动，行内不换行以免长域名挤掉勾选框 */
+.pick-list{margin-top:8px;border:1px solid color-mix(in oklab,var(--border) 80%,transparent);border-radius:9px;max-height:220px;overflow-y:auto;scrollbar-gutter:stable}
+.pick-row{display:flex;align-items:center;gap:8px;padding:8px 11px;font-size:var(--fs-xs);cursor:pointer}
+.pick-row+.pick-row{border-top:1px solid color-mix(in oklab,var(--border) 55%,transparent)}
+.pick-row:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
+.pick-row input[type=checkbox]{width:14px;height:14px;accent-color:var(--primary);flex-shrink:0;cursor:pointer}
+.pick-name{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px}
+.pick-row>.muted-xs.truncate{max-width:150px}
 
 /* ── 徽章 / 状态 ── */
 .badge{display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 8px;border-radius:9999px;font-size:var(--fs-2xs);font-weight:500;line-height:1;white-space:nowrap;border:none;font-family:inherit;cursor:default}
