@@ -67,6 +67,9 @@ function appShell(){
     keyForm:{name:'',custom_key:''}, keyModal:false,
     resources:{accounts:[],loaded:false},
     pool:null,   // 号池状态快照（GET /admin/pool；仅开关开启时有值）
+    // 实验开关是否已从服务端读到。labs 的默认值全是「关」，不区分「还不知道」与
+    // 「确实关着」会让刷新后停在账号页的用户永远看不到号池卡片（见 loadPool）。
+    _experimentsLoaded:false, _experimentsPromise:null,
     _resourceRefetch:false,   // 在途期间到来的强刷意图（见 pages/resources.js loadResources）
     /* 账号代次：换账号 / 删凭证时 +1。账号口径加载器发请求前捕获代次、响应落地时比对，
        不一致则丢弃 —— 否则旧账号响应晚于新账号落地会把新数据覆盖回旧值（last-write-wins）。
@@ -133,7 +136,7 @@ function appShell(){
     },
 
     /* ── 登录后进场：刷壳层数据 + 首屏页数据（走 enter，与后续切页同一入口） ── */
-    afterLogin(){ this.loadHealth(); this.enter(this.view); },
+    afterLogin(){ this.loadHealth(); this.loadExperiments(); this.enter(this.view); },
 
     /* ═══ 软导航：切 view + 换 URL，不重载文档 ═══ */
 
@@ -223,7 +226,7 @@ function appShell(){
     },
     /* 会话边界：清空「已进场」缓存。401 或退出后再登录属新会话，数据已失效；
        若不清理，afterLogin() → enter(view) 会被 entered 挡下，当前页保留过期前的旧统计 / 旧 Key 列表。 */
-    resetSession(){ this.entered = {}; },
+    resetSession(){ this.entered = {}; this._experimentsLoaded = false; },
     /* 凭证被删除：清空账号口径的本地状态并撤销保活。
        此刻已无凭证，不能改成重拉（只会失败弹错）；而状态留着的话，保活会让余额/任务页
        继续展示被删账号的数据。撤销 entered 后下次进入页面重新拉取。 */
@@ -379,6 +382,51 @@ function appShell(){
       this.loadGrowth(true);
       this.loadTasks();          // 任务中心与成长总览同为账号口径，换账号必须一并刷新
       this.loadCompensation();
+      this.loadPool();           // 号池成员按账号档案枚举，换账号后会变
+    },
+
+    /* ── 号池 ── */
+    /* loadPool 拉号池快照（GET /admin/pool）。放共享层而不是页面层：
+       账号页与实验页要用同一份 pool 状态，两份实现会静默漂移
+       （见 web_test 的 TestPageLayerDoesNotShadowShell）。
+
+       开关还没拉到（刷新后直接停在账号页，afterLogin 的 loadExperiments 尚在途）时
+       必须先等它：否则 labs.pool_enabled 仍是默认 false，本函数会当场返回 null，
+       号池卡片一直空着 —— 这正是「只能从实验页跳转才看得见」的原因。 */
+    async loadPool(){
+      if(!this._experimentsLoaded) await this.loadExperiments();
+      if(!this.labs.pool_enabled){ this.pool = null; return; }
+      try{ this.pool = await this.api('/admin/pool'); }catch(e){ this.pool = null; }
+    },
+    /* loadExperiments 只拉实验开关（不拉号池统计，供全站公共入口用）。
+       必须由 afterLogin 调一次：开关状态原先只有「实验」页进场才拉，
+       于是刷新停在账号页时 labs.pool_enabled 恒为默认 false，号池卡片被
+       x-show 藏起来、loadPool 也不发请求 —— 看起来「刷新后号池就不见了」。
+
+       成功后置 _experimentsLoaded：账号页刷新与 afterLogin 是并发的，
+       loadPool 靠它判断「开关还不知道」并等价一次，而不是稳当地返回 false。 */
+    loadExperiments(){
+      // 在途去重：afterLogin 与页面 load() 同一轮里都会要它，不得重复打接口
+      if(this._experimentsPromise) return this._experimentsPromise;
+      this._experimentsPromise = (async()=>{
+        try{
+          const r = await this.api('/admin/experiments');
+          this.applyExperiments(r);
+        }catch(e){ /* 静默：实验状态拉不到就用默认值，不阻断其余页面 */ }
+        finally{ this._experimentsPromise = null; }
+      })();
+      return this._experimentsPromise;
+    },
+    /* applyExperiments 把服务端回值灌回 labs（PUT / GET 恒回服务端真值）。
+       放共享层：afterLogin 与实验页都要用。 */
+    applyExperiments(r){
+      this.labs.embeddings_enabled = !!r.embeddings_enabled;
+      this.labs.pool_enabled = !!r.pool_enabled;
+      this.labs.pool_session_ttl = r.pool_session_ttl;
+      this.labs.pool_max_retry = r.pool_max_retry;
+      this.labs.pool_cool_max_min = r.pool_cool_max_min;
+      this.labs.pool_probe_cron = r.pool_probe_cron;
+      this._experimentsLoaded = true;
     },
 
     /** 上报条数区间文案：有波动显示 N±J（实际 a-b 条），无波动显示 N 条 */

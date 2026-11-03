@@ -36,17 +36,11 @@ PAGE('labs', {
      （web_test 的 TestPageLayerDoesNotShadowShell 锁定了这一点）。 */
 
   async loadLabs(){
-    try{
-      const r = await this.api('/admin/experiments');
-      this.labs.embeddings_enabled = !!r.embeddings_enabled;
-      this.labs.pool_enabled = !!r.pool_enabled;
-      this.labs.pool_session_ttl = r.pool_session_ttl;
-      this.labs.pool_max_retry = r.pool_max_retry;
-      this.labs.pool_cool_max_min = r.pool_cool_max_min;
-      this.labs.pool_probe_cron = r.pool_probe_cron;
-    }catch(e){}
+    // 开关字段全靠共享层 loadExperiments/applyExperiments（afterLogin 已拉过一次，
+    // 这里重拉是为了让开关与参数总是走到权威值，例如 env 锁定或另一标签页改过）。
+    await this.loadExperiments();
     // 只有开启时才拉号池状态（关闭时统计行整块不显示，拉了也没地方用）
-    if(this.labs.pool_enabled) this.loadPoolSummary();
+    if(this.labs.pool_enabled) this.loadPool();
   },
   /* 开关即时生效（无「保存」按钮）：非乐观更新，以服务端回值为准；
      失败由 busy() 统一弹错，开关停在原状态，不会出现 UI 与服务端不一致。 */
@@ -68,7 +62,7 @@ PAGE('labs', {
         const r = await this.api('/admin/experiments',{method:'PUT',body:JSON.stringify({pool_enabled:true})});
         this.applyExperiments(r);
         this.toast('号池负载均衡已开启','ok');
-        this.loadPoolSummary();
+        this.loadPool();
         this.loadAccounts();   // 账号页的池状态列
       })();
       return;
@@ -82,15 +76,9 @@ PAGE('labs', {
         this.toast('号池已关闭','ok');
       })(), {okText:'关闭', danger:true});
   },
-  /* 把服务端回值灌回 labs（PUT 恒回服务端真值，env 锁定时会与用户意图不同） */
-  applyExperiments(r){
-    this.labs.embeddings_enabled = !!r.embeddings_enabled;
-    this.labs.pool_enabled = !!r.pool_enabled;
-    this.labs.pool_session_ttl = r.pool_session_ttl;
-    this.labs.pool_max_retry = r.pool_max_retry;
-    this.labs.pool_cool_max_min = r.pool_cool_max_min;
-    this.labs.pool_probe_cron = r.pool_probe_cron;
-  },
+  /* 把服务端回值灌回 labs 的实现已上提到共享层（app.js 的 applyExperiments）：
+     afterLogin 也要用它，而页面层同名成员会覆盖共享层（见 web_test 的重名守卫）。 */
+
   /* 数值参数保存（blur 触发；非法值不提交并提示，避免把手误敲进配置） */
   savePoolParam(field, min, max, label){
     const v = Number(this.labs[field]);
@@ -119,10 +107,8 @@ PAGE('labs', {
     })();
   },
 
-  /* ── 号池统计（实验页只看概要，明细在账号页） ── */
-  async loadPoolSummary(){
-    try{ this.pool = await this.api('/admin/pool'); }catch(e){ this.pool = null; }
-  },
+  /* ── 号池统计（实验页只看概要，明细在账号页）──
+     loadPool 在共享层（app.js）：与账号页共用同一份 pool 快照。 */
   /* 粘性命中率：判断 TTL 该调大还是调小的唯一依据 */
   poolHitRate(){
     const p = this.pool;

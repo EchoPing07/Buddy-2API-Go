@@ -601,6 +601,16 @@ Object.keys(PAGES).forEach(function (k) {
     };
   }
 });
+// 号池两个加载器：既要**记录**调用（17 组断言），又要跑**真实现**（要验证它们
+// 自己发请求的顺序与短路条件，stub 掉就等于把被测逻辑删了）。
+['loadPool', 'loadExperiments'].forEach(function (m) {
+  const orig = inst[m];
+  real[m] = orig;
+  inst[m] = function () {
+    loads.push(m);
+    return orig.apply(inst, arguments);
+  };
+});
 inst.loadHealth = function () { loads.push('loadHealth'); };
 inst.$nextTick = function (fn) { fn(); }; // Alpine magic（onPop 的滚动回位用）
 // api() 保留真实现：14f 要验证它把响应体挂到 error 上（明细靠这条链路传给 importBatch）
@@ -1176,6 +1186,87 @@ inst.parseBatchBundle('weird.json', JSON.stringify({ hello: 'world' }));
 if (!inst.batchForm.error) fail('缺 format 标识时应就地报错，不发请求');
 if (inst.batchForm.items.length !== 0) fail('非法包不该产生预览项');
 
+// 17) 号池卡片：刷新后必须自己出现，不能「只有从实验页跳转才看得见」
+// 回归：labs.pool_enabled 只由实验页的 loadLabs() 填充，刷新后直接停在账号页时
+// 它恒为默认 false → 号池卡片被 x-show 藏起来、loadPool 也直接 return 不发请求。
+// 修法：afterLogin 拉一次实验开关（loadExperiments），loadPool 在开关还未知时等价一次。
+const poolUrls = [];
+function poolFetch(poolEnabled, data) {
+  global.fetch = async function (url) {
+    const u = String(url);
+    poolUrls.push(u);
+    if (u.indexOf('/admin/experiments') === 0) {
+      return { ok: true, status: 200, json: async function () {
+        return { embeddings_enabled: false, pool_enabled: poolEnabled, pool_session_ttl: 180,
+                 pool_max_retry: 2, pool_cool_max_min: 360, pool_probe_cron: '0 0 0,6,12,18 * * *' };
+      } };
+    }
+    if (u.indexOf('/admin/pool') === 0) {
+      return { ok: true, status: 200, json: async function () { return data || { accounts: [] }; } };
+    }
+    return { ok: true, status: 200, json: async function () { return {}; } };
+  };
+}
+
+// 17a) 登录进场时必须拉实验开关（这是刷新后号池能出现的前提）
+inst._experimentsLoaded = false;
+loads.length = 0;
+poolUrls.length = 0;
+poolFetch(true);
+inst.afterLogin();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (count('loadExperiments') !== 1) {
+  fail('afterLogin 必须拉一次实验开关（否则刷新在账号页时 labs.pool_enabled 恒为默认 false）: '
+       + JSON.stringify(loads));
+}
+if (!inst.labs.pool_enabled) fail('实验开关拉回后 labs.pool_enabled 应为 true');
+if (!inst._experimentsLoaded) fail('_experimentsLoaded 未置位（loadPool 无法判断「开关未知」）');
+
+// 17b) 刷新在账号页：开关未拉到时 loadPool 必须等价一次，而不是当场返回 null
+// 这正是「只能从实验页跳转才看得见」的根因。
+inst._experimentsLoaded = false;
+inst.labs.pool_enabled = false;
+inst.pool = null;
+poolUrls.length = 0;
+poolFetch(true, { accounts: [{ uid: 'acc1', nickname: '账号A', credits: 12, credits_at: 1700000000 }],
+                  member_count: 1, available_now: 1, session_count: 0 });
+await inst.loadPool();
+if (!/\/admin\/pool/.test(poolUrls.join(','))) {
+  fail('刷新在账号页时 loadPool 必须真的请求 /admin/pool（早期直接 return 了）: ' + JSON.stringify(poolUrls));
+}
+if (!inst.pool || inst.pool.accounts.length !== 1) {
+  fail('loadPool 未把号池快照写进状态: ' + JSON.stringify(inst.pool));
+}
+if (!inst.labs.pool_enabled) fail('loadPool 等价拉开关后 labs.pool_enabled 应为 true');
+
+// 17c) 开关确实关着时不得请求 /admin/pool（省一次无意义请求）
+inst._experimentsLoaded = false;
+inst.labs.pool_enabled = false;
+inst.pool = { accounts: [{ uid: 'stale' }] };   // 脏值应被清空
+poolUrls.length = 0;
+poolFetch(false);
+await inst.loadPool();
+if (/\/admin\/pool/.test(poolUrls.join(','))) {
+  fail('号池关闭时不应请求 /admin/pool: ' + JSON.stringify(poolUrls));
+}
+if (inst.pool !== null) fail('号池关闭时 pool 快照应清空（否则残留上一轮账号列表），得到 ' + JSON.stringify(inst.pool));
+
+// 17d) 开关未知时并发调用 loadPool 不得重复打 /admin/experiments（在途去重）
+inst._experimentsLoaded = false;
+inst.labs.pool_enabled = false;
+poolUrls.length = 0;
+poolFetch(true);
+await Promise.all([inst.loadPool(), inst.loadPool()]);
+const expHits = poolUrls.filter(function (u) { return /\/admin\/experiments/.test(u); }).length;
+if (expHits !== 1) fail('并发 loadPool 应只拉一次实验开关，实际 ' + expHits + ' 次: ' + JSON.stringify(poolUrls));
+
+// 17e) 会话边界（登出/401）后必须重新拉开关：换会话前的实验状态不可信
+inst._experimentsLoaded = true;
+inst.resetSession();
+if (inst._experimentsLoaded) fail('resetSession 未清 _experimentsLoaded（重新登录会沿用上一会话的实验开关）');
+
+global.fetch = savedFetch;
+
 console.log('OK ' + JSON.stringify(loads));
 })().catch(function (e) { console.error('FAIL: harness 异常: ' + ((e && e.stack) || e)); process.exit(1); });
 `
@@ -1513,6 +1604,67 @@ func TestAccountPageExportImportUI(t *testing.T) {
 	// 导出不得再兼容旧的裸 token.json 下载（按钮必须开弹窗，而非直接下载）
 	if strings.Contains(script, "a.download = 'token.json'") {
 		t.Error("account.js 仍在下载旧格式 token.json（导出应统一为凭证包）")
+	}
+}
+
+// TestAccountPagePoolCreditsColumn 号池卡片必须显示**每个**号的额度，且能区分「未知」与「额度 0」。
+//
+// 两个回归点：
+//  1. 额度列原来用 `credits>0` 判显隐，探测确认耗尽（credits=0, credits_at>0）的号会被
+//     当成「未知」显示 —，用户看不出它到底是没探过还是真的用完了；
+//  2. 卡片原来 `x-show="labs.pool_enabled"`，而该字段只有实验页会拉，刷新在账号页时
+//     恒为 false → 号池状态整块看不见（只能从实验页跳过去才出现）。
+func TestAccountPagePoolCreditsColumn(t *testing.T) {
+	html, err := pageFS.ReadFile("pages/account.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(html)
+	for _, want := range []string{
+		"a.credits_at>0", // 「未知」判定靠探测时刻，而非额度是否大于 0
+		"fmtDosage(a.credits)",
+		"号池状态",
+		"loadPool()", // 手动刷新按钮
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("account.html 缺少 %q", want)
+		}
+	}
+	if strings.Contains(page, "x-if=\"a.credits>0\"") {
+		t.Error("account.html 仍用 credits>0 判显隐（探测确认耗尽的号会被误显成「未知」）")
+	}
+}
+
+// TestExperimentsLoadedOnLogin 登录进场必须拉实验开关（号池卡片的可见性依赖它）。
+//
+// 只看源码文本是因为这条约束同时横跨“谁调它”与“谁不覆盖它”：
+// afterLogin 必须调；页面层不得再定义同名成员（重名会顶掉共享层实现，由
+// TestPageLayerDoesNotShadowShell 兵底）。行为验证在 harness 第 17 组。
+func TestExperimentsLoadedOnLogin(t *testing.T) {
+	src, err := assetFS.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	for _, want := range []string{
+		"afterLogin(){ this.loadHealth(); this.loadExperiments();",
+		"async loadPool(){",
+		"if(!this._experimentsLoaded) await this.loadExperiments();",
+		"applyExperiments(r){",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js 缺少 %q（刷新后号池不可见的回归）", want)
+		}
+	}
+	// 页面层不得重复实现（两份会静默漂移）
+	labs, err := assetFS.ReadFile("assets/pages/labs.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"applyExperiments(r){", "async loadPool(){"} {
+		if strings.Contains(string(labs), banned) {
+			t.Errorf("labs.js 重复定义了 %q（应一律用共享层实现）", banned)
+		}
 	}
 }
 

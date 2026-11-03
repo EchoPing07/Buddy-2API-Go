@@ -41,28 +41,31 @@ func (h *Handler) poolView(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, view)
 }
 
-// poolCredits 从余额缓存里读某个账号的可用额度。
+// poolCredits 从余额缓存里读某个账号的可用额度，返回 (额度, 读到它的时刻)。
 //
-// 号池账号的余额没有按账号分片的缓存（缓存键是单账号设计的固定字串），
-// 所以这里只在「该账号正好是当前活动账号」时用现成缓存，其余返回 0 交给 UI 显示「—」。
+// 缓存键是单账号设计的固定字串（`default_v3`），**只代表当前活动账号**，
+// 其他账号这里一律回 (0, 0)。号池面板不会因此只剩下一个号显额度：
+// pool.Manager 在探测时已把每个号自己的额度存进了状态（AccountState.Credits），
+// Snapshot 按时间戳取新——本函数的 0 值（at=0）永远比不过真实探测值。
+//
 // 刻意不在这里打上游：面板刷新一次要 ×N 个账号，得不偿失；真要看余额点「探测」。
-func (h *Handler) poolCredits(uid string) float64 {
+func (h *Handler) poolCredits(uid string) (float64, int64) {
 	t := h.toks.Get()
 	if t == nil || t.UID != uid {
-		return 0
+		return 0, 0
 	}
-	payload, _, ok := h.st.GetCache("resource_cache", resourceCacheKey, 0)
+	payload, updatedAt, ok := h.st.GetCache("resource_cache", resourceCacheKey, 0)
 	if !ok || payload == "" {
-		return 0
+		return 0, 0
 	}
 	// 缓存内容是 processResources 加工后的结构，直接取 total_dosage
 	var cached struct {
 		TotalDosage float64 `json:"total_dosage"`
 	}
 	if err := json.Unmarshal([]byte(payload), &cached); err != nil {
-		return 0
+		return 0, 0
 	}
-	return cached.TotalDosage
+	return cached.TotalDosage, updatedAt
 }
 
 // poolDisable / poolEnable 手动禁用 / 启用某账号。

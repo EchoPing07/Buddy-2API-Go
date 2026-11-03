@@ -111,7 +111,19 @@ func commonHeaders(domain string) http.Header {
 }
 
 // chatHeaders chat 请求头：通用 + 账号 + IDE/CLI + SDK（绝不带 refresh_token）。
+//
+// conversationID 为空时保持旧行为（每次随机）。chat 路径应传入**按会话稳定**的 ID：
+// 上游的前缀缓存按会话维度生效，每次都换 X-Conversation-ID 会让缓存命中率恒为 0。
+// 逆向后实测（同一段 2415 token 前缀）：
+//
+//	随机 X-Conversation-ID → prompt_cache_hit_tokens=0,    credit≈0.04
+//	固定 X-Conversation-ID → prompt_cache_hit_tokens=2368, credit≈0.01（约 4× 降本）
 func chatHeaders(t *auth.Token) http.Header {
+	return chatHeadersWithConversation(t, "")
+}
+
+// chatHeadersWithConversation 同 chatHeaders，但允许调用方指定稳定的会话 ID。
+func chatHeadersWithConversation(t *auth.Token, conversationID string) http.Header {
 	h := commonHeaders(t.Domain)
 
 	k, v := accountHeader(t.AccessToken, "Authorization", "X-No-Authorization")
@@ -134,7 +146,10 @@ func chatHeaders(t *auth.Token) http.Header {
 	h.Set("X-IDE-Version", ideVersion)
 	h.Set("x-codebuddy-request", "1")
 	h.Set("X-Agent-Intent", "craft")
-	h.Set("X-Conversation-ID", uuidStd())
+	if conversationID == "" {
+		conversationID = uuidStd()
+	}
+	h.Set("X-Conversation-ID", conversationID)
 	h.Set("X-Conversation-Request-ID", uuidHex())
 	h.Set("X-Conversation-Message-ID", uuidHex())
 	h.Set("x-stainless-arch", "x64")

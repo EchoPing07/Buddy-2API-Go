@@ -71,7 +71,7 @@ func (m *Manager) Probe(ctx context.Context, uid string) ProbeResult {
 		res.Disabled = true
 		res.Reason = "manual"
 		res.Msg = "已手动禁用，探测不会自动恢复"
-		m.recordProbe(uid, false, "manual-disabled", 0)
+		m.recordProbe(uid, false, "manual-disabled", 0, false)
 		return res
 	}
 	if ts == nil {
@@ -103,7 +103,7 @@ func (m *Manager) Probe(ctx context.Context, uid string) ProbeResult {
 			m.router.DropUID(uid)
 			res.Disabled = true
 			res.Reason = AutoCredential
-			m.recordProbe(uid, false, res.Msg, 0)
+			m.recordProbe(uid, false, res.Msg, 0, false)
 			slog.Warn("号池探测确认凭证失效", "uid", shortUID(uid), "error", err)
 			return res
 		}
@@ -111,7 +111,7 @@ func (m *Manager) Probe(ctx context.Context, uid string) ProbeResult {
 		// 把「网络抖动」当成「号还是坏的」会让一次断网把好号永久禁掉。
 		res.Disabled = prevDisabled != ""
 		res.Reason = prevDisabled
-		m.recordProbe(uid, false, "probe failed: "+res.Msg, 0)
+		m.recordProbe(uid, false, "probe failed: "+res.Msg, 0, false)
 		slog.Warn("号池探测失败（不改状态）", "uid", shortUID(uid), "error", err)
 		return res
 	}
@@ -136,7 +136,7 @@ func (m *Manager) Probe(ctx context.Context, uid string) ProbeResult {
 		}
 		res.OK = true
 		res.Msg = "credit=" + fmtFloat(credits)
-		m.recordProbe(uid, true, res.Msg, credits)
+		m.recordProbe(uid, true, res.Msg, credits, true)
 		return res
 	}
 
@@ -146,7 +146,7 @@ func (m *Manager) Probe(ctx context.Context, uid string) ProbeResult {
 	res.Disabled = true
 	res.Reason = AutoQuota
 	res.Msg = "credit=0"
-	m.recordProbe(uid, false, res.Msg, 0)
+	m.recordProbe(uid, false, res.Msg, 0, true)
 	return res
 }
 
@@ -191,7 +191,11 @@ func (m *Manager) setAutoDisabled(uid, reason, msg string) {
 }
 
 // recordProbe 更新探测域并落库（异步）。
-func (m *Manager) recordProbe(uid string, ok bool, msg string, credits float64) {
+//
+// creditsKnown 为 true 表示本次探测**真的读到了**余额（成功 / 明确 0），此时把额度
+// 一并写进状态；为 false（网络故障、凭证刷不动）时只能更新探测时间，绝不能把
+// 旧额度清成 0——那会让面板把一个好号显示成「额度 0」。
+func (m *Manager) recordProbe(uid string, ok bool, msg string, credits float64, creditsKnown bool) {
 	now := time.Now().Unix()
 	m.mu.Lock()
 	st := m.accounts[uid]
@@ -202,6 +206,10 @@ func (m *Manager) recordProbe(uid string, ok bool, msg string, credits float64) 
 	st.LastProbeAt = now
 	st.LastProbeOK = ok
 	st.LastProbeMsg = truncRunes(msg, 200)
+	if creditsKnown {
+		st.Credits = credits
+		st.CreditsAt = now
+	}
 	row := m.rowOfLocked(st)
 	m.mu.Unlock()
 	m.persist(persistOp{account: row})

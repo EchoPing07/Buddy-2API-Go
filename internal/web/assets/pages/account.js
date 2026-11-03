@@ -321,11 +321,8 @@ PAGE('account', {
   },
 
     /* ═══ 号池状态 ═══
-       只在开关开启时渲染；关闭时整块不显示，也不发 /admin/pool 请求。 */
-  async loadPool(){
-    if(!this.labs.pool_enabled){ this.pool = null; return; }
-    try{ this.pool = await this.api('/admin/pool'); }catch(e){ this.pool = null; }
-  },
+       loadPool 在共享层（app.js）：账号页与实验页共用同一份 pool 状态
+       （两份实现会静默漂移）。本页只负责渲染与动作。 */
   /** 号池账号行的状态键：三色语义（绿可用 / 黄部分限额 / 红整号不可用） */
   poolStateKey(a){
     if(a.manual_disabled || a.auto_disabled) return 'down';
@@ -425,7 +422,8 @@ PAGE('account', {
         this.oauthStop();
         this.toast('登录成功：'+(r.account.nickname||r.account.uid),'ok');
         // 换账号，同导入；loadModels 单独留着：模型列表跟 region 走不跟账号走
-        this.refreshAccountData(); this.loadModels(); this.loadAccounts(); this.loadPool();
+        // （号池快照由 refreshAccountData 内的 loadPool 一并刷新）
+        this.refreshAccountData(); this.loadModels(); this.loadAccounts();
       }else if(r.status==='error'){
         this.oauthStop(r.message);
       }else{

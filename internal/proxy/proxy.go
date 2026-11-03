@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ var passthroughBodyKeys = []string{
 	"stream_options", "stop", "presence_penalty", "frequency_penalty",
 	"n", "response_format", "seed", "user", "reasoning_effort",
 	"verbosity", "reasoning_summary",
+	// prompt_cache_key 是上游前缀缓存命中键。此前不在白名单 → 上游缓存命中率恒为 0，
+	// 实测 8k 前缀不带键 credit≈0.34、带键≈0.02（约 17× 费用差）。
+	"prompt_cache_key",
 }
 
 // thoughtPrefixRE 上游 reasoning_content 的 "Thought: Xms\n" 前缀。
@@ -351,39 +355,75 @@ func buildUpstreamBody(body map[string]any) []byte {
 }
 
 // sseChunk 最小化解析 SSE chunk 需要的字段。
+//
+// 完整的 usage 用 RawMessage 原样留存（见 usageJSON 注释）：缓存命中类字段
+// （prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens 等）不可枚举，
+// 用白名单结构体会把它们整批丢掉。
 type sseChunk struct {
-	ID      string `json:"id"`
-	Created int64  `json:"created"`
-	Model   string `json:"model"`
-	Choices []struct {
-		Index        int    `json:"index"`
-		FinishReason string `json:"finish_reason"`
-		Delta        struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
-			ToolCalls        []struct {
-				Index    int    `json:"index"`
-				ID       string `json:"id"`
-				Type     string `json:"type"`
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-		} `json:"delta"`
-	} `json:"choices"`
-	Usage *usageJSON `json:"usage"`
+	ID                string          `json:"id"`
+	Created           int64           `json:"created"`
+	Model             string          `json:"model"`
+	SystemFingerprint string          `json:"system_fingerprint"`
+	ServiceTier       string          `json:"service_tier"`
+	Choices           []sseChoice     `json:"choices"`
+	Usage             json.RawMessage `json:"usage"`
 	// Error 流内错误帧（HTTP 200 已开流，上游在流里报错）。
 	// 实测形态：{"error":{"message":"...","code":"6004","requestId":"..."}}，
 	// code 是字符串而非数字，故用 BizCode 统一解（见 upstream.ClassifyChatError）。
 	Error json.RawMessage `json:"error"`
 }
 
+// sseChoice 单个候选的增量。
+type sseChoice struct {
+	Index        int      `json:"index"`
+	FinishReason string   `json:"finish_reason"`
+	Delta        sseDelta `json:"delta"`
+}
+
+// sseDelta 增量内容。
+type sseDelta struct {
+	Role             string        `json:"role"`
+	Content          string        `json:"content"`
+	ReasoningContent string        `json:"reasoning_content"`
+	Refusal          string        `json:"refusal"`
+	ToolCalls        []sseToolCall `json:"tool_calls"`
+}
+
+// sseToolCall 流式工具调用分片。
+type sseToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// usageJSON 已解析的 usage（**仅用于取数记账**，不回写给客户端）。
+//
+// 只有这 4 个字段被结构化读取：其余字段（缓存命中、reasoning_tokens、
+// *_tokens_details 等）不可枚举且会随上游变化，必须原样透传。
+// 回写给客户端的永远是 chunk.Usage 原始 JSON（见 completionJSON / passthroughSSE），
+// 不要用本结构体重新编码——那样会退化成“白名单丢字段”。
 type usageJSON struct {
 	PromptTokens     int     `json:"prompt_tokens"`
 	CompletionTokens int     `json:"completion_tokens"`
 	TotalTokens      int     `json:"total_tokens"`
 	Credit           float64 `json:"credit"`
+}
+
+// parseUsage 解析一帧的 usage 原始 JSON；null / 空 / 不可解析均返回 nil。
+func parseUsage(raw json.RawMessage) *usageJSON {
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return nil
+	}
+	var u usageJSON
+	if json.Unmarshal(raw, &u) != nil {
+		return nil
+	}
+	return &u
 }
 
 // passthroughSSE 流式透传：逐行转发（Flusher 实时），末尾补全 finish_reason。
@@ -406,6 +446,9 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 	sawFinish := false
 	notedError := false
 	var lastChunk sseChunk
+	// lastUsage 保存最后一帧 usage 的**原始 JSON**，合成帧时原样回写，
+	// 不经过 usageJSON 重新编码（否则缓存命中类字段会被丢掉）。
+	var lastUsage json.RawMessage
 	clientGone := false
 
 	// writeLine 写入一行；失败标记 clientGone（不再从内部 break，统一在循环出口处理）。
@@ -443,8 +486,8 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 							"finish_reason": "stop",
 						}},
 					}
-					if lastChunk.Usage != nil {
-						synth["usage"] = lastChunk.Usage
+					if len(lastUsage) > 0 {
+						synth["usage"] = lastUsage
 					}
 					if raw, err := json.Marshal(synth); err == nil {
 						writeLine("data: " + string(raw) + "\n\n")
@@ -487,12 +530,13 @@ func (h *Handler) passthroughSSE(w http.ResponseWriter, r *http.Request, body io
 					if chunk.Created != 0 {
 						lastChunk.Created = chunk.Created
 					}
-					if chunk.Usage != nil {
-						lastChunk.Usage = chunk.Usage
-						logEntry.PromptTokens = chunk.Usage.PromptTokens
-						logEntry.CompletionTokens = chunk.Usage.CompletionTokens
-						logEntry.TotalTokens = chunk.Usage.TotalTokens
-						logEntry.Credit = chunk.Usage.Credit
+					if u := parseUsage(chunk.Usage); u != nil {
+						lastUsage = chunk.Usage
+						logEntry.PromptTokens = u.PromptTokens
+						logEntry.CompletionTokens = u.CompletionTokens
+						logEntry.TotalTokens = u.TotalTokens
+						logEntry.Credit = u.Credit
+						logEntry.UsagePresent = true
 					}
 					for _, ch := range chunk.Choices {
 						if ch.FinishReason != "" {
@@ -560,13 +604,14 @@ func (h *Handler) aggregate(r *http.Request, body io.Reader, reqBody map[string]
 						agg2 := scanSSE(resp.Body, onError)
 						resp.Body.Close()
 						// 重试无论是否采用其结果，上游都已计费：累计 token，避免漏计费
-						if agg2 != nil && agg2.Usage != nil {
-							logEntry.PromptTokens += agg2.Usage.PromptTokens
-							logEntry.CompletionTokens += agg2.Usage.CompletionTokens
-							logEntry.TotalTokens += agg2.Usage.TotalTokens
-							logEntry.Credit += agg2.Usage.Credit
+						if agg2 != nil && agg2.usageParsed != nil {
+							logEntry.PromptTokens += agg2.usageParsed.PromptTokens
+							logEntry.CompletionTokens += agg2.usageParsed.CompletionTokens
+							logEntry.TotalTokens += agg2.usageParsed.TotalTokens
+							logEntry.Credit += agg2.usageParsed.Credit
+							logEntry.UsagePresent = true
 						}
-						if agg2 != nil && len(agg2.ToolCalls) > 0 {
+						if agg2 != nil && agg2.hasAnyToolCalls() {
 							if agg2.Model != "" {
 								logEntry.Model = agg2.Model
 							}
@@ -601,20 +646,36 @@ type toolCallAccum struct {
 
 // aggregated 非流式聚合结果。
 type aggregated struct {
-	ID           string
-	Created      int64
-	Model        string
+	ID                string
+	Created           int64
+	Model             string
+	SystemFingerprint string
+	ServiceTier       string
+	// Choices 按 index 分组累积。此前把所有 choice 的 content 拼进同一个 builder，
+	// n>1（或上游多候选）时内容会混成一团且最后只输出 index:0 一个候选。
+	Choices      map[int]*choiceAccum
+	FinishReason string
+	// Usage 上游最后一帧 usage 的原始 JSON：直接透传给客户端，保留全部字段
+	// （缓存命中 / *_tokens_details 等），不做白名单过滤。
+	Usage json.RawMessage
+	// usageParsed 是 Usage 的强类型视图，仅供日志与计费取数。
+	usageParsed *usageJSON
+	sawAny      bool
+}
+
+// choiceAccum 单个候选的累积器。
+type choiceAccum struct {
+	Role         string
 	Content      strings.Builder
 	Reasoning    strings.Builder
+	Refusal      strings.Builder
 	ToolCalls    []*toolCallAccum
 	FinishReason string
-	Usage        *usageJSON
-	sawAny       bool
 }
 
 // scanSSE 扫描上游 SSE 流聚合成单个 chat.completion。
 func scanSSE(body io.Reader, onError func(upstream.ChatErrKind, []byte)) *aggregated {
-	agg := &aggregated{}
+	agg := &aggregated{Choices: map[int]*choiceAccum{}}
 	notedError := false
 	reader := bufio.NewReaderSize(body, 64<<10)
 	for {
@@ -650,35 +711,52 @@ func scanSSE(body io.Reader, onError func(upstream.ChatErrKind, []byte)) *aggreg
 					if chunk.Model != "" {
 						agg.Model = chunk.Model
 					}
-					if chunk.Usage != nil {
+					if chunk.SystemFingerprint != "" {
+						agg.SystemFingerprint = chunk.SystemFingerprint
+					}
+					if chunk.ServiceTier != "" {
+						agg.ServiceTier = chunk.ServiceTier
+					}
+					if u := parseUsage(chunk.Usage); u != nil {
 						agg.Usage = chunk.Usage
+						agg.usageParsed = u
 					}
 					for _, ch := range chunk.Choices {
+						acc := agg.Choices[ch.Index]
+						if acc == nil {
+							acc = &choiceAccum{}
+							agg.Choices[ch.Index] = acc
+						}
 						if ch.FinishReason != "" {
 							agg.FinishReason = ch.FinishReason
+							acc.FinishReason = ch.FinishReason
 						}
-						agg.Content.WriteString(ch.Delta.Content)
-						agg.Reasoning.WriteString(ch.Delta.ReasoningContent)
+						if ch.Delta.Role != "" {
+							acc.Role = ch.Delta.Role
+						}
+						acc.Content.WriteString(ch.Delta.Content)
+						acc.Reasoning.WriteString(ch.Delta.ReasoningContent)
+						acc.Refusal.WriteString(ch.Delta.Refusal)
 						for _, tc := range ch.Delta.ToolCalls {
-							var acc *toolCallAccum
-							for _, a := range agg.ToolCalls {
+							var tacc *toolCallAccum
+							for _, a := range acc.ToolCalls {
 								if a.Index == tc.Index {
-									acc = a
+									tacc = a
 									break
 								}
 							}
-							if acc == nil {
-								acc = &toolCallAccum{Index: tc.Index, Type: "function"}
-								agg.ToolCalls = append(agg.ToolCalls, acc)
+							if tacc == nil {
+								tacc = &toolCallAccum{Index: tc.Index, Type: "function"}
+								acc.ToolCalls = append(acc.ToolCalls, tacc)
 							}
 							if tc.ID != "" {
-								acc.ID = tc.ID
+								tacc.ID = tc.ID
 							}
 							if tc.Type != "" {
-								acc.Type = tc.Type
+								tacc.Type = tc.Type
 							}
-							acc.Name += tc.Function.Name
-							acc.Args.WriteString(tc.Function.Arguments)
+							tacc.Name += tc.Function.Name
+							tacc.Args.WriteString(tc.Function.Arguments)
 						}
 					}
 				}
@@ -696,38 +774,60 @@ func scanSSE(body io.Reader, onError func(upstream.ChatErrKind, []byte)) *aggreg
 
 // completionJSON 构造 OpenAI chat.completion 响应。
 func (a *aggregated) completionJSON() []byte {
-	msg := map[string]any{"role": "assistant"}
-	if a.Content.Len() > 0 {
-		msg["content"] = a.Content.String()
-	} else {
-		msg["content"] = nil
-	}
-	if reasoning := thoughtPrefixRE.ReplaceAllString(a.Reasoning.String(), ""); reasoning != "" {
-		msg["reasoning_content"] = reasoning
-	}
-	if len(a.ToolCalls) > 0 {
-		tcs := make([]any, 0, len(a.ToolCalls))
-		for _, tc := range a.ToolCalls {
-			tcs = append(tcs, map[string]any{
-				"id":   orDefault(tc.ID, "call_"+fmt.Sprint(tc.Index)),
-				"type": tc.Type,
-				"function": map[string]any{
-					"name":      tc.Name,
-					"arguments": tc.Args.String(),
-				},
-			})
-		}
-		msg["tool_calls"] = tcs
-	}
-
-	// finish_reason 修正：空则按内容推断
-	finish := a.FinishReason
-	if finish == "" {
-		if len(a.ToolCalls) > 0 {
-			finish = "tool_calls"
+	choices := make([]any, 0, len(a.Choices))
+	for _, idx := range sortedChoiceIndexes(a.Choices) {
+		acc := a.Choices[idx]
+		msg := map[string]any{"role": orDefault(acc.Role, "assistant")}
+		if acc.Content.Len() > 0 {
+			msg["content"] = acc.Content.String()
 		} else {
-			finish = "stop"
+			msg["content"] = nil
 		}
+		if reasoning := thoughtPrefixRE.ReplaceAllString(acc.Reasoning.String(), ""); reasoning != "" {
+			msg["reasoning_content"] = reasoning
+		}
+		if acc.Refusal.Len() > 0 {
+			msg["refusal"] = acc.Refusal.String()
+		}
+		if len(acc.ToolCalls) > 0 {
+			tcs := make([]any, 0, len(acc.ToolCalls))
+			for _, tc := range acc.ToolCalls {
+				tcs = append(tcs, map[string]any{
+					"id":   orDefault(tc.ID, "call_"+fmt.Sprint(tc.Index)),
+					"type": orDefault(tc.Type, "function"),
+					"function": map[string]any{
+						"name":      tc.Name,
+						"arguments": tc.Args.String(),
+					},
+				})
+			}
+			msg["tool_calls"] = tcs
+		}
+
+		// finish_reason 修正：空则按内容推断
+		finish := acc.FinishReason
+		if finish == "" {
+			finish = orDefault(a.FinishReason, "")
+		}
+		if finish == "" {
+			if len(acc.ToolCalls) > 0 {
+				finish = "tool_calls"
+			} else {
+				finish = "stop"
+			}
+		}
+		choices = append(choices, map[string]any{
+			"index":         idx,
+			"message":       msg,
+			"finish_reason": finish,
+		})
+	}
+	if len(choices) == 0 {
+		choices = append(choices, map[string]any{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": nil},
+			"finish_reason": orDefault(a.FinishReason, "stop"),
+		})
 	}
 
 	resp := map[string]any{
@@ -735,17 +835,33 @@ func (a *aggregated) completionJSON() []byte {
 		"object":  "chat.completion",
 		"created": orDefaultInt(a.Created, time.Now().Unix()),
 		"model":   a.Model,
-		"choices": []any{map[string]any{
-			"index":         0,
-			"message":       msg,
-			"finish_reason": finish,
-		}},
+		"choices": choices,
 	}
-	if a.Usage != nil {
+	if a.SystemFingerprint != "" {
+		resp["system_fingerprint"] = a.SystemFingerprint
+	}
+	if a.ServiceTier != "" {
+		resp["service_tier"] = a.ServiceTier
+	}
+	// usage 原样回写（保留缓存命中 / *_tokens_details 等全部字段）；
+	// 上游未提供时按 OpenAI 规范写 null，而不是省略该键。
+	if len(a.Usage) > 0 {
 		resp["usage"] = a.Usage
+	} else {
+		resp["usage"] = nil
 	}
 	raw, _ := json.Marshal(resp)
 	return raw
+}
+
+// sortedChoiceIndexes 返回升序的候选 index，保证响应可重复。
+func sortedChoiceIndexes(m map[int]*choiceAccum) []int {
+	idxs := make([]int, 0, len(m))
+	for i := range m {
+		idxs = append(idxs, i)
+	}
+	sort.Ints(idxs)
+	return idxs
 }
 
 // needToolRetry 判断是否触发工具停转防护。
@@ -767,7 +883,15 @@ func needToolRetry(reqBody map[string]any, agg *aggregated) bool {
 	if !hasToolResult {
 		return false
 	}
-	return agg.FinishReason == "stop" && len(agg.ToolCalls) == 0 && agg.Content.Len() > 0
+	if agg.FinishReason != "stop" {
+		return false
+	}
+	for _, acc := range agg.Choices {
+		if len(acc.ToolCalls) > 0 || acc.Content.Len() == 0 {
+			return false
+		}
+	}
+	return len(agg.Choices) > 0
 }
 
 func applyAggToLog(agg *aggregated, l *store.LogEntry) {
@@ -776,19 +900,30 @@ func applyAggToLog(agg *aggregated, l *store.LogEntry) {
 	}
 	finish := agg.FinishReason
 	if finish == "" {
-		if len(agg.ToolCalls) > 0 {
+		if agg.hasAnyToolCalls() {
 			finish = "tool_calls"
 		} else {
 			finish = "stop"
 		}
 	}
 	l.FinishReason = finish
-	if agg.Usage != nil {
-		l.PromptTokens = agg.Usage.PromptTokens
-		l.CompletionTokens = agg.Usage.CompletionTokens
-		l.TotalTokens = agg.Usage.TotalTokens
-		l.Credit = agg.Usage.Credit
+	if agg.usageParsed != nil {
+		l.PromptTokens = agg.usageParsed.PromptTokens
+		l.CompletionTokens = agg.usageParsed.CompletionTokens
+		l.TotalTokens = agg.usageParsed.TotalTokens
+		l.Credit = agg.usageParsed.Credit
+		l.UsagePresent = true
 	}
+}
+
+// hasAnyToolCalls 任意候选产生了工具调用。
+func (a *aggregated) hasAnyToolCalls() bool {
+	for _, acc := range a.Choices {
+		if len(acc.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // ── models / health ──

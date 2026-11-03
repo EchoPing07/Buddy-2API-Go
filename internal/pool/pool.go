@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -309,6 +310,22 @@ func (m *Manager) AccountStateOf(uid string) (AccountState, bool) {
 		return AccountState{}, false
 	}
 	return *st, true
+}
+
+// SetCredits 写入某账号的「已知额度」与读到它的时刻。
+//
+// 生产路径只由 Probe 调（探测真的读到余额时）；导出是为了让面板与其他包的用例
+// 能直接构造「这个号探测过、额度是多少」的状态，不必为每个用例搭一套假 billing 上游。
+func (m *Manager) SetCredits(uid string, credits float64, at int64) {
+	if at <= 0 {
+		at = time.Now().Unix()
+	}
+	m.mu.Lock()
+	st := m.accounts[uid]
+	if st != nil {
+		st.Credits, st.CreditsAt = credits, at
+	}
+	m.mu.Unlock()
 }
 
 // ── 会话路由 ──
@@ -609,6 +626,7 @@ type AccountView struct {
 	Available       bool   `json:"available"`
 
 	Credits      float64 `json:"credits"`
+	CreditsAt    int64   `json:"credits_at"` // 0 = 从未读到过额度（UI 显示 —）
 	LastProbeAt  int64   `json:"last_probe_at"`
 	LastProbeOK  bool    `json:"last_probe_ok"`
 	LastProbeMsg string  `json:"last_probe_msg"`
@@ -647,8 +665,12 @@ type PoolView struct {
 }
 
 // Snapshot 构造管理页视图。creditsOf 由调用方注入（余额需要额外上游调用，
-// pool 包不自己做，避免探测路径与面板路径耦合）。
-func (m *Manager) Snapshot(creditsOf func(uid string) float64) PoolView {
+// pool 包不自己做，避免探测路径与面板路径耦合），返回 (额度, 读到它的时刻)。
+//
+// 注入的余额只是**补充**：账号自己探测过的额度（st.Credits/st.CreditsAt）与之按时间戳
+// 取新，谁新用谁。早期版本把注入值当唯一来源，而它只回答“当前活动账号”的余额，
+// 于是面板上 N 个号里只有当前这个显出额度、其余全是 —。
+func (m *Manager) Snapshot(creditsOf func(uid string) (float64, int64)) PoolView {
 	cfg := m.cfg.Get()
 	now := time.Now().Unix()
 	// Router 的取数全部在 m.mu 之外：持 Manager 锁时绝不进 Router 的锁，
@@ -677,6 +699,7 @@ func (m *Manager) Snapshot(creditsOf func(uid string) float64) PoolView {
 			AutoDisabledMsg: st.AutoDisabledMsg, QuotaFailStreak: st.QuotaFailStreak,
 			LastProbeAt: st.LastProbeAt, LastProbeOK: st.LastProbeOK,
 			LastProbeMsg: st.LastProbeMsg, BoundSessions: byUID[uid],
+			Credits: st.Credits, CreditsAt: st.CreditsAt,
 			SuccessCount: st.SuccessCount, ErrorCount: st.ErrorCount, LastUsedAt: st.LastUsedAt,
 		}
 		cools := make([]CoolView, 0, len(m.cools[uid]))
@@ -712,9 +735,14 @@ func (m *Manager) Snapshot(creditsOf func(uid string) float64) PoolView {
 	m.mu.RUnlock()
 
 	// 第二段：出了锁再查余额（可能是一次 DB 读）。
+	// 注入的额度与探测得到的额度按时间戳取新：当前活动账号余额缓存很新（刚刷过页面），
+	// 其他号只有上次探测的值（可能几小时前），两者都比没有强。
 	if creditsOf != nil {
 		for i := range views {
-			views[i].Credits = creditsOf(creditsUIDs[i])
+			v, at := creditsOf(creditsUIDs[i])
+			if at > views[i].CreditsAt {
+				views[i].Credits, views[i].CreditsAt = v, at
+			}
 		}
 	}
 	return PoolView{
@@ -863,6 +891,7 @@ func (m *Manager) rowOfLocked(st *AccountState) *store.PoolAccountRow {
 		AutoDisabled: st.AutoDisabled, AutoDisabledAt: st.AutoDisabledAt,
 		AutoDisabledMsg: st.AutoDisabledMsg, QuotaFailStreak: st.QuotaFailStreak,
 		LastProbeAt: st.LastProbeAt, LastProbeOK: st.LastProbeOK, LastProbeMsg: st.LastProbeMsg,
+		Credits: st.Credits, CreditsAt: st.CreditsAt,
 	}
 }
 
@@ -877,6 +906,32 @@ func applyRow(st *AccountState, row store.PoolAccountRow) {
 	st.LastProbeAt = row.LastProbeAt
 	st.LastProbeOK = row.LastProbeOK
 	st.LastProbeMsg = row.LastProbeMsg
+	st.Credits = row.Credits
+	st.CreditsAt = row.CreditsAt
+	backfillCreditsFromProbeMsg(st)
+}
+
+// backfillCreditsFromProbeMsg 从旧的 last_probe_msg 里回填额度。
+//
+// credits / credits_at 是后加的列，老库里是默认 0；但探测一直有把结论写成
+// "credit=5015.37" 这类字符串，信息其实已经在库里。不回填的话，升级后用户要等
+// 下一次探测（默认 6 小时一轮）才能在面板上看到那些号的额度，而面板会一直显示 —。
+//
+// 只在 credits_at 为 0（从未记录过额度）时动手：已有记录的值比从消息里解析的更权威。
+// 不主动落库：这是每轮 Load 都能重现的派生值，为此多一次写没有收益。
+func backfillCreditsFromProbeMsg(st *AccountState) {
+	if st.CreditsAt > 0 || st.LastProbeAt <= 0 {
+		return
+	}
+	const prefix = "credit="
+	if !strings.HasPrefix(st.LastProbeMsg, prefix) {
+		return
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(st.LastProbeMsg[len(prefix):]), 64)
+	if err != nil {
+		return
+	}
+	st.Credits, st.CreditsAt = v, st.LastProbeAt
 }
 
 // computeCoolUntil 计算实际生效的冷却截止。

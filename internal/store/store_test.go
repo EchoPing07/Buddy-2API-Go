@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -156,6 +157,75 @@ func TestEnsureColumnIdempotent(t *testing.T) {
 	}
 }
 
+// TestPoolCreditsColumnsUpgrade 老库升级：库里已存在**旧的** pool_account_state
+// （建表语句里没有 credits / credits_at），Open 必须补上这两列，原数据不得丢。
+//
+// 回归背景：额度原先只在当前活动账号上现查余额缓存，号池面板只显一个号的额度。
+// 修法是把每个号的探测额度落到 pool_account_state，而生产库里这张表早已存在，
+// 只靠 CREATE TABLE IF NOT EXISTS 加不上新列。
+func TestPoolCreditsColumnsUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// 1) 造一张「旧版」表并写入一行
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`CREATE TABLE pool_account_state (
+		uid                TEXT PRIMARY KEY,
+		manual_disabled    INTEGER NOT NULL DEFAULT 0,
+		manual_disabled_at INTEGER NOT NULL DEFAULT 0,
+		auto_disabled      TEXT    NOT NULL DEFAULT '',
+		auto_disabled_at   INTEGER NOT NULL DEFAULT 0,
+		auto_disabled_msg  TEXT    NOT NULL DEFAULT '',
+		quota_fail_streak  INTEGER NOT NULL DEFAULT 0,
+		last_probe_at      INTEGER NOT NULL DEFAULT 0,
+		last_probe_ok      INTEGER NOT NULL DEFAULT 0,
+		last_probe_msg     TEXT    NOT NULL DEFAULT ''
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO pool_account_state (uid, quota_fail_streak, last_probe_msg)
+		VALUES ('old-uid', 3, '旧数据')`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	// 2) 正常 Open：迁移必须补列（不报错）
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("老库升级失败: %v", err)
+	}
+	defer st.Close()
+
+	rows, err := st.LoadPoolAccounts()
+	if err != nil {
+		t.Fatalf("读取升级后的表失败: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("老数据应保留 1 行，实际 %d", len(rows))
+	}
+	if rows[0].UID != "old-uid" || rows[0].QuotaFailStreak != 3 || rows[0].LastProbeMsg != "旧数据" {
+		t.Errorf("升级丢了老数据: %+v", rows[0])
+	}
+	// 新列默认 0 = 「从未读到过额度」，UI 据此显示 —（而非额度 0）
+	if rows[0].Credits != 0 || rows[0].CreditsAt != 0 {
+		t.Errorf("新列默认值应为 0，得到 credits=%v credits_at=%d", rows[0].Credits, rows[0].CreditsAt)
+	}
+
+	// 3) 写入额度后能读回
+	rows[0].Credits, rows[0].CreditsAt = 88.5, 1234
+	if err := st.SavePoolAccount(&rows[0]); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := st.LoadPoolAccounts()
+	if len(again) != 1 || again[0].Credits != 88.5 || again[0].CreditsAt != 1234 {
+		t.Errorf("额度未落库: %+v", again)
+	}
+}
+
 // TestLogAccountUID 日志能写入并读回 account_uid（号池观测列的往返）。
 func TestLogAccountUID(t *testing.T) {
 	dir := t.TempDir()
@@ -200,6 +270,7 @@ func TestPoolStateRoundTrip(t *testing.T) {
 		UID: "u1", ManualDisabled: true, ManualDisabledAt: 100,
 		AutoDisabled: "quota", AutoDisabledAt: 200, AutoDisabledMsg: "额度已用尽",
 		QuotaFailStreak: 2, LastProbeAt: 300, LastProbeOK: false, LastProbeMsg: "credit=0",
+		Credits: 1234.5, CreditsAt: 300,
 	}
 	if err := st.SavePoolAccount(&row); err != nil {
 		t.Fatal(err)
@@ -214,6 +285,9 @@ func TestPoolStateRoundTrip(t *testing.T) {
 	got := rows[0]
 	if !got.ManualDisabled || got.AutoDisabled != "quota" || got.QuotaFailStreak != 2 || got.AutoDisabledMsg != "额度已用尽" {
 		t.Errorf("往返后字段不符：%+v", got)
+	}
+	if got.Credits != 1234.5 || got.CreditsAt != 300 {
+		t.Errorf("额度未往返：credits=%v credits_at=%d", got.Credits, got.CreditsAt)
 	}
 	// UPSERT 覆盖
 	row.ManualDisabled = false

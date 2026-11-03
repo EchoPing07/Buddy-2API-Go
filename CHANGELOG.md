@@ -23,6 +23,9 @@
 
 ### 🐞 修复
 
+- **号池状态卡只能从「实验」页跳过去才看得见，刷新后就消失**：`labs.pool_enabled` 原先只由实验页的 `loadLabs()` 填充，而 `labs` 的初始值是「全关」——刷新后直接停在账号页时该字段恒为默认 `false`，于是 `x-show="labs.pool_enabled"` 把号池卡片整块藏起来，`loadPool()` 也当场 return 不发请求。现在实验开关读取上提为共享层 `loadExperiments()`，由 `afterLogin()` 调一次（`_experimentsLoaded` 区分「还不知道」与「确实关着」，`loadPool()` 在未知时等价一次并做在途去重，`resetSession()` 清标志）；`loadPool` / `applyExperiments` 同时上提共享层，实验页与账号页共用同一份实现（`labs.js` 已删掉重复定义，由重名守卫兜底）。回归用例：harness 第 17 组（17a/17b/17c/17d/17e）、`TestExperimentsLoadedOnLogin`。
+- **号池额度只显示当前活动账号，其余全是 `—`**：`admin.poolCredits` 只从余额缓存取数，而缓存的键是**单账号设计的固定字串**（`default_v3`），只代表 `token.json` 里那个号。而探测（`pool.Probe`）每次都已经调了 `get-user-resource` 并算出 `Σ 未过期包剩余`，这个值却被丢掉了。现在探测得到的额度随探测结果落进 `pool_account_state.credits` / `credits_at`（老库经 `ensureColumn` 增量加列，历史行默认 0 不丢数据），面板直接读它；`Snapshot` 把「探测值」与「注入值」按时间戳取新，`credits_at=0` 的注入值（不知道）永远比不过真实探测值。网络故障/凭证刷不动时**不改**已记录的额度（否则一次断网就把好号显示成「额度 0」）。前端额度列改用 `credits_at>0` 判「未知」而非 `credits>0`——探测确认耗尽（`credits=0, credits_at>0`）现在正确显示 0 而不是 `—`，并附上探测时刻。号池卡片另加「刷新」按钮。回归用例：`TestPoolCreditsColumnsUpgrade`、`TestPoolStateRoundTrip`、`TestSnapshotCreditsPerAccount` / `...PrefersNewest` / `...WithoutProbeCreditsUnknown`、`TestProbeCreditsPersistAcrossReload`、`TestProbeNetworkErrorKeepsCredits`、`TestSnapshotViewJSONShape`、`TestPoolViewCreditsForEveryAccount`、`TestAccountPagePoolCreditsColumn`；均已在回退对应修复后确认会失败。
+
 - **分段控件（导入 / 导出弹窗的方式切换）选中项 hover 时文字消失**：`.seg-btn:hover` 无条件把字色改成 `--fg`，而选中项的背景已是主色（`--primary`，浅色模式下即深色），两者同色导致文字看不见。改为 hover 只作用于未选中项（`:not(.is-active)`），选中项 hover 只降不透明度；同时给未选中项 hover 补一层淡背景，与全站按钮的 hover 反馈一致。
 
 - **批量导入的实测缺陷修复（自查发现）**：

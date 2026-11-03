@@ -33,7 +33,7 @@
                     <td class="muted-xs mono" :title="l.account_uid" x-text="poolAccountName(l.account_uid)"></td>
                     <td class="muted-xs" x-text="l.api_key_name||'—'"></td>
                     <td class="muted-xs" x-text="l.stream?'流式':'—'"></td>
-                    <td class="muted-xs mono" x-text="(l.prompt_tokens||0)+' / '+(l.completion_tokens||0)+' / '+(l.total_tokens||0)"></td>
+                    <td class="muted-xs mono" x-text="(l.prompt_tokens||0)+' / '+(l.completion_tokens||0)+' / '+(l.total_tokens||0)" :title="l.usage_present?'上游返回 usage':'上游未返回 usage（token 不可信）'"></td>
                     <td class="muted-xs" x-text="l.credit||''"></td>
                     <td class="muted-xs" x-text="l.finish_reason||''"></td>
                     <td class="muted-xs" x-text="l.duration_ms!=null?l.duration_ms+'ms':''"></td>

@@ -23,6 +23,11 @@ type AccountState struct {
 	LastProbeAt  int64  `json:"last_probe_at,omitempty"`
 	LastProbeOK  bool   `json:"last_probe_ok"`
 	LastProbeMsg string `json:"last_probe_msg"`
+	// Credits 上次探测读到的可用额度 / CreditsAt 读到它的时刻（0 = 从未探测过）。
+	// 不落盘就会被面板丢掉：早期实现只在「当前活动账号」上现查余额缓存，其它号的额度
+	// 恒为空，面板只能显示一个号。探测本来就拿到了额度（SumAvailable），顺手存下来。
+	Credits   float64 `json:"credits"`
+	CreditsAt int64   `json:"credits_at,omitempty"`
 
 	// 观测域（不落盘，随重启清零）
 	SuccessCount int64 `json:"success_count"`

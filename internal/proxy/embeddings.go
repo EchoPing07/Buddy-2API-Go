@@ -132,6 +132,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	logEntry.Model = orDefault(res.Model, body.Model)
 	logEntry.PromptTokens = res.Usage.PromptTokens
 	logEntry.TotalTokens = res.Usage.TotalTokens
+	logEntry.UsagePresent = true
 
 	resp := openAIEmbeddingsResponse{
 		Object: "list",

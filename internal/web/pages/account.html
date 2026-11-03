@@ -112,6 +112,8 @@
                   x-text="(pool?pool.member_count:0)+' 个账号 · '+(pool?pool.available_now:0)+' 个可用 · '+(pool?pool.session_count:0)+' 个活跃会话'"></span>
             <div class="spacer"></div>
             <button class="btn btn-ghost btn-sm" @click="poolProbeAll()" :disabled="loading">全部探测</button>
+            <button class="btn btn-ghost btn-sm" @click="loadPool()" :disabled="loading" title="刷新号池快照">
+              <span class="ic" x-html="ic('refresh')"></span>刷新</button>
             <button class="btn btn-ghost btn-sm" @click="poolResetSessions()" :disabled="loading">重置会话绑定</button>
           </div>
           <p class="field-hint">
@@ -141,8 +143,16 @@
                            x-text="a.auto_disabled_msg.slice(0,40)"></div>
                     </td>
                     <td>
-                      <template x-if="a.credits>0"><span x-text="fmtDosage(a.credits)"></span></template>
-                      <template x-if="!(a.credits>0)"><span class="muted-xs">—</span></template>
+                      <!-- credits_at = 0 表示从未读到过额度（探测还没跑过），显示 — 而不是 0；
+                           探测确认耗尽时 credits_at 有值、credits 为 0，那时才显示 0。
+                           具体探测时刻已在「成功 / 失败」列下方展示，这里只把时刻放进 title。 -->
+                      <template x-if="a.credits_at>0">
+                        <span x-text="fmtDosage(a.credits)"
+                              :title="'上次探测读到于 '+ts(a.credits_at)+'（刷新面板不会打上游，想看最新额度点「探测」）'"></span>
+                      </template>
+                      <template x-if="!(a.credits_at>0)">
+                        <span class="muted-xs" title="尚未探测过，点「探测」读取额度">—</span>
+                      </template>
                     </td>
                     <td>
                       <template x-for="c in (a.model_cooldowns||[])" :key="c.model">
@@ -181,6 +191,8 @@
           <div class="field-hint code-hint" x-show="pool">
             <div>* 粘性命中率 <span class="mono" x-text="pool?pool.sticky_hit_total+' / '+(pool.sticky_hit_total+pool.sticky_miss_total):'—'"></span>
                  （低命中率说明会话键不稳定，去「实验」页看客户端接入示例）</div>
+            <div>* 「额度」列是**上次探测读到的值**（面板刷新不会主动打上游，N 个号一起查太贵）；
+                 想看最新额度点该行的「探测」，或「全部探测」</div>
             <div>* 「限额中的模型」只影响该模型；整个账号被禁用看「状态」列</div>
           </div>
         </div>

@@ -43,6 +43,10 @@ type LogEntry struct {
 	// AccountUID 本次请求最终生效的账号 uid（号池开启时才有值，关闭为空）。
 	// 没有它就无法验证「粘性有没有生效」，也就无法调 TTL 与分配算法。
 	AccountUID string `json:"account_uid"`
+	// UsagePresent 上游是否真的返回了 usage。
+	//	okens/credit 全为 0 既可能是「真的没花钱」，也可能是「上游没给 usage」，
+	// 两者在旧表结构里不可区分（credit DEFAULT 0）。有了这一列才能说清。
+	UsagePresent bool `json:"usage_present"`
 }
 
 // Store 数据库封装。
@@ -102,7 +106,8 @@ CREATE TABLE IF NOT EXISTS logs (
   duration_ms       INTEGER,
   status_code       INTEGER,
   error_msg         TEXT,
-  created_at        INTEGER
+  created_at        INTEGER,
+  usage_present     INTEGER DEFAULT 0
 );
 DROP TABLE IF EXISTS api_key_daily_usage; -- 已移除每日限额功能，清理遗留计数表
 CREATE TABLE IF NOT EXISTS resource_cache (
@@ -133,7 +138,9 @@ CREATE TABLE IF NOT EXISTS pool_account_state (
   quota_fail_streak  INTEGER NOT NULL DEFAULT 0,
   last_probe_at      INTEGER NOT NULL DEFAULT 0,
   last_probe_ok      INTEGER NOT NULL DEFAULT 0,
-  last_probe_msg     TEXT    NOT NULL DEFAULT ''
+  last_probe_msg     TEXT    NOT NULL DEFAULT '',
+  credits            REAL    NOT NULL DEFAULT 0,
+  credits_at         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS pool_model_cool (
   uid      TEXT    NOT NULL,
@@ -155,8 +162,25 @@ CREATE INDEX IF NOT EXISTS idx_pool_cool_until ON pool_model_cool(until);
 	if err := s.ensureColumn("logs", "account_uid", "TEXT DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("logs", "usage_present", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_account ON logs(account_uid)`)
-	return err
+	if err != nil {
+		return err
+	}
+	// 额度也走增量加列：老库的 pool_account_state 没有这两列，而面板要靠它们
+	// 显示「每个号还有多少额度」——早期实现只在当前活动账号上现查余额缓存，
+	// 其余号的额度恒为空（面板只显示一个号）。
+	for _, col := range [][2]string{
+		{"credits", "REAL NOT NULL DEFAULT 0"},
+		{"credits_at", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn("pool_account_state", col[0], col[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ensureColumn 列不存在时 ALTER TABLE 补加（SQLite 无 ADD COLUMN IF NOT EXISTS）。
@@ -301,11 +325,11 @@ func (s *Store) IncrementKeyUsage(id int64, tokens int64) error {
 // InsertLog 写入请求日志。
 func (s *Store) InsertLog(l *LogEntry) error {
 	_, err := s.db.Exec(`INSERT INTO logs (api_key_id, api_key_name, model, stream, prompt_tokens,
-		completion_tokens, total_tokens, credit, finish_reason, duration_ms, status_code, error_msg, created_at, account_uid)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		completion_tokens, total_tokens, credit, finish_reason, duration_ms, status_code, error_msg, created_at, account_uid, usage_present)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		l.APIKeyID, l.APIKeyName, l.Model, boolToInt(l.Stream), l.PromptTokens, l.CompletionTokens,
 		l.TotalTokens, l.Credit, l.FinishReason, l.DurationMs, l.StatusCode, l.ErrorMsg,
-		orDefaultInt64(l.CreatedAt, time.Now().Unix()), l.AccountUID)
+		orDefaultInt64(l.CreatedAt, time.Now().Unix()), l.AccountUID, boolToInt(l.UsagePresent))
 	return err
 }
 
@@ -352,7 +376,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]LogEntry, int, error) {
 		return nil, 0, err
 	}
 	q := `SELECT id, api_key_id, COALESCE(api_key_name,''), COALESCE(model,''), stream, COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0),
-		COALESCE(total_tokens,0), COALESCE(credit,0), COALESCE(finish_reason,''), COALESCE(duration_ms,0), COALESCE(status_code,0), COALESCE(error_msg,''), created_at, COALESCE(account_uid,'')
+		COALESCE(total_tokens,0), COALESCE(credit,0), COALESCE(finish_reason,''), COALESCE(duration_ms,0), COALESCE(status_code,0), COALESCE(error_msg,''), created_at, COALESCE(account_uid,''), COALESCE(usage_present,0)
 		FROM logs` + where + ` ORDER BY id DESC LIMIT ? OFFSET ?`
 	args = append(args, f.PageSize, (f.Page-1)*f.PageSize)
 	rows, err := s.db.Query(q, args...)
@@ -363,14 +387,15 @@ func (s *Store) QueryLogs(f LogFilter) ([]LogEntry, int, error) {
 	var out []LogEntry
 	for rows.Next() {
 		var l LogEntry
-		var stream int
+		var stream, usagePresent int
 		err := rows.Scan(&l.ID, &l.APIKeyID, &l.APIKeyName, &l.Model, &stream, &l.PromptTokens,
 			&l.CompletionTokens, &l.TotalTokens, &l.Credit, &l.FinishReason, &l.DurationMs,
-			&l.StatusCode, &l.ErrorMsg, &l.CreatedAt, &l.AccountUID)
+			&l.StatusCode, &l.ErrorMsg, &l.CreatedAt, &l.AccountUID, &usagePresent)
 		if err != nil {
 			return nil, 0, err
 		}
 		l.Stream = stream != 0
+		l.UsagePresent = usagePresent != 0
 		out = append(out, l)
 	}
 	return out, total, rows.Err()
@@ -456,7 +481,7 @@ func (s *Store) GetStats() (*Stats, error) {
 		}
 		// 近期错误
 		rows4, err := s.db.Query(`SELECT id, api_key_id, COALESCE(api_key_name,''), COALESCE(model,''), stream, COALESCE(prompt_tokens,0),
-			COALESCE(completion_tokens,0), COALESCE(total_tokens,0), COALESCE(credit,0), COALESCE(finish_reason,''), COALESCE(duration_ms,0), COALESCE(status_code,0), COALESCE(error_msg,''), created_at, COALESCE(account_uid,'')
+			COALESCE(completion_tokens,0), COALESCE(total_tokens,0), COALESCE(credit,0), COALESCE(finish_reason,''), COALESCE(duration_ms,0), COALESCE(status_code,0), COALESCE(error_msg,''), created_at, COALESCE(account_uid,''), COALESCE(usage_present,0)
 			FROM logs WHERE status_code>=400 OR error_msg!='' ORDER BY id DESC LIMIT 10`)
 		if err != nil {
 			return err
@@ -464,13 +489,14 @@ func (s *Store) GetStats() (*Stats, error) {
 		defer rows4.Close()
 		for rows4.Next() {
 			var l LogEntry
-			var stream int
+			var stream, usagePresent int
 			if err := rows4.Scan(&l.ID, &l.APIKeyID, &l.APIKeyName, &l.Model, &stream, &l.PromptTokens,
 				&l.CompletionTokens, &l.TotalTokens, &l.Credit, &l.FinishReason, &l.DurationMs,
-				&l.StatusCode, &l.ErrorMsg, &l.CreatedAt, &l.AccountUID); err != nil {
+				&l.StatusCode, &l.ErrorMsg, &l.CreatedAt, &l.AccountUID, &usagePresent); err != nil {
 				return err
 			}
 			l.Stream = stream != 0
+			l.UsagePresent = usagePresent != 0
 			st.RecentErrors = append(st.RecentErrors, l)
 		}
 		return rows4.Err()
@@ -542,6 +568,11 @@ type PoolAccountRow struct {
 	LastProbeAt      int64  `json:"last_probe_at"`
 	LastProbeOK      bool   `json:"last_probe_ok"`
 	LastProbeMsg     string `json:"last_probe_msg"`
+	// Credits 上次探测读到的可用额度 / CreditsAt 读到它的时刻。
+	// 分两个字段而不是用 0 当哨兵：0 是「探测确认额度耗尽」这个有意义的结论，
+	// 与「从未探测过 / 不知道」必须能区分，否则面板会把没探过的号显示成「额度 0」。
+	Credits   float64 `json:"credits"`
+	CreditsAt int64   `json:"credits_at"`
 }
 
 // PoolCoolRow 模型级冷却（一行一个 (uid, model)）。
@@ -559,7 +590,8 @@ type PoolCoolRow struct {
 func (s *Store) LoadPoolAccounts() ([]PoolAccountRow, error) {
 	rows, err := s.db.Query(`SELECT uid, COALESCE(manual_disabled,0), COALESCE(manual_disabled_at,0),
 		COALESCE(auto_disabled,''), COALESCE(auto_disabled_at,0), COALESCE(auto_disabled_msg,''),
-		COALESCE(quota_fail_streak,0), COALESCE(last_probe_at,0), COALESCE(last_probe_ok,0), COALESCE(last_probe_msg,'')
+		COALESCE(quota_fail_streak,0), COALESCE(last_probe_at,0), COALESCE(last_probe_ok,0), COALESCE(last_probe_msg,''),
+		COALESCE(credits,0), COALESCE(credits_at,0)
 		FROM pool_account_state`)
 	if err != nil {
 		return nil, err
@@ -571,7 +603,7 @@ func (s *Store) LoadPoolAccounts() ([]PoolAccountRow, error) {
 		var manual, probeOK int
 		if err := rows.Scan(&r.UID, &manual, &r.ManualDisabledAt, &r.AutoDisabled,
 			&r.AutoDisabledAt, &r.AutoDisabledMsg, &r.QuotaFailStreak,
-			&r.LastProbeAt, &probeOK, &r.LastProbeMsg); err != nil {
+			&r.LastProbeAt, &probeOK, &r.LastProbeMsg, &r.Credits, &r.CreditsAt); err != nil {
 			return nil, err
 		}
 		r.ManualDisabled, r.LastProbeOK = manual != 0, probeOK != 0
@@ -584,16 +616,19 @@ func (s *Store) LoadPoolAccounts() ([]PoolAccountRow, error) {
 func (s *Store) SavePoolAccount(r *PoolAccountRow) error {
 	_, err := s.db.Exec(`INSERT INTO pool_account_state
 		(uid, manual_disabled, manual_disabled_at, auto_disabled, auto_disabled_at,
-		 auto_disabled_msg, quota_fail_streak, last_probe_at, last_probe_ok, last_probe_msg)
-		VALUES (?,?,?,?,?,?,?,?,?,?)
+		 auto_disabled_msg, quota_fail_streak, last_probe_at, last_probe_ok, last_probe_msg,
+		 credits, credits_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(uid) DO UPDATE SET
 		 manual_disabled=excluded.manual_disabled, manual_disabled_at=excluded.manual_disabled_at,
 		 auto_disabled=excluded.auto_disabled, auto_disabled_at=excluded.auto_disabled_at,
 		 auto_disabled_msg=excluded.auto_disabled_msg, quota_fail_streak=excluded.quota_fail_streak,
 		 last_probe_at=excluded.last_probe_at, last_probe_ok=excluded.last_probe_ok,
-		 last_probe_msg=excluded.last_probe_msg`,
+		 last_probe_msg=excluded.last_probe_msg,
+		 credits=excluded.credits, credits_at=excluded.credits_at`,
 		r.UID, boolToInt(r.ManualDisabled), r.ManualDisabledAt, r.AutoDisabled, r.AutoDisabledAt,
-		r.AutoDisabledMsg, r.QuotaFailStreak, r.LastProbeAt, boolToInt(r.LastProbeOK), r.LastProbeMsg)
+		r.AutoDisabledMsg, r.QuotaFailStreak, r.LastProbeAt, boolToInt(r.LastProbeOK), r.LastProbeMsg,
+		r.Credits, r.CreditsAt)
 	return err
 }
 

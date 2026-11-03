@@ -134,7 +134,9 @@ func (c *Client) chatOnce(ctx context.Context, body []byte, t *auth.Token) (*htt
 	if err != nil {
 		return nil, err
 	}
-	req.Header = chatHeaders(t)
+	// X-Conversation-ID 必须稳定，否则上游前缀缓存永远命中不了（实测 4× 费用差）。
+	// 用 prompt_cache_key 派生：同一会话 → 同一 conversation id → 缓存可复用。
+	req.Header = chatHeadersWithConversation(t, ConversationIDFromBody(body))
 	return c.long.Do(req)
 }
 
@@ -225,6 +227,10 @@ func (c *Client) doChatWith(ctx context.Context, ts *auth.TokenStore, body []byt
 	if nt := ts.Get(); nt != nil {
 		t = nt
 	}
+
+	// 注入上游前缀缓存命中键（按账号隔离）。放在凭证确定之后，因为键里要嵌 uid。
+	// 这是「缓存命中率与 usage 缓存字段恒为 0」的根因修复：此前既不透传也不注入。
+	body = InjectPromptCacheKey(body, t.UID)
 
 	resp, err := c.chatOnce(ctx, body, t)
 	if err != nil {
