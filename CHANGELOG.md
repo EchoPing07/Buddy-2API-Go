@@ -8,12 +8,51 @@
 
 ## [Unreleased]
 
+暂无。
+
+---
+
+## [v0.3.1] - 2026-11-03
+
+> 一次修复发布：**usage 字段完整性**与**上游前缀缓存**两条主线，另修号池面板两个显示缺陷。
+> 对比：[v0.3.0...v0.3.1](https://github.com/EchoPing07/Buddy-2API-Go/compare/v0.3.0...v0.3.1)
+
+### ⚠️ 升级注意
+
+- **`usage` 缺失时由「省略该键」改为 `"usage": null`**。更贴合 OpenAI 规范，但若有客户端以「键是否存在」判断有无用量，会从 `false` 变成「存在但为 null」，需按值判空。
+- **`X-Conversation-ID` 由每次随机改为按会话稳定**（由 `prompt_cache_key` 派生）。这是本版唯一有上游可观测副作用的改动——前缀缓存能生效正是靠它；若发现上游对会话 ID 另有用途（如限流维度），需回归确认。
+- **老库自动迁移**：`logs.usage_present` 与 `pool_account_state.credits` / `credits_at` 均经 `ensureColumn` 增量加列，历史行取默认值，不重写表、不丢数据。
+- **缓存生效后 `credit` 数字会明显下降**：实测同一段前缀约 17× 差值，升级前后的余额与日志数字不可直接对比。
+
+### 🐞 修复
+
+- **关掉客户端流式输出后 usage 里的缓存命中字段全部消失**：`usageJSON` 是个 4 字段白名单结构体（`prompt_tokens` / `completion_tokens` / `total_tokens` / `credit`），聚合层用它重新编码后回写，`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` / `prompt_tokens_details.cached_tokens` / `cached_tokens` / `completion_tokens_details.*` 被整批丢弃；流式路径的尾部合成帧（上游不发 `finish_reason` 直接 `DONE`）走同一个结构体，于是「关流式一定丢、流式走到合成帧也丢」。现在 `sseChunk.Usage` 改为 `json.RawMessage`，`usageJSON` 降级为**仅供记账取数的强类型视图**，回写给客户端的永远是上游原始 JSON。
+- **上游前缀缓存命中率恒为 0（费用偏高）**：`prompt_cache_key` 既不在出站白名单里、也没有任何注入逻辑，且 `X-Conversation-ID` 每次请求随机，上游前缀缓存永远无法复用。实测同一段 8k 前缀：不带键 `credit≈0.34`，带键 `≈0.02`（约 17×）；同一段 2415 token 前缀：随机会话 ID → `hit=0 / credit≈0.04`，固定 → `hit=2368 / credit≈0.01`。现在新增 `internal/upstream/cache_key.go`：出站补齐 `prompt_cache_key`（键为 `b2a-<uid8>-<sha256(uid|会话)[:8]>`，**uid8 是账号隔离因子**，跨账号复用会命中他人前缀缓存），并由它派生稳定的 `X-Conversation-ID`。客户端已带非空 `prompt_cache_key` 时绝不覆盖。
+- **`n>1` 时多个候选被拼成一段、且只输出 `index:0`**：聚合器把每个 choice 的 `delta.content` 都追加进同一个 builder，`"A"` 与 `"B"` 会变成 `"AB"`。现在按 `index` 分组累积（`Choices map[int]*choiceAccum`），响应按 index 升序输出全部候选，各自带自己的 `finish_reason`。
+- **非流式响应丢 `system_fingerprint` / `service_tier` / `message.role` / `refusal`**：`sseChunk` 原先根本没解析这几个字段，`role` 还被硬编码成 `"assistant"`。现已补齐，`role` 取上游 `delta.role`。
+- **「上游没给 usage」与「确实没花钱」不可区分**：两者在旧表结构里都是 `credit=0, tokens=0`。新增 `logs.usage_present` 列，日志页 P/C/T 列的 tooltip 据此提示 token 是否可信。
+- **号池额度只显示当前活动账号，其余全是 `—`**：`admin.poolCredits` 只从余额缓存取数，而缓存键是单账号设计的固定字串（`default_v3`），只代表 `token.json` 里那个号；而探测（`pool.Probe`）每次都已经调了 `get-user-resource` 并算出 `Σ 未过期包剩余`，这个值却被丢掉了。现在探测额度随结果落进 `pool_account_state.credits` / `credits_at`，`Snapshot` 把「探测值」与「注入值」按时间戳取新；网络故障 / 凭证刷不动时**不改**已记录额度（否则一次断网就把好号显示成「额度 0」）。前端改用 `credits_at>0` 判「未知」——探测确认耗尽（`credits=0, credits_at>0`）现在正确显示 0 而非 `—`。老库从 `last_probe_msg`（`"credit=5015.37"`）回填，不必等下一轮探测。
+- **号池状态卡只能从「实验」页跳过去才看得见，刷新后就消失**：`labs.pool_enabled` 原先只由实验页的 `loadLabs()` 填充，而 `labs` 初始值是「全关」——刷新后直接停在账号页时该字段恒为默认 `false`，`x-show` 把号池卡片整块藏起来，`loadPool()` 也当场 return 不发请求。现在实验开关读取上提为共享层 `loadExperiments()`，由 `afterLogin()` 调一次（`_experimentsLoaded` 区分「还不知道」与「确实关着」，`loadPool()` 在未知时等价一次并做在途去重）。
+
+### 🔧 工程与文档
+
+- 号池卡片新增「刷新」按钮与额度列探测时刻 tooltip；`loadPool` / `applyExperiments` 上提共享层，`labs.js` 与 `account.js` 的重复定义删除（由 `TestPageLayerDoesNotShadowShell` 重名守卫兜底）。
+- 新增 `internal/upstream/cache_key.go`、`internal/admin/pool_test.go`、`internal/pool/snapshot_test.go`。回归用例：`TestPoolCreditsColumnsUpgrade`、`TestPoolStateRoundTrip`、`TestSnapshotCreditsPerAccount` / `...PrefersNewest` / `...WithoutProbeCreditsUnknown`、`TestProbeCreditsPersistAcrossReload`、`TestProbeNetworkErrorKeepsCredits`、`TestSnapshotViewJSONShape`、`TestBackfillCreditsFromProbeMsg`、`TestLoadBackfillsCreditsFromOldRow`、`TestPoolViewCreditsForEveryAccount`、`TestPoolViewActiveFlagMarked`、`TestAccountPagePoolCreditsColumn`、`TestExperimentsLoadedOnLogin`、`TestAccountPageNoDanglingHandlers`。
+
+---
+
+## [v0.3.0] - 2026-10-30
+
+> 主线：**号池负载均衡**（实验特性，默认关闭）。另含凭证批量导入 / 导出、多账号存档切换、嵌入端点、成长任务中心与若干修复。
+> 对比：[v0.2.0...v0.3.0](https://github.com/EchoPing07/Buddy-2API-Go/compare/v0.2.0...v0.3.0)
+
 ### ⚠️ 升级注意
 
 - **`GET /admin/account/export` 响应由裸 `token.json` 改为凭证包**（`{format:"buddy2api.accounts", version, exported_at, active_uid, accounts[]}`），新增 `?scope=current|selected` 与 `uids`，不再兼容旧格式。第三方脚本若解析导出结果需同步；已保存的旧 `token.json` 仍可通过「导入凭证 → 单个账号」继续导入。
 
 ### ✨ 新功能
 
+- **号池负载均衡（实验特性，默认关闭）**：请求分发 idle-first（优先挑未被活跃会话占用的号，4 号 4 会话必然各占一个）；会话粘性默认 3h 滑动续期；错误按「账号 / (账号, 模型)」两级惩罚（`6004` 模型级冷却至上游给的重置时间、`14018` / `402` 连败 2 次与 `401` 刷新失败账号级自动禁用、`5xx` 与网络只记观测不惩罚）；网关内换号重试默认 2 次，只对 429 / 402 / 401 这类「上游明确拒绝、未开工」的重试（5xx 与网络中断不重试，避免重复扣费）；定时探测（默认 0/6/12/18 点）自动恢复。手动禁用与自动禁用分域，探测成功不会自动打开用户手动关掉的号。开关与 TTL / 重试上限 / 冷却上限 / 探测 cron 都在「实验」页，改动即时落库。
 - **导出凭证改为弹窗，分「单个导出 / 批量导出」**：账号页「导出凭证」不再点一下直接下载 `token.json`，而是打开弹窗选择方式。**单个导出**导当前活动账号（无活动账号时置灰）；**批量导出**在账号列表中勾选，且**默认全选**，配合「全选 / 取消全选」按钮即可覆盖旧「全部账号」的用法 —— 因此**不再单设「全部账号」第三种范围**（多一条分支就多一处口径要维护，且多选与全选复用同一条 `selected` 路径才能保证两者等价）。两种导出**统一输出凭证包**（`auth.Bundle`：`format` / `version` / `exported_at` / `active_uid` / `accounts[]`），**单账号导出也改用该格式，不再兼容旧的裸 `token.json`** —— 两种形状并存时导入侧要猜「收到的是一份凭证还是一个包」，猜错会把 `{format,accounts}` 当成一份凭证存进档案（`access_token` 为空）。`GET /admin/account/export` 新增 `?scope=current|selected`（`selected` 配 `uids=a,b`），响应带 `X-Export-Count` / `X-Export-Missing`，文件名走 `Content-Disposition`（uid 经 `safeFileToken` 过滤，避免头注入）。
 - **导入凭证新增「批量导入」**：导入弹窗分「单个账号 / 批量导入」两种模式。批量导入选凭证包后本地先解析并预览包里有哪些账号（uid/昵称从 JWT 现解），确认后 `POST /admin/account/import/batch` 一次性入档，**语义恒为「仅导入」：不切换当前账号**（一次导入多个账号时该启用哪个无从判断），导入后到「账号切换」卡片点切换启用。逐条尽力而为：一条坏凭证只让该条报错（结果逐条展示在弹窗里），不让整包失败；全部失败才回 400。整包按 `format` / `version` 硬校验，旧裸 `token.json` 与任意 JSON 一律拒收。两种模式自适应切换：单个模式选到凭证包自动转批量，批量模式选到 `token.json` 自动转单个并回填。
 - **导入凭证拆为「仅导入」与「导入并启用」**：`POST /admin/account/import` 新增 `activate` 字段。默认（不带该字段）为「仅导入」：只把凭证写入账号档案 `data/accounts/<id>.json`，**不改动当前活动账号 `token.json`**，也不再清账号口径缓存或复位调度器日内状态 —— 一次导入多个备用账号时，当前账号的余额 / 签到 / 「今日已上报」都不受影响；弹窗内提示后可到「账号切换」卡片点「切换」启用。带 `"activate":true` 则为「导入并启用」，行为与此前一致（写凭证 → 入档 → 真换账号才 `invalidateAccountCaches()`）。导入弹窗底部因此由单一「导入」改为「仅导入」+「导入并启用」两个按钮（回车默认走「仅导入」）；仅导入时前端只 `loadAccounts()` 刷新档案列表，不触发 `refreshAccountData()`。仅导入路径下档案写入失败会直接回 500（档案是唯一产物），而登录 / 启用路径的入档失败仍只留痕（凭证已落盘）。仅导入的凭证「端点不匹配」提示照常出现在列表里。
