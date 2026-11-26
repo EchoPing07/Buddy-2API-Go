@@ -107,6 +107,103 @@ func TestGetStatsByModelNoTruncate(t *testing.T) {
 	}
 }
 
+// TestGetStatsRanges 验证五档时间范围（all / 24h / 7d / 30d / 90d）的总量、模型分布、
+// 近期错误、趋势分桶粒度与零值桶补齐，以及非法范围拒绝。
+func TestGetStatsRanges(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	defer s.Close()
+
+	// 固定本地参考时刻，避免跨越午夜或整点导致用例抖动
+	now := time.Date(2026, 6, 15, 14, 30, 0, 0, time.Local)
+	logs := []*LogEntry{
+		// 24h 内（也是今日）：成功 1 条 + 失败 1 条
+		{Model: "m-24h", StatusCode: 200, TotalTokens: 100, Credit: 0.5, CreatedAt: now.Add(-2 * time.Hour).Unix()},
+		{Model: "m-24h", StatusCode: 500, ErrorMsg: "err-24h", TotalTokens: 50, Credit: 0.2, CreatedAt: now.Add(-10 * time.Hour).Unix()},
+		// 3 天前（落入 7d / 30d / 90d / all，不入 24h）
+		{Model: "m-7d", StatusCode: 200, TotalTokens: 200, Credit: 1.0, CreatedAt: now.AddDate(0, 0, -3).Unix()},
+		// 20 天前（落入 30d / 90d / all，不入 7d）
+		{Model: "m-30d", StatusCode: 429, ErrorMsg: "err-30d", TotalTokens: 300, Credit: 1.5, CreatedAt: now.AddDate(0, 0, -20).Unix()},
+		// 60 天前（落入 90d / all，不入 30d）
+		{Model: "m-90d", StatusCode: 200, TotalTokens: 400, Credit: 2.0, CreatedAt: now.AddDate(0, 0, -60).Unix()},
+		// 120 天前（仅落入 all）
+		{Model: "m-old", StatusCode: 502, ErrorMsg: "err-old", TotalTokens: 500, Credit: 2.5, CreatedAt: now.AddDate(0, 0, -120).Unix()},
+	}
+	for _, l := range logs {
+		if err := s.InsertLog(l); err != nil {
+			t.Fatalf("插入日志失败: %v", err)
+		}
+	}
+
+	cases := []struct {
+		rng             string
+		wantGranularity string
+		wantReq         int64
+		wantTokens      int64
+		wantErrs        int64
+		wantModels      int
+		wantRecentErrs  int
+		wantBuckets     int // 0 表示不要求固定桶数（all 只返回有数据日期）
+	}{
+		{StatsRange24h, "hour", 2, 150, 1, 1, 1, 24},
+		{StatsRange7d, "day", 3, 350, 1, 2, 1, 7},
+		{StatsRange30d, "day", 4, 650, 2, 3, 2, 30},
+		{StatsRange90d, "day", 5, 1050, 2, 4, 2, 90},
+		{StatsRangeAll, "day", 6, 1550, 3, 5, 3, 0},
+	}
+	for _, tc := range cases {
+		st, err := s.getStatsAt(tc.rng, now)
+		if err != nil {
+			t.Fatalf("getStatsAt(%q) 失败: %v", tc.rng, err)
+		}
+		if st.Range != tc.rng || st.Granularity != tc.wantGranularity {
+			t.Errorf("%s: range=%q granularity=%q，期望 %q/%q", tc.rng, st.Range, st.Granularity, tc.rng, tc.wantGranularity)
+		}
+		if st.TotalRequests != tc.wantReq || st.TotalTokens != tc.wantTokens || st.ErrorCount != tc.wantErrs {
+			t.Errorf("%s: req=%d tok=%d err=%d，期望 %d/%d/%d",
+				tc.rng, st.TotalRequests, st.TotalTokens, st.ErrorCount, tc.wantReq, tc.wantTokens, tc.wantErrs)
+		}
+		if len(st.ByModel) != tc.wantModels {
+			t.Errorf("%s: by_model=%d，期望 %d", tc.rng, len(st.ByModel), tc.wantModels)
+		}
+		if len(st.RecentErrors) != tc.wantRecentErrs {
+			t.Errorf("%s: recent_errors=%d，期望 %d", tc.rng, len(st.RecentErrors), tc.wantRecentErrs)
+		}
+		if tc.wantBuckets > 0 && len(st.Daily) != tc.wantBuckets {
+			t.Errorf("%s: daily 桶数=%d，期望 %d", tc.rng, len(st.Daily), tc.wantBuckets)
+		}
+		// 各桶之和必须与范围总量一致（不得丢数据或重复统计）
+		var sumReq, sumTok int64
+		for _, d := range st.Daily {
+			sumReq += d.Requests
+			sumTok += d.Tokens
+		}
+		if sumReq != st.TotalRequests || sumTok != st.TotalTokens {
+			t.Errorf("%s: 趋势之和(%d/%d) != 范围总量(%d/%d)", tc.rng, sumReq, sumTok, st.TotalRequests, st.TotalTokens)
+		}
+		// 今日统计恒为 2 条（与范围无关）
+		if st.TodayRequests != 2 || st.TodayTokens != 150 {
+			t.Errorf("%s: today=%d/%d，期望 2/150", tc.rng, st.TodayRequests, st.TodayTokens)
+		}
+	}
+
+	// 空范围回退 all
+	if st, err := s.getStatsAt("", now); err != nil || st.Range != StatsRangeAll || st.TotalRequests != 6 {
+		t.Errorf("空范围应回退 all: st=%+v err=%v", st, err)
+	}
+	// 非法范围报错
+	if _, err := s.getStatsAt("14d", now); err == nil {
+		t.Error("非法范围 14d 应返回错误")
+	}
+	// 无数据时固定窗口不补零（前端据空切片显示空态）
+	emptyNow := now.AddDate(1, 0, 0)
+	if st, err := s.getStatsAt(StatsRange24h, emptyNow); err != nil || len(st.Daily) != 0 {
+		t.Errorf("无数据时 24h daily 应为空，实际 len=%d err=%v", len(st.Daily), err)
+	}
+}
+
 // TestCacheDeleteKey 验证缓存行的写入、读取与指定 key 删除（幂等、不影响其他 key、非法表拒绝）。
 // 用于换缓存 key 后清理遗留旧行，避免永久残留。
 func TestCacheDeleteKey(t *testing.T) {

@@ -3,9 +3,13 @@ package admin
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
+
+	"buddy2api-go/internal/store"
 )
 
 // daysLeftStr 把 *int 转为可读串（nil → "nil"），避免 t.Logf 用 %v 打印指针地址。
@@ -435,5 +439,46 @@ func TestResourceCacheVersionBumped(t *testing.T) {
 	// 当前键不得出现在清理清单中，否则写入后即被删除，缓存永久失效
 	if stale[resourceCacheKey] {
 		t.Errorf("当前键 %q 出现在清理清单里，会被自己删掉", resourceCacheKey)
+	}
+}
+
+// TestStatsRangeQuery 验证 GET /admin/stats 的 range 查询参数：缺省走 all、
+// 支持 all/24h/7d/30d/90d 五档、非法值返回 400。
+func TestStatsRangeQuery(t *testing.T) {
+	h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+	now := time.Now()
+	if err := h.st.InsertLog(&store.LogEntry{
+		Model: "recent-m", StatusCode: 200, TotalTokens: 100, CreatedAt: now.Add(-1 * time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.InsertLog(&store.LogEntry{
+		Model: "old-m", StatusCode: 200, TotalTokens: 500, CreatedAt: now.AddDate(0, 0, -40).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	query := func(path string) (int, store.Stats) {
+		rr := httptest.NewRecorder()
+		h.stats(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		var st store.Stats
+		_ = json.Unmarshal(rr.Body.Bytes(), &st)
+		return rr.Code, st
+	}
+
+	if code, st := query("/admin/stats"); code != http.StatusOK || st.Range != store.StatsRangeAll || st.TotalRequests != 2 {
+		t.Errorf("默认范围异常: code=%d st=%+v", code, st)
+	}
+	if code, st := query("/admin/stats?range=24h"); code != http.StatusOK || st.Range != store.StatsRange24h || st.Granularity != "hour" || st.TotalRequests != 1 {
+		t.Errorf("24h 范围异常: code=%d st=%+v", code, st)
+	}
+	if code, st := query("/admin/stats?range=30d"); code != http.StatusOK || st.Range != store.StatsRange30d || st.TotalRequests != 1 {
+		t.Errorf("30d 范围异常: code=%d st=%+v", code, st)
+	}
+	if code, st := query("/admin/stats?range=90d"); code != http.StatusOK || st.Range != store.StatsRange90d || st.TotalRequests != 2 {
+		t.Errorf("90d 范围异常: code=%d st=%+v", code, st)
+	}
+	if code, _ := query("/admin/stats?range=bad"); code != http.StatusBadRequest {
+		t.Errorf("非法范围应返回 400，实际 %d", code)
 	}
 }

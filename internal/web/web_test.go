@@ -1265,6 +1265,55 @@ inst._experimentsLoaded = true;
 inst.resetSession();
 if (inst._experimentsLoaded) fail('resetSession 未清 _experimentsLoaded（重新登录会沿用上一会话的实验开关）');
 
+// 18) 统计页时间范围切换：五档（all/24h/7d/30d/90d）拉对应 ?range= 参数、持久化、
+// 丢弃先发后到的旧响应（防快速切换时页面跳回旧范围）
+inst.loadStats = real.loadStats;
+inst.renderDaily = function () {}; // 无真实 SVG DOM
+const stored = {};
+global.localStorage = {
+  getItem: function (k) { return k in stored ? stored[k] : null; },
+  setItem: function (k, v) { stored[k] = String(v); },
+};
+let statsUrls = [];
+let releaseSlow = null;
+global.fetch = function (url) {
+  const u = String(url);
+  statsUrls.push(u);
+  if (u.indexOf('range=90d') >= 0) {
+    return new Promise(function (resolve) {
+      releaseSlow = function () {
+        resolve({ ok: true, status: 200, json: async function () {
+          return { range: '90d', granularity: 'day', total_requests: 999, total_tokens: 9990, daily: [] };
+        } });
+      };
+    });
+  }
+  return Promise.resolve({ ok: true, status: 200, json: async function () {
+    return { range: '24h', granularity: 'hour', total_requests: 24, total_tokens: 240,
+             daily: [{ date: '2026-06-15 14:00', requests: 24, tokens: 240 }] };
+  } });
+};
+if (inst.statsRange !== 'all') fail('statsRange 默认应为 all，得到 ' + inst.statsRange);
+if (inst.statsRanges.map(function (x) { return x.key; }).join(',') !== 'all,24h,7d,30d,90d') {
+  fail('statsRanges 选项不对: ' + JSON.stringify(inst.statsRanges));
+}
+inst.setStatsRange('invalid');
+if (inst.statsRange !== 'all' || statsUrls.length !== 0) fail('非法范围不应触发请求或修改状态');
+// 先切 90d（挂起慢响应），再快速切 24h（立即返回），最后释放 90d：页面必须保持 24h 数据
+inst.setStatsRange('90d');
+inst.setStatsRange('24h');
+await new Promise(function (r) { setTimeout(r, 0); });
+if (releaseSlow) releaseSlow();
+await new Promise(function (r) { setTimeout(r, 0); });
+if (inst.statsRange !== '24h') fail('statsRange 应为 24h，得到 ' + inst.statsRange);
+if (stored['buddy2api:statsRange'] !== '24h') fail('statsRange 未持久化到 localStorage');
+if (inst.stats.total_requests !== 24) fail('先发后到的 90d 响应覆盖了 24h 数据: ' + JSON.stringify(inst.stats));
+if (statsUrls.length !== 2 || !/range=90d/.test(statsUrls[0]) || !/range=24h/.test(statsUrls[1])) {
+  fail('请求 URL 不符预期: ' + JSON.stringify(statsUrls));
+}
+if (inst.chartTitle !== '近 24 小时用量') fail('24h 图表标题不对: ' + inst.chartTitle);
+if (!/时均/.test(inst.reqDetail)) fail('24h 请求详情应显示时均: ' + inst.reqDetail);
+
 global.fetch = savedFetch;
 
 console.log('OK ' + JSON.stringify(loads));
@@ -1706,5 +1755,43 @@ func TestGrowthPageNoDanglingHandlers(t *testing.T) {
 	}
 	if len(seen) == 0 {
 		t.Error("未在 growth.html 中解析到任何 @click 处理器（正则或页面结构变了？）")
+	}
+}
+
+// TestDashboardStatsRangeUI 统计页时间范围切换 UI 契约：
+// 模板包含范围分段控件与动态标题/明细绑定，脚本提供五档范围且不遗留硬编码近 14 天切片。
+func TestDashboardStatsRangeUI(t *testing.T) {
+	html, err := pageFS.ReadFile("pages/dashboard.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := assetFS.ReadFile("assets/pages/dashboard.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, script := string(html), string(js)
+	for _, want := range []string{
+		"statsRanges",
+		"setStatsRange(opt.key)",
+		"chartTitle",
+		"reqDetail",
+		"tokDetail",
+		"statsRangeLabel",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("dashboard.html 缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"'all'", "'24h'", "'7d'", "'30d'", "'90d'",
+		"所有", "近24h", "7天", "30天", "90天",
+		"/admin/stats?range=",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("dashboard.js 缺少 %q", want)
+		}
+	}
+	if strings.Contains(script, ".slice(-14)") {
+		t.Error("dashboard.js 仍硬编码 .slice(-14)，会截断 30天/90天/所有 范围的趋势图")
 	}
 }

@@ -403,8 +403,29 @@ func (s *Store) QueryLogs(f LogFilter) ([]LogEntry, int, error) {
 
 // ── stats ──
 
+// 统计时间范围取值。
+const (
+	StatsRangeAll = "all"
+	StatsRange24h = "24h"
+	StatsRange7d  = "7d"
+	StatsRange30d = "30d"
+	StatsRange90d = "90d"
+)
+
+// ValidStatsRange 判断是否为支持的统计时间范围。
+func ValidStatsRange(r string) bool {
+	switch r {
+	case StatsRangeAll, StatsRange24h, StatsRange7d, StatsRange30d, StatsRange90d:
+		return true
+	default:
+		return false
+	}
+}
+
 // Stats 仪表盘聚合。
 type Stats struct {
+	Range         string      `json:"range"`
+	Granularity   string      `json:"granularity"` // "day" | "hour"
 	TotalRequests int64       `json:"total_requests"`
 	TotalTokens   int64       `json:"total_tokens"`
 	TotalCredit   float64     `json:"total_credit"`
@@ -416,7 +437,7 @@ type Stats struct {
 	RecentErrors  []LogEntry  `json:"recent_errors"`
 }
 
-// DailyStat 按日请求/tokens/credits 统计。
+// DailyStat 按日（或按小时）请求/tokens/credits 统计。
 type DailyStat struct {
 	Date     string  `json:"date"`
 	Requests int64   `json:"requests"`
@@ -431,43 +452,110 @@ type ModelStat struct {
 	Tokens   int64  `json:"tokens"`
 }
 
-// GetStats 仪表盘聚合查询。
+// GetStats 仪表盘聚合查询（默认全部时间范围）。
 func (s *Store) GetStats() (*Stats, error) {
-	st := &Stats{}
+	return s.GetStatsRange(StatsRangeAll)
+}
+
+// GetStatsRange 按时间范围（all / 24h / 7d / 30d / 90d）查询仪表盘聚合统计。
+func (s *Store) GetStatsRange(rangeKey string) (*Stats, error) {
+	return s.getStatsAt(rangeKey, time.Now())
+}
+
+func (s *Store) getStatsAt(rangeKey string, now time.Time) (*Stats, error) {
+	if rangeKey == "" {
+		rangeKey = StatsRangeAll
+	}
+	if !ValidStatsRange(rangeKey) {
+		return nil, fmt.Errorf("不支持的统计范围: %s", rangeKey)
+	}
+
+	loc := now.Location()
+	var (
+		since       int64
+		granularity = "day"
+		days        int
+		startDay    time.Time
+	)
+	switch rangeKey {
+	case StatsRange24h:
+		since = now.Add(-24 * time.Hour).Unix()
+		granularity = "hour"
+	case StatsRange7d:
+		days = 7
+	case StatsRange30d:
+		days = 30
+	case StatsRange90d:
+		days = 90
+	}
+	if days > 0 {
+		startDay = time.Date(now.Year(), now.Month(), now.Day()-(days-1), 0, 0, 0, 0, loc)
+		since = startDay.Unix()
+	}
+
+	whereTime := ""
+	var timeArgs []any
+	if since > 0 {
+		whereTime = " WHERE created_at >= ?"
+		timeArgs = []any{since}
+	}
+
+	st := &Stats{
+		Range:       rangeKey,
+		Granularity: granularity,
+	}
 	err := func() error {
-		// 总量
+		// 范围内总量
 		if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(credit),0),
-			COALESCE(SUM(CASE WHEN status_code>=400 OR error_msg!='' THEN 1 ELSE 0 END),0) FROM logs`).
+			COALESCE(SUM(CASE WHEN status_code>=400 OR error_msg!='' THEN 1 ELSE 0 END),0) FROM logs`+whereTime, timeArgs...).
 			Scan(&st.TotalRequests, &st.TotalTokens, &st.TotalCredit, &st.ErrorCount); err != nil {
 			return err
 		}
-		// 今日
+		// 今日（本地自然日，走 idx_logs_created 索引）
+		todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).Unix()
+		tomorrowStart := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, loc).Unix()
 		if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total_tokens),0) FROM logs
-			WHERE date(created_at,'unixepoch','localtime')=date('now','localtime')`).
+			WHERE created_at >= ? AND created_at < ?`, todayStart, tomorrowStart).
 			Scan(&st.TodayRequests, &st.TodayTokens); err != nil {
 			return err
 		}
-		// 近 14 天
-		rows, err := s.db.Query(`SELECT date(created_at,'unixepoch','localtime') d, COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(credit),0)
-			FROM logs WHERE created_at >= strftime('%s','now','-13 days','start of day')
-			GROUP BY d ORDER BY d`)
+		// 趋势序列：24h 按小时聚合，其余按本地日期聚合
+		bucketExpr := `date(created_at,'unixepoch','localtime')`
+		if granularity == "hour" {
+			bucketExpr = `strftime('%Y-%m-%d %H:00',created_at,'unixepoch','localtime')`
+		}
+		rows, err := s.db.Query(`SELECT `+bucketExpr+` d, COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(credit),0)
+			FROM logs`+whereTime+` GROUP BY d ORDER BY d`, timeArgs...)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
+		var rawDaily []DailyStat
 		for rows.Next() {
 			var d DailyStat
 			if err := rows.Scan(&d.Date, &d.Requests, &d.Tokens, &d.Credit); err != nil {
 				return err
 			}
-			st.Daily = append(st.Daily, d)
+			rawDaily = append(rawDaily, d)
 		}
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		// 固定窗口（24h/7d/30d/90d）在有数据时补齐零值桶，使时间轴连续且柱子跨度与所选范围一致；
+		// 无数据时保持空切片，前端展示空态；「所有」范围只返回有数据的日期。
+		if st.TotalRequests > 0 {
+			switch {
+			case granularity == "hour":
+				st.Daily = fillHourlyBuckets(rawDaily, now)
+			case days > 0:
+				st.Daily = fillDailyBuckets(rawDaily, startDay, days)
+			default:
+				st.Daily = rawDaily
+			}
+		}
 		// 按模型聚合，不截断：模型集合由 /v3/config 下发、数量有限，截断会使返回条数少于实际模型数
 		rows2, err := s.db.Query(`SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(total_tokens),0)
-			FROM logs GROUP BY model ORDER BY COUNT(*) DESC`)
+			FROM logs`+whereTime+` GROUP BY model ORDER BY COUNT(*) DESC`, timeArgs...)
 		if err != nil {
 			return err
 		}
@@ -479,10 +567,17 @@ func (s *Store) GetStats() (*Stats, error) {
 			}
 			st.ByModel = append(st.ByModel, m)
 		}
-		// 近期错误
+		if err := rows2.Err(); err != nil {
+			return err
+		}
+		// 近期错误（限定在当前统计范围内）
+		errWhere := ` WHERE status_code>=400 OR error_msg!=''`
+		if since > 0 {
+			errWhere = ` WHERE created_at >= ? AND (status_code>=400 OR error_msg!='')`
+		}
 		rows4, err := s.db.Query(`SELECT id, api_key_id, COALESCE(api_key_name,''), COALESCE(model,''), stream, COALESCE(prompt_tokens,0),
 			COALESCE(completion_tokens,0), COALESCE(total_tokens,0), COALESCE(credit,0), COALESCE(finish_reason,''), COALESCE(duration_ms,0), COALESCE(status_code,0), COALESCE(error_msg,''), created_at, COALESCE(account_uid,''), COALESCE(usage_present,0)
-			FROM logs WHERE status_code>=400 OR error_msg!='' ORDER BY id DESC LIMIT 10`)
+			FROM logs`+errWhere+` ORDER BY id DESC LIMIT 10`, timeArgs...)
 		if err != nil {
 			return err
 		}
@@ -505,6 +600,66 @@ func (s *Store) GetStats() (*Stats, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+// fillHourlyBuckets 把近 24 小时聚合结果补齐为连续小时序列（本地时区）。
+// 若 24h 前起点的非整点半小时桶无记录，则从下一个整点起排满 24 个小时；
+// 有记录则保留该桶（最多 25 个），确保各桶之和严格等于总量。
+func fillHourlyBuckets(raw []DailyStat, now time.Time) []DailyStat {
+	byKey := make(map[string]DailyStat, len(raw))
+	for _, d := range raw {
+		byKey[d.Date] = d
+	}
+	loc := now.Location()
+	sinceT := now.Add(-24 * time.Hour).In(loc)
+	sinceHour := time.Date(sinceT.Year(), sinceT.Month(), sinceT.Day(), sinceT.Hour(), 0, 0, 0, loc)
+	endHour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, loc)
+	startHour := sinceHour
+	if _, ok := byKey[sinceHour.Format("2006-01-02 15:04")]; !ok {
+		startHour = sinceHour.Add(time.Hour)
+	}
+	used := make(map[string]bool, 25)
+	out := make([]DailyStat, 0, 25)
+	for cur := startHour; !cur.After(endHour); cur = cur.Add(time.Hour) {
+		k := cur.Format("2006-01-02 15:04")
+		used[k] = true
+		if d, ok := byKey[k]; ok {
+			out = append(out, d)
+		} else {
+			out = append(out, DailyStat{Date: k})
+		}
+	}
+	for _, d := range raw {
+		if !used[d.Date] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// fillDailyBuckets 把 N 天窗口聚合结果补齐为连续自然日序列（本地时区）。
+func fillDailyBuckets(raw []DailyStat, startDay time.Time, days int) []DailyStat {
+	byKey := make(map[string]DailyStat, len(raw))
+	for _, d := range raw {
+		byKey[d.Date] = d
+	}
+	used := make(map[string]bool, days)
+	out := make([]DailyStat, 0, days)
+	for i := 0; i < days; i++ {
+		k := startDay.AddDate(0, 0, i).Format("2006-01-02")
+		used[k] = true
+		if d, ok := byKey[k]; ok {
+			out = append(out, d)
+		} else {
+			out = append(out, DailyStat{Date: k})
+		}
+	}
+	for _, d := range raw {
+		if !used[d.Date] {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // CleanupLogs 删除保留期外的日志，返回删除条数。

@@ -2,7 +2,16 @@
         <header class="page-head">
           <h1>统计</h1>
           <div class="page-actions">
-            <button class="btn btn-secondary btn-sm" @click="loadStats()" :disabled="loading">
+            <div class="seg seg-sm" role="tablist" aria-label="统计时间范围">
+              <template x-for="opt in statsRanges" :key="opt.key">
+                <button type="button" class="seg-btn" role="tab"
+                        :class="{'is-active':statsRange===opt.key}"
+                        :aria-selected="statsRange===opt.key?'true':'false'"
+                        @click="setStatsRange(opt.key)"
+                        x-text="opt.label"></button>
+              </template>
+            </div>
+            <button class="btn btn-secondary btn-sm" @click="loadStats()" :disabled="loading || statsLoading">
               <span class="ic" x-html="ic('refresh')"></span>刷新统计
             </button>
           </div>
@@ -10,14 +19,14 @@
 
         <div class="grid metrics-4">
           <article class="metric">
-            <header class="metric-head"><span class="metric-label">总请求</span><span class="ic" x-html="ic('activity')"></span></header>
+            <header class="metric-head"><span class="metric-label" x-text="reqMetricLabel"></span><span class="ic" x-html="ic('activity')"></span></header>
             <div class="metric-value" x-text="fmt(stats.total_requests)"></div>
-            <p class="metric-detail" x-text="'今日 '+fmt(stats.today_requests)+' · 日均 '+compact(avg14)"></p>
+            <p class="metric-detail" x-text="reqDetail"></p>
           </article>
           <article class="metric">
             <header class="metric-head"><span class="metric-label">Tokens 用量</span><span class="ic" x-html="ic('type')"></span></header>
             <div class="metric-value" x-text="fmt(stats.total_tokens)"></div>
-            <p class="metric-detail" x-text="'今日 '+fmt(stats.today_tokens)"></p>
+            <p class="metric-detail" x-text="tokDetail"></p>
           </article>
           <article class="metric">
             <header class="metric-head"><span class="metric-label">错误数</span><span class="ic" x-html="ic('alert')"></span></header>
@@ -26,7 +35,7 @@
           </article>
           <article class="metric">
             <header class="metric-head"><span class="metric-label">Credits 消耗</span><span class="ic" x-html="ic('dollar')"></span></header>
-            <div class="metric-value" x-text="fmt(stats.total_credit)"></div>
+            <div class="metric-value" x-text="fmt(Math.round((stats.total_credit||0)*100)/100)"></div>
             <p class="metric-detail" x-text="keys.length+' 个 Key · '+(stats.by_model||[]).length+' 个模型'"></p>
           </article>
         </div>
@@ -34,7 +43,7 @@
         <div class="grid charts">
           <div class="card">
             <div class="card-head">
-              <h3>近 14 天用量</h3>
+              <h3 x-text="chartTitle"></h3>
               <div class="spacer"></div>
               <div class="legend">
                 <span class="lg lg-bar"><i></i>Tokens 用量</span>
@@ -90,7 +99,11 @@
         </div>
 
         <div class="card">
-          <div class="card-head"><h3>近期错误</h3></div>
+          <div class="card-head">
+            <h3>近期错误</h3>
+            <div class="spacer"></div>
+            <span class="muted-xs" x-text="statsRangeLabel"></span>
+          </div>
           <div class="table-wrap" x-show="(stats.recent_errors||[]).length">
             <table>
               <thead><tr><th>时间</th><th>模型</th><th>Key</th><th>状态码</th><th>错误信息</th></tr></thead>

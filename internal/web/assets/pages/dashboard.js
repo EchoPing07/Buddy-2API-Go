@@ -1,38 +1,88 @@
 /* ═══ 页面层：统计（PAGE(key, def) 注册本页专属状态与动作） ═══ */
 PAGE('dashboard', {
   /* ── 统计 ── */
+  get statsRanges(){
+    return [
+      {key:'all', label:'所有'},
+      {key:'24h', label:'近24h'},
+      {key:'7d',  label:'7天'},
+      {key:'30d', label:'30天'},
+      {key:'90d', label:'90天'},
+    ];
+  },
+  get statsRangeLabel(){
+    const m = {all:'所有时间', '24h':'近 24 小时', '7d':'近 7 天', '30d':'近 30 天', '90d':'近 90 天'};
+    return m[this.statsRange] || '所有时间';
+  },
+  get reqMetricLabel(){
+    return this.statsRange === 'all' ? '总请求' : '请求数';
+  },
+  get chartTitle(){
+    const m = {all:'全部用量', '24h':'近 24 小时用量', '7d':'近 7 天用量', '30d':'近 30 天用量', '90d':'近 90 天用量'};
+    return m[this.statsRange] || '全部用量';
+  },
   get successRate(){
     const t = this.stats.total_requests||0;
     if(!t) return null;
     return (100*(1-(this.stats.error_count||0)/t)).toFixed(1);
   },
-  get avg14(){
-    const d = (this.stats.daily||[]).slice(-14);
+  get avgRate(){
+    const d = this.stats.daily||[];
     if(!d.length) return 0;
     return Math.round(d.reduce((s,x)=>s+(x.requests||0),0)/d.length);
+  },
+  get avgTokens(){
+    const d = this.stats.daily||[];
+    if(!d.length) return 0;
+    return Math.round(d.reduce((s,x)=>s+(x.tokens||0),0)/d.length);
+  },
+  get reqDetail(){
+    if(this.statsRange === '24h') return '近 24 小时 · 时均 '+this.compact(this.avgRate);
+    return '今日 '+this.fmt(this.stats.today_requests)+' · 日均 '+this.compact(this.avgRate);
+  },
+  get tokDetail(){
+    if(this.statsRange === '24h') return '近 24 小时 · 时均 '+this.compact(this.avgTokens);
+    if(this.statsRange === 'all') return '今日 '+this.fmt(this.stats.today_tokens);
+    return '今日 '+this.fmt(this.stats.today_tokens)+' · 日均 '+this.compact(this.avgTokens);
   },
   get maxReq(){
     // 不使用展开运算：模型数量增长时 Math.max(1, ...arr) 会触及参数个数上限
     return (this.stats.by_model||[]).reduce((a,m)=>Math.max(a,m.requests||0),1);
   },
+  setStatsRange(r){
+    if(!['all','24h','7d','30d','90d'].includes(r) || r === this.statsRange) return;
+    this.statsRange = r;
+    localStorage.setItem('buddy2api:statsRange', r);
+    this.loadStats();
+  },
   async loadStats(){
+    const seq = ++this._statsSeq;
+    const rng = this.statsRange || 'all';
+    this.statsLoading = true;
     try{
-      this.stats = await this.api('/admin/stats');
+      const data = await this.api('/admin/stats?range='+encodeURIComponent(rng));
+      if(seq !== this._statsSeq) return; // 快速切换范围时丢弃先发后到的旧响应
+      this.stats = data;
       this.$nextTick(()=>requestAnimationFrame(()=>this.renderDaily()));
-    }catch(e){ this.toast(e.message,'err'); }
+    }catch(e){
+      if(seq === this._statsSeq) this.toast(e.message,'err');
+    }finally{
+      if(seq === this._statsSeq) this.statsLoading = false;
+    }
   },
 
-    /* ── 图表：近 14 天（手写 SVG，双轴：柱=Tokens，线=请求·Catmull-Rom 平滑曲线） ── */
+    /* ── 图表：用量趋势（手写 SVG，双轴：柱=Tokens，线=请求·Catmull-Rom 平滑曲线） ── */
   renderDaily(){
     const el = document.getElementById('chartDaily');
     if(!el) return;
-    const daily = (this.stats.daily||[]).slice(-14);
+    const daily = this.stats.daily||[];
     if(!daily.length){ el.innerHTML = '<div class="chart-empty">暂无数据</div>'; return; }
     const W = el.clientWidth || 600;
     if(W < 40) return;
     const H = 236, padT = 12, padB = 24;
-    const maxB = Math.max(...daily.map(d=>d.tokens||0), 1);   // 柱：Tokens（左轴）
-    const maxL = Math.max(...daily.map(d=>d.requests||0), 1); // 线：请求（右轴）
+    const isHour = this.stats.granularity === 'hour' || (daily[0].date||'').length > 10;
+    const maxB = daily.reduce((a,d)=>Math.max(a,d.tokens||0), 1);   // 柱：Tokens（左轴）
+    const maxL = daily.reduce((a,d)=>Math.max(a,d.requests||0), 1); // 线：请求（右轴）
     // 刻度文案：满量程的 0/¼/½/¾/满 五档
     const tickB = g => this.compact(Math.round(maxB*g/4));
     const tickL = g => this.compact(Math.round(maxL*g/4));
@@ -54,7 +104,8 @@ PAGE('dashboard', {
     const padR = axisPad([0,1,2,3,4].map(tickL), 14, 44);
     const iw = W-padL-padR, ih = H-padT-padB;
     const step = iw/daily.length;
-    const barW = Math.max(4, Math.min(16, step*0.48));
+    const dense = daily.length > 31;
+    const barW = Math.max(1.5, Math.min(16, step*(dense?0.62:0.48)));
     const cx = i => padL + step*i + step/2;
     const clampY = v => Math.max(padT+1, Math.min(padT+ih-1, v));
     const yB = v => padT + ih - v/maxB*ih;
@@ -85,10 +136,21 @@ PAGE('dashboard', {
     });
     const linePts = daily.map((d,i)=>[cx(i), clampY(yL(d.requests||0))]);
     s += `<path class="tok-line" d="${smoothPath(linePts)}"/>`;
-    linePts.forEach(p=>{ s += `<circle class="tok-dot" cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="2.6"/>`; });
+    if(!dense){
+      const dotR = daily.length > 16 ? '2.1' : '2.6';
+      linePts.forEach(p=>{ s += `<circle class="tok-dot" cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${dotR}"/>`; });
+    }else{
+      // 90 天或更长跨度点数密集，不常驻圆点以免挤成黑线，悬停时再亮出单点指示
+      s += `<circle class="tok-dot tok-dot-hl" cx="0" cy="0" r="3" opacity="0" pointer-events="none"/>`;
+    }
     const k = Math.max(1, Math.ceil(daily.length/7));
+    const minGap = Math.ceil(k*0.5);
     daily.forEach((d,i)=>{
-      if(i%k===0 || i===daily.length-1) s += `<text class="axis-label" text-anchor="middle" x="${cx(i).toFixed(1)}" y="${H-6}">${(d.date||'').slice(5)}</text>`;
+      const isLast = i === daily.length-1;
+      if(k===1 || isLast || (i%k===0 && (daily.length-1-i)>=minGap)){
+        const lbl = isHour ? (d.date||'').slice(11) : (d.date||'').slice(5);
+        s += `<text class="axis-label" text-anchor="middle" x="${cx(i).toFixed(1)}" y="${H-6}">${lbl}</text>`;
+      }
     });
     daily.forEach((d,i)=>{ s += `<rect class="hz" data-i="${i}" x="${(padL+step*i).toFixed(1)}" y="${padT}" width="${step.toFixed(1)}" height="${ih.toFixed(1)}" fill="transparent"/>`; });
     s += `<g class="tip" opacity="0" pointer-events="none"><rect class="tip-bg" rx="7" width="130" height="70"/><text class="tip-t" x="10" y="16"></text><text class="tip-l" x="10" y="30"></text><text class="tip-l" x="10" y="43"></text><text class="tip-l" x="10" y="56"></text></g>`;
@@ -98,6 +160,7 @@ PAGE('dashboard', {
     const svg = el.querySelector('svg');
     const tip = svg.querySelector('.tip');
     const bg = tip.querySelector('.tip-bg');
+    const hlDot = svg.querySelector('.tok-dot-hl');
     const [tt, l1, l2, l3] = tip.querySelectorAll('text');
     svg.querySelectorAll('.hz').forEach(hz=>{
       hz.addEventListener('mouseenter', ()=>{
@@ -106,19 +169,25 @@ PAGE('dashboard', {
         l1.textContent = `请求数 ${this.fmt(d.requests||0)}`;
         l2.textContent = `Tokens 用量 ${this.fmt(d.tokens||0)}`;
         l3.textContent = `Credits 消耗 ${this.fmt(Math.round((d.credit||0)*100)/100)}`;
-        const w = Math.max(...[tt,l1,l2].map(t=>t.getComputedTextLength())) + 20;
+        const w = Math.max(...[tt,l1,l2,l3].map(t=>t.getComputedTextLength())) + 20;
         bg.setAttribute('width', w.toFixed(0));
         const g = this._chartGeom;
         let tx = g.padL + g.step*i + g.step + 8;
-        if(tx + w > g.W - 2) tx = g.padL + g.step*i - w - 8;
+        if(tx + w > g.W - 2) tx = Math.max(2, g.padL + g.step*i - w - 8);
         tip.setAttribute('transform', `translate(${tx.toFixed(1)},${padT+2})`);
         tip.setAttribute('opacity','1');
         const bar = svg.querySelector(`.bar-c[data-i="${i}"]`);
         if(bar) bar.classList.add('hl');
+        if(hlDot && linePts[i]){
+          hlDot.setAttribute('cx', linePts[i][0].toFixed(1));
+          hlDot.setAttribute('cy', linePts[i][1].toFixed(1));
+          hlDot.setAttribute('opacity','1');
+        }
       });
       hz.addEventListener('mouseleave', ()=>{
         tip.setAttribute('opacity','0');
         svg.querySelectorAll('.bar-c.hl').forEach(b=>b.classList.remove('hl'));
+        if(hlDot) hlDot.setAttribute('opacity','0');
       });
     });
   },

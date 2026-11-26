@@ -1252,7 +1252,15 @@ func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
-	st, err := h.st.GetStats()
+	rng := strings.TrimSpace(r.URL.Query().Get("range"))
+	if rng == "" {
+		rng = store.StatsRangeAll
+	}
+	if !store.ValidStatsRange(rng) {
+		jsonErr(w, http.StatusBadRequest, "不支持的统计范围: "+rng+"（仅支持 all/24h/7d/30d/90d）")
+		return
+	}
+	st, err := h.st.GetStatsRange(rng)
 	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, err.Error())
 		return

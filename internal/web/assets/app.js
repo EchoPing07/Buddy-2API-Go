@@ -61,6 +61,8 @@ function appShell(){
     mobileNav:false, toasts:[], _toastSeq:0,
     theme: localStorage.getItem('buddy2api:theme') || 'system',
     health:{}, stats:{}, account:{}, keys:[],
+    statsRange: (()=>{ const v = localStorage.getItem('buddy2api:statsRange'); return ['all','24h','7d','30d','90d'].includes(v) ? v : 'all'; })(),
+    statsLoading:false, _statsSeq:0,
     accounts:{items:[],loaded:false},   // 多账号档案（切换列表，见 pages/account.js）
     logs:[], logTotal:0, logPage:1, logPageSize:20,
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
