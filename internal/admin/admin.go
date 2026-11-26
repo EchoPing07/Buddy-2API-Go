@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -95,6 +96,7 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Post("/account/import/batch", h.accountImportBatch)
 			// 多账号档案：手动切换到某个已存账号（无轮询 / 无故障转移）。
 			r.Get("/accounts", h.listAccounts)
+			r.Put("/accounts/{uid}", h.updateAccountProfile)
 			r.Post("/accounts/{uid}/activate", h.activateAccount)
 			r.Delete("/accounts/{uid}", h.deleteAccountProfile)
 
@@ -296,8 +298,10 @@ func (h *Handler) account(w http.ResponseWriter, r *http.Request) {
 		"access_token":  maskToken(t.AccessToken),
 		"has_refresh":   t.RefreshToken != "",
 		"uid":           t.UID,
+		"id":            auth.AccountID(t.UID),
 		"enterprise_id": t.EnterpriseID,
 		"nickname":      t.Nickname,
+		"remark":        t.Remark,
 		"domain":        t.Domain,
 		"expires_at":    t.ExpiresAt,
 		"expires_human": t.ExpiresInHuman(),
@@ -336,6 +340,10 @@ func (h *Handler) oauthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prev := h.toks.Get()
+	if tok.Remark == "" {
+		// 重登已有账号时保留本地备注，避免扫码续期后备注被清空
+		tok.Remark = h.existingRemark(tok.UID, prev)
+	}
 	if err := h.toks.Save(tok); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
 		return
@@ -348,7 +356,7 @@ func (h *Handler) oauthPoll(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"status": "success",
 		"account": map[string]any{
-			"uid": tok.UID, "nickname": tok.Nickname, "domain": tok.Domain,
+			"uid": tok.UID, "nickname": tok.Nickname, "remark": tok.Remark, "domain": tok.Domain,
 			"expires_human": tok.ExpiresInHuman(),
 		},
 	})
@@ -557,6 +565,11 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, errMsg)
 		return
 	}
+	prev := h.toks.Get()
+	if t.Remark == "" {
+		// 未提供新备注时沿用本地已有备注（重导裸 token.json 不应清空原备注）
+		t.Remark = h.existingRemark(t.UID, prev)
+	}
 	if !req.Activate {
 		// 仅导入：唯一产出就是这份档案，所以存档失败必须报错（启用路径可以只留痕，
 		// 那里 token.json 已经落地，用户仍有可用凭证）。
@@ -564,21 +577,30 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, http.StatusInternalServerError, "保存账号档案失败: "+err.Error())
 			return
 		}
+		if prev != nil && prev.UID == t.UID && t.Remark != prev.Remark {
+			_ = h.toks.UpdateRemark(t.UID, t.Remark)
+		}
+		if h.pool != nil {
+			h.pool.SetAccountRemark(t.UID, t.Remark)
+		}
 		jsonWrite(w, http.StatusOK, map[string]any{
 			"ok":       true,
 			"uid":      t.UID,
 			"nickname": t.Nickname,
+			"remark":   t.Remark,
 			"domain":   t.Domain,
 			"activate": false,
 		})
 		return
 	}
-	prev := h.toks.Get()
 	if err := h.toks.Save(t); err != nil {
 		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
 		return
 	}
 	h.archiveAccount(t) // 导入的账号同样入档
+	if h.pool != nil {
+		h.pool.SetAccountRemark(t.UID, t.Remark)
+	}
 	if accountSwitched(prev, t) {
 		// 同账号重导不清，否则今日上报会按新会话再发一轮（见 accountSwitched）
 		h.invalidateAccountCaches()
@@ -587,10 +609,13 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		"ok":       true,
 		"uid":      t.UID,
 		"nickname": t.Nickname,
+		"remark":   t.Remark,
 		"domain":   t.Domain,
 		"activate": true,
 	})
 }
+
+const maxAccountRemarkRunes = 64
 
 // importRequest 单账号导入请求体；也是批量包里单条的宽松形式（两者字段一一对应）。
 type importRequest struct {
@@ -600,6 +625,7 @@ type importRequest struct {
 	ExpiresAt    int64  `json:"expires_at"`
 	Domain       string `json:"domain"`
 	Nickname     string `json:"nickname"`
+	Remark       string `json:"remark"`
 	Activate     bool   `json:"activate"`
 }
 
@@ -613,6 +639,10 @@ func (h *Handler) importedToken(req importRequest) (*auth.Token, string) {
 	if _, _, _, _, _, err := auth.ParseJWT(tok); err != nil {
 		return nil, "access_token 不是合法 JWT: " + err.Error()
 	}
+	remark := strings.TrimSpace(req.Remark)
+	if utf8.RuneCountInString(remark) > maxAccountRemarkRunes {
+		return nil, fmt.Sprintf("备注不能超过 %d 个字符", maxAccountRemarkRunes)
+	}
 	t := &auth.Token{
 		AccessToken:  tok,
 		RefreshToken: strings.TrimSpace(req.RefreshToken),
@@ -620,6 +650,7 @@ func (h *Handler) importedToken(req importRequest) (*auth.Token, string) {
 		ExpiresAt:    req.ExpiresAt,
 		Domain:       strings.TrimSpace(req.Domain),
 		Nickname:     strings.TrimSpace(req.Nickname),
+		Remark:       remark,
 	}
 	t.EnrichFromJWT()
 	if t.TokenType == "" {
@@ -675,6 +706,7 @@ func (h *Handler) accountImportBatch(w http.ResponseWriter, r *http.Request) {
 	type importResult struct {
 		UID      string `json:"uid,omitempty"`
 		Nickname string `json:"nickname,omitempty"`
+		Remark   string `json:"remark,omitempty"`
 		Domain   string `json:"domain,omitempty"`
 		OK       bool   `json:"ok"`
 		Error    string `json:"error,omitempty"`
@@ -683,13 +715,21 @@ func (h *Handler) accountImportBatch(w http.ResponseWriter, r *http.Request) {
 		Overwrote bool `json:"overwrote,omitempty"`
 	}
 	results := make([]importResult, 0, len(bundle.Accounts))
-	// 先取现存档案的 uid 集合：Save 是「同名覆盖」，不先查就只能事后猜。
+	// 先取现存档案的 uid 集合（与已有备注）：Save 是「同名覆盖」，不先查就只能事后猜。
 	// List 失败不阻断导入（档案目录可能尚不存在），此时按「都是新账号」处理。
 	existing := map[string]bool{}
+	existingRemarks := map[string]string{}
 	if metas, err := book.List(); err == nil {
 		for _, m := range metas {
 			existing[m.UID] = true
+			if m.Remark != "" {
+				existingRemarks[m.UID] = m.Remark
+			}
 		}
+	}
+	active := h.toks.Get()
+	if active != nil && active.Remark != "" && existingRemarks[active.UID] == "" {
+		existingRemarks[active.UID] = active.Remark
 	}
 	imported, failed, overwrote := 0, 0, 0
 	// seen 记录本包内已出现过的 uid：同一包里同一账号出现两次时后者会静默覆盖前者，
@@ -703,25 +743,35 @@ func (h *Handler) accountImportBatch(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt:    item.ExpiresAt,
 			Domain:       item.Domain,
 			Nickname:     item.Nickname,
+			Remark:       item.Remark,
 		})
 		if t == nil {
 			failed++
 			results = append(results, importResult{Error: fmt.Sprintf("第 %d 条：%s", i+1, errMsg)})
 			continue
 		}
+		if t.Remark == "" {
+			t.Remark = existingRemarks[t.UID]
+		}
 		if prev, dup := seen[t.UID]; dup {
 			// 不算失败（凭证本身合法），但不能计入 imported 的新增数，且必须提示覆盖了哪一条
 			failed++
-			results = append(results, importResult{UID: t.UID, Nickname: t.Nickname,
+			results = append(results, importResult{UID: t.UID, Nickname: t.Nickname, Remark: t.Remark,
 				Error: fmt.Sprintf("第 %d 条：与第 %d 条是同一账号（uid %s），已跳过；请确认包里是否重复",
 					i+1, prev, t.UID)})
 			continue
 		}
 		if err := book.Save(t); err != nil {
 			failed++
-			results = append(results, importResult{UID: t.UID, Nickname: t.Nickname,
+			results = append(results, importResult{UID: t.UID, Nickname: t.Nickname, Remark: t.Remark,
 				Error: "保存账号档案失败: " + err.Error()})
 			continue
+		}
+		if active != nil && active.UID == t.UID && t.Remark != active.Remark {
+			_ = h.toks.UpdateRemark(t.UID, t.Remark)
+		}
+		if h.pool != nil {
+			h.pool.SetAccountRemark(t.UID, t.Remark)
 		}
 		seen[t.UID] = i + 1
 		imported++
@@ -729,7 +779,7 @@ func (h *Handler) accountImportBatch(w http.ResponseWriter, r *http.Request) {
 		if was {
 			overwrote++
 		}
-		results = append(results, importResult{UID: t.UID, Nickname: t.Nickname, Domain: t.Domain,
+		results = append(results, importResult{UID: t.UID, Nickname: t.Nickname, Remark: t.Remark, Domain: t.Domain,
 			OK: true, Overwrote: was})
 	}
 	// 全部失败时给 400：前端就能用统一的错误气泡，而不是弹一个「成功」再列全红。
@@ -767,10 +817,26 @@ func (h *Handler) archiveAccount(t *auth.Token) {
 	}
 }
 
+// existingRemark 查询指定账号本地已有的备注（优先当前活动凭证，其次档案库）。
+// 用于 OAuth 重登或导入未携带 remark 的凭证时避免静默丢失用户备注。
+func (h *Handler) existingRemark(uid string, active *auth.Token) string {
+	if uid == "" {
+		return ""
+	}
+	if active != nil && active.UID == uid && active.Remark != "" {
+		return active.Remark
+	}
+	if old, err := h.accountBook().Load(uid); err == nil && old.Remark != "" {
+		return old.Remark
+	}
+	return ""
+}
+
 // accountItem 账号列表项（不含任何凭证）。
 type accountItem struct {
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname"`
+	Remark       string `json:"remark"`
 	Domain       string `json:"domain"`
 	ExpiresAt    int64  `json:"expires_at"`
 	ExpiresHuman string `json:"expires_human"`
@@ -790,6 +856,7 @@ func newAccountItem(m auth.AccountMeta, active *auth.Token, regionDomain string)
 	return accountItem{
 		UID:          m.ID,
 		Nickname:     m.Nickname,
+		Remark:       m.Remark,
 		Domain:       m.Domain,
 		ExpiresAt:    m.ExpiresAt,
 		ExpiresHuman: t.ExpiresInHuman(),
@@ -857,7 +924,7 @@ func (h *Handler) activateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	// 同一账号：不动凭证也不清缓存（清了当天活跃上报会按新会话再发一轮）。
 	if cur := h.toks.Get(); cur != nil && cur.UID == next.UID {
-		jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": next.UID, "nickname": next.Nickname})
+		jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": next.UID, "nickname": next.Nickname, "remark": next.Remark})
 		return
 	}
 	// 先归档当前：刷新后 token.json 是最新的，档案可能还停在旧 token 上。
@@ -874,7 +941,83 @@ func (h *Handler) activateAccount(w http.ResponseWriter, r *http.Request) {
 		h.pool.ReloadMembers()
 	}
 	h.invalidateAccountCaches()
-	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": next.UID, "nickname": next.Nickname})
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": next.UID, "nickname": next.Nickname, "remark": next.Remark})
+}
+
+// updateAccountProfile 更新指定账号的备注（PUT /admin/accounts/{uid}）。
+// 同时落盘账号档案与活动凭证 token.json（若为当前账号），并同步号池内存快照；
+// 不触碰账号口径缓存或调度器状态（仅本地展示元信息）。
+func (h *Handler) updateAccountProfile(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "uid")
+	var req struct {
+		Remark *string `json:"remark"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if req.Remark == nil {
+		jsonErr(w, http.StatusBadRequest, "缺少 remark 参数")
+		return
+	}
+	remark := strings.TrimSpace(*req.Remark)
+	if utf8.RuneCountInString(remark) > maxAccountRemarkRunes {
+		jsonErr(w, http.StatusBadRequest, fmt.Sprintf("备注不能超过 %d 个字符", maxAccountRemarkRunes))
+		return
+	}
+	book := h.accountBook()
+	t, err := book.UpdateRemark(id, remark)
+	if err != nil {
+		if errors.Is(err, auth.ErrAccountNotFound) {
+			// 旧安装仅存在 token.json（尚未入档）：允许直接给当前账号写备注并顺带归档。
+			if active := h.toks.Get(); active != nil && (active.UID == id || auth.AccountID(active.UID) == id) {
+				if err := h.toks.UpdateRemark(active.UID, remark); err != nil {
+					jsonErr(w, http.StatusInternalServerError, "保存备注失败: "+err.Error())
+					return
+				}
+				t = h.toks.Get()
+				h.archiveAccount(t)
+			} else {
+				jsonErr(w, http.StatusNotFound, "账号档案不存在")
+				return
+			}
+		} else {
+			jsonErr(w, http.StatusInternalServerError, "更新账号备注失败: "+err.Error())
+			return
+		}
+	} else if active := h.toks.Get(); active != nil && active.UID == t.UID {
+		if err := h.toks.UpdateRemark(t.UID, remark); err != nil {
+			jsonErr(w, http.StatusInternalServerError, "更新当前账号备注失败: "+err.Error())
+			return
+		}
+	}
+	if h.pool != nil {
+		h.pool.SetAccountRemark(t.UID, remark)
+	}
+	active := h.toks.Get()
+	regionDomain := config.EndpointOf(h.cfg.Get().Region).Domain
+	item := newAccountItem(auth.AccountMeta{
+		ID:        auth.AccountID(t.UID),
+		UID:       t.UID,
+		Nickname:  t.Nickname,
+		Remark:    t.Remark,
+		Domain:    t.Domain,
+		ExpiresAt: t.ExpiresAt,
+		SavedAt:   t.SavedAt,
+	}, active, regionDomain)
+	if h.pool != nil && h.cfg.Get().PoolEnabled {
+		if st, ok := h.pool.AccountStateOf(t.UID); ok {
+			item.InPool = true
+			item.PoolAvailable = st.Available()
+			item.PoolAutoDisabled = st.AutoDisabled
+		}
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"uid":     item.UID,
+		"raw_uid": t.UID,
+		"remark":  t.Remark,
+		"item":    item,
+	})
 }
 
 // deleteAccountProfile 移除档案。当前正在使用的账号不允许移除：

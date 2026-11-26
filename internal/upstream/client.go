@@ -357,6 +357,7 @@ func buildToken(d tokenData, old *auth.Token) *auth.Token {
 		if t.Domain == "" {
 			t.Domain = old.Domain
 		}
+		t.Remark = old.Remark
 	}
 	t.EnrichFromJWT()
 	if t.ExpiresAt == 0 && d.ExpiresIn > 0 {

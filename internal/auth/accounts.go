@@ -34,6 +34,7 @@ type AccountMeta struct {
 	ID        string // 档案 id（文件名，可安全用于 URL）
 	UID       string // 原始 uid（判定是否当前账号）
 	Nickname  string
+	Remark    string
 	Domain    string
 	ExpiresAt int64
 	SavedAt   int64
@@ -51,9 +52,9 @@ func NewAccountBook(dataDir string) *AccountBook {
 	return &AccountBook{dir: filepath.Join(dataDir, "accounts")}
 }
 
-// accountID 把 UID 归一为安全文件名；含非法字符时退回哈希，
-// 保证同一 UID 始终映射同一份档案（Load / Delete 可用原始 UID 调回）。
-func accountID(uid string) string {
+// AccountID 把 UID 归一为安全文件名；含非法字符时退回哈希，
+// 保证同一 UID 始终映射同一份档案（Load / Delete / UpdateRemark 可用原始 UID 或档案 ID 调回）。
+func AccountID(uid string) string {
 	if accountIDRe.MatchString(uid) {
 		return uid
 	}
@@ -84,6 +85,7 @@ func (b *AccountBook) List() ([]AccountMeta, error) {
 			ID:        strings.TrimSuffix(e.Name(), ".json"),
 			UID:       t.UID,
 			Nickname:  t.Nickname,
+			Remark:    t.Remark,
 			Domain:    t.Domain,
 			ExpiresAt: t.ExpiresAt,
 			SavedAt:   t.SavedAt,
@@ -108,12 +110,36 @@ func (b *AccountBook) Save(t *Token) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(b.dir, accountID(t.UID)+".json"), data, 0o600)
+	return os.WriteFile(filepath.Join(b.dir, AccountID(t.UID)+".json"), data, 0o600)
+}
+
+// UpdateRemark 更新指定档案的备注并落盘；保留原 SavedAt，避免改备注导致列表顺序跳动。
+func (b *AccountBook) UpdateRemark(id, remark string) (*Token, error) {
+	path := filepath.Join(b.dir, AccountID(id)+".json")
+	t, err := b.loadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrAccountNotFound
+		}
+		return nil, err
+	}
+	t.Remark = remark
+	if t.SavedAt == 0 {
+		t.SavedAt = time.Now().Unix()
+	}
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // Load 读取一份档案；id 可以是档案 id，也可直接传原始 UID。
 func (b *AccountBook) Load(id string) (*Token, error) {
-	t, err := b.loadFile(filepath.Join(b.dir, accountID(id)+".json"))
+	t, err := b.loadFile(filepath.Join(b.dir, AccountID(id)+".json"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrAccountNotFound
@@ -125,7 +151,7 @@ func (b *AccountBook) Load(id string) (*Token, error) {
 
 // Delete 删除一份档案；不存在视为已删除（幂等）。
 func (b *AccountBook) Delete(id string) error {
-	if err := os.Remove(filepath.Join(b.dir, accountID(id)+".json")); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(filepath.Join(b.dir, AccountID(id)+".json")); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil

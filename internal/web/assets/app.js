@@ -94,7 +94,7 @@ function appShell(){
           pool_max_retry:2, pool_cool_max_min:360, pool_probe_cron:'0 0 0,6,12,18 * * *'},
     models:{models:[],ids:[],state:null,loading:false},
     importModal:false, importMode:'single',
-    importForm:{access_token:'',refresh_token:'',domain:'',filename:''},
+    importForm:{access_token:'',refresh_token:'',domain:'',remark:'',filename:''},
     importActivate:false,      // 导入弹窗当前在跑的是哪一个动作（"仅导入"/"导入并启用"），仅用于按钮 loading 态
     batchForm:{filename:'',items:[],error:'',bundle:null},   // 批量导入：已解析的凭证包（bundle 原样回传服务端）
     batchResult:null,          // 批量导入逐条结果（null = 本轮还没执行过）
@@ -319,6 +319,11 @@ function appShell(){
     fmtDosage(v){
       if(v==null) return '—';
       return typeof v==='number' ? String(+v.toFixed(2)) : v;
+    },
+    /** 账号展示名：优先用户自定义备注，其次上游昵称，最终回退「未命名」 */
+    accountLabel(a){
+      if(!a) return '未命名';
+      return a.remark || a.nickname || '未命名';
     },
 
     /* ── 登录 ── */

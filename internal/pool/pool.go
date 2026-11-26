@@ -606,12 +606,26 @@ func (m *Manager) DeleteAccount(uid string) {
 	m.syncDeleteAccount(uid)
 }
 
+// SetAccountRemark 同步更新池内账号副本的备注（管理页改备注后调用，不重置池状态与会话）。
+func (m *Manager) SetAccountRemark(uid, remark string) {
+	if m == nil || uid == "" {
+		return
+	}
+	m.mu.RLock()
+	ts := m.toks[uid]
+	m.mu.RUnlock()
+	if ts != nil {
+		ts.SetRemarkInMemory(remark)
+	}
+}
+
 // ── Snapshot（管理 API） ──
 
 // AccountView 管理页用的账号视图（不含凭证）。
 type AccountView struct {
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname"`
+	Remark       string `json:"remark"`
 	Domain       string `json:"domain"`
 	ExpiresAt    int64  `json:"expires_at"`
 	ExpiresHuman string `json:"expires_human"`
@@ -723,7 +737,7 @@ func (m *Manager) Snapshot(creditsOf func(uid string) (float64, int64)) PoolView
 		}
 		if ts := m.toks[uid]; ts != nil {
 			if t := ts.Get(); t != nil {
-				v.Nickname, v.Domain, v.ExpiresAt = t.Nickname, t.Domain, t.ExpiresAt
+				v.Nickname, v.Remark, v.Domain, v.ExpiresAt = t.Nickname, t.Remark, t.Domain, t.ExpiresAt
 				v.ExpiresHuman = t.ExpiresInHuman()
 				v.RegionMatch = t.Domain == config.EndpointOf(cfg.Region).Domain
 			}

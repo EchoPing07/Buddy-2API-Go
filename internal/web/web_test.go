@@ -1314,6 +1314,56 @@ if (statsUrls.length !== 2 || !/range=90d/.test(statsUrls[0]) || !/range=24h/.te
 if (inst.chartTitle !== '近 24 小时用量') fail('24h 图表标题不对: ' + inst.chartTitle);
 if (!/时均/.test(inst.reqDetail)) fail('24h 请求详情应显示时均: ' + inst.reqDetail);
 
+// 19) 账号备注：行内就地更新（不整表重拉）、同步活动账号与号池视图、未改值不发请求、失败回滚
+loads.length = 0;
+inst.account = { logged_in: true, uid: 'uid-cur', id: 'uid-cur', nickname: '原昵称', remark: '' };
+inst.accounts = { loaded: true, items: [
+  { uid: 'uid-cur', nickname: '原昵称', remark: '', active: true },
+  { uid: 'uid-b',   nickname: '账号B',  remark: '旧B', active: false },
+] };
+inst.pool = { accounts: [
+  { uid: 'uid-cur', nickname: '原昵称', remark: '' },
+  { uid: 'uid-b',   nickname: '账号B',  remark: '旧B' },
+] };
+let remarkCalls = [];
+global.fetch = async function (url, opts) {
+  remarkCalls.push({ url: String(url), method: opts && opts.method, body: opts && JSON.parse(opts.body) });
+  return { ok: true, status: 200, json: async function () {
+    return {
+      ok: true, uid: 'uid-cur', raw_uid: 'uid-cur', remark: '主力号',
+      item: { uid: 'uid-cur', nickname: '原昵称', remark: '主力号', active: true },
+    };
+  } };
+};
+const fakeInput = { value: '  主力号  ' };
+await inst.updateAccountRemark(inst.accounts.items[0], fakeInput.value, fakeInput);
+if (remarkCalls.length !== 1 || remarkCalls[0].method !== 'PUT' || remarkCalls[0].url !== '/admin/accounts/uid-cur') {
+  fail('updateAccountRemark 请求异常: ' + JSON.stringify(remarkCalls));
+}
+if (remarkCalls[0].body.remark !== '主力号') fail('updateAccountRemark 未裁剪空白: ' + JSON.stringify(remarkCalls[0].body));
+if (count('loadAccounts') !== 0) fail('updateAccountRemark 不应整表重拉 loadAccounts');
+if (inst.accounts.items[0].remark !== '主力号') fail('列表行备注未更新: ' + JSON.stringify(inst.accounts.items[0]));
+if (inst.account.remark !== '主力号') fail('当前活动账号备注未同步: ' + JSON.stringify(inst.account));
+if (inst.pool.accounts[0].remark !== '主力号') fail('号池视图备注未同步: ' + JSON.stringify(inst.pool.accounts[0]));
+if (fakeInput.value !== '主力号') fail('输入框未同步为裁剪后的值: ' + fakeInput.value);
+if (inst.accountLabel(inst.accounts.items[0]) !== '主力号') fail('accountLabel 应优先返回备注');
+if (inst.poolAccountName('uid-cur') !== '主力号') fail('日志页 poolAccountName 应优先返回备注');
+
+// 19b) 值未变化时不发请求
+remarkCalls = [];
+await inst.updateAccountRemark(inst.accounts.items[0], '  主力号  ', fakeInput);
+if (remarkCalls.length !== 0) fail('备注未变化时不应发 PUT 请求');
+
+// 19c) 失败时回滚输入框与行状态，且不整表重拉
+const failInput = { value: '超长失败值' };
+global.fetch = async function () {
+  return { ok: false, status: 400, json: async function () { return { error: '备注不能超过 64 个字符' }; } };
+};
+await inst.updateAccountRemark(inst.accounts.items[1], failInput.value, failInput);
+if (failInput.value !== '旧B') fail('失败后输入框未回滚到原备注: ' + failInput.value);
+if (inst.accounts.items[1].remark !== '旧B') fail('失败后行状态未回滚: ' + JSON.stringify(inst.accounts.items[1]));
+if (count('loadAccounts') !== 0) fail('失败后不应整表重拉 loadAccounts');
+
 global.fetch = savedFetch;
 
 console.log('OK ' + JSON.stringify(loads));
@@ -1793,5 +1843,37 @@ func TestDashboardStatsRangeUI(t *testing.T) {
 	}
 	if strings.Contains(script, ".slice(-14)") {
 		t.Error("dashboard.js 仍硬编码 .slice(-14)，会截断 30天/90天/所有 范围的趋势图")
+	}
+}
+
+// TestAccountPageRemarkUI 账号备注 UI 契约：凭证卡片、账号切换表、号池表与导入弹窗均接线。
+func TestAccountPageRemarkUI(t *testing.T) {
+	html, err := pageFS.ReadFile("pages/account.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := assetFS.ReadFile("assets/pages/account.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, script := string(html), string(js)
+	for _, want := range []string{
+		"<th>备注</th>",
+		"updateAccountRemark(",
+		"accountLabel(",
+		"importForm.remark",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("account.html 缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"async updateAccountRemark(",
+		"method:'PUT'",
+		"remark:(f.remark||'').trim()",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("account.js 缺少 %q", want)
+		}
 	}
 }

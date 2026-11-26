@@ -157,6 +157,7 @@ PAGE('account', {
       this.importForm.access_token = obj.access_token || '';
       this.importForm.refresh_token = obj.refresh_token || '';
       this.importForm.domain = obj.domain || '';
+      this.importForm.remark = obj.remark || '';
       this.toast('已读取文件，确认后导入','ok');
     };
     reader.onerror = ()=>this.toast('读取文件失败','err');
@@ -171,20 +172,21 @@ PAGE('account', {
     this.busy(async()=>{
       const r = await this.api('/admin/account/import',{method:'POST',body:JSON.stringify({
         access_token:f.access_token.trim(),
-        refresh_token:f.refresh_token.trim(),
-        domain:f.domain.trim(),
+        refresh_token:(f.refresh_token||'').trim(),
+        domain:(f.domain||'').trim(),
+        remark:(f.remark||'').trim(),
         activate:!!activate,
       })});
       this.importModal = false;
-      this.importForm = {access_token:'',refresh_token:'',domain:'',filename:''};
+      this.importForm = {access_token:'',refresh_token:'',domain:'',remark:'',filename:''};
       // 账号列表必须先刷：仅导入时它是用户能看到的唯一反馈
       this.loadAccounts();
       if(activate){
-        this.toast('已导入并启用：'+(r.nickname||r.uid||'已保存'),'ok');
+        this.toast('已导入并启用：'+(r.remark||r.nickname||r.uid||'已保存'),'ok');
         // 换账号：余额/签到/任务重拉（后端已清缓存，但前端 keep-alive，旧数据会残留）
         this.refreshAccountData();
       }else{
-        const who = r.nickname||r.uid||'已存档';
+        const who = r.remark||r.nickname||r.uid||'已存档';
         // 无活动账号时「仅导入」不会让应用能用，提示去列表启用（不默默替用户切账号）
         this.toast('已导入：'+who+(this.account.logged_in
           ? '，可在「账号切换」中启用'
@@ -225,6 +227,7 @@ PAGE('account', {
           access_token: obj.access_token || '',
           refresh_token: obj.refresh_token || '',
           domain: obj.domain || '',
+          remark: obj.remark || '',
           filename,
         };
         this.toast('这是单个账号凭证，已切到「单个账号」导入','ok');
@@ -241,6 +244,7 @@ PAGE('account', {
       return {
         uid: t.uid || c.sub || '',
         nickname: t.nickname || c.nickname || '',
+        remark: t.remark || '',
         domain: t.domain || '',
       };
     });
@@ -298,12 +302,61 @@ PAGE('account', {
       if(r && Array.isArray(r.items)) this.accounts = {items:r.items, loaded:true};
     }catch(e){ /* 忽略 */ }
   },
+  /** 行内更新账号备注：仅就地更新目标行与活动/号池副本，不整表重拉，失败回滚输入框。 */
+  async updateAccountRemark(target, rawRemark, el){
+    if(!target) return;
+    const items = (this.accounts && Array.isArray(this.accounts.items)) ? this.accounts.items : [];
+    const targetID = target.id || target.uid;
+    if(!targetID) return;
+    const findIdx = ()=> items.findIndex(x=>x.uid===targetID || (target===this.account && x.active));
+    const idx = findIdx();
+    const isActive = target === this.account
+      || (idx >= 0 && !!items[idx].active)
+      || !!(this.account && this.account.logged_in && (this.account.id===targetID || this.account.uid===targetID));
+    const prevRemark = (idx >= 0 ? items[idx].remark : (isActive ? this.account.remark : target.remark)) || '';
+    const nextRemark = String(rawRemark == null ? '' : rawRemark).trim();
+    if(nextRemark === prevRemark){
+      if(el) el.value = prevRemark;
+      return;
+    }
+    const reqUID = idx >= 0 ? items[idx].uid : targetID;
+    const before = idx >= 0 ? Object.assign({}, items[idx]) : null;
+    try{
+      const r = await this.api('/admin/accounts/'+encodeURIComponent(reqUID),{
+        method:'PUT',
+        body:JSON.stringify({remark:nextRemark}),
+      });
+      const saved = (r && typeof r.remark === 'string') ? r.remark : nextRemark;
+      const j = findIdx();
+      if(j >= 0){
+        const row = (r && r.item) ? r.item : Object.assign({}, before, {remark:saved});
+        items.splice(j, 1, row);
+      }
+      if(isActive && this.account){
+        this.account = Object.assign({}, this.account, {remark:saved});
+      }
+      if(this.pool && Array.isArray(this.pool.accounts)){
+        const rawUID = (r && r.raw_uid) || (isActive && this.account && this.account.uid) || target.uid;
+        const pIdx = this.pool.accounts.findIndex(x=>x.uid===rawUID || x.uid===reqUID);
+        if(pIdx >= 0){
+          this.pool.accounts.splice(pIdx, 1, Object.assign({}, this.pool.accounts[pIdx], {remark:saved}));
+        }
+      }
+      if(el) el.value = saved;
+      this.toast(saved ? '备注已保存' : '备注已清除','ok');
+    }catch(e){
+      const j = findIdx();
+      if(j >= 0 && before) items.splice(j, 1, Object.assign({}, before));
+      if(el) el.value = prevRemark;
+      this.toast(e.message,'err');
+    }
+  },
   switchAccount(a){
     this.askConfirm('切换账号',
-      '切换到「'+(a.nickname||a.uid.slice(-8))+'」？',
+      '切换到「'+(a.remark||a.nickname||a.uid.slice(-8))+'」？',
       ()=>this.busy(async()=>{
         const r = await this.api('/admin/accounts/'+encodeURIComponent(a.uid)+'/activate',{method:'POST'});
-        this.toast('已切换到 '+(r.nickname||r.uid||''),'ok');
+        this.toast('已切换到 '+(r.remark||r.nickname||r.uid||''),'ok');
         // 后端已清账号口径缓存，前端 keep-alive，必须原地强刷
         this.refreshAccountData();
         this.loadAccounts();
@@ -311,7 +364,7 @@ PAGE('account', {
   },
   removeAccount(a){
     this.askConfirm('移除账号',
-      '从列表删除「'+(a.nickname||a.uid.slice(-8))+'」的本地存档？当前登录不受影响。',
+      '从列表删除「'+(a.remark||a.nickname||a.uid.slice(-8))+'」的本地存档？当前登录不受影响。',
       ()=>this.busy(async()=>{
         await this.api('/admin/accounts/'+encodeURIComponent(a.uid),{method:'DELETE'});
         this.toast('已移除','ok');
@@ -350,7 +403,7 @@ PAGE('account', {
   },
   poolDisable(a){
     this.askConfirm('禁用账号',
-      '在号池中禁用「'+(a.nickname||a.uid.slice(-8))+'」？',
+      '在号池中禁用「'+(a.remark||a.nickname||a.uid.slice(-8))+'」？',
       ()=>this.busy(async()=>{
         await this.api('/admin/pool/accounts/'+encodeURIComponent(a.uid)+'/disable',{method:'POST'});
         this.toast('已禁用','ok');
@@ -420,7 +473,7 @@ PAGE('account', {
       const r = await this.api('/admin/account/oauth/poll?state='+encodeURIComponent(this.oauth.state));
       if(r.status==='success'){
         this.oauthStop();
-        this.toast('登录成功：'+(r.account.nickname||r.account.uid),'ok');
+        this.toast('登录成功：'+(r.account.remark||r.account.nickname||r.account.uid),'ok');
         // 换账号，同导入；loadModels 单独留着：模型列表跟 region 走不跟账号走
         // （号池快照由 refreshAccountData 内的 loadPool 一并刷新）
         this.refreshAccountData(); this.loadModels(); this.loadAccounts();

@@ -27,6 +27,7 @@ type Token struct {
 	EnterpriseID string `json:"enterprise_id"` // 可空（个人账号）
 	Domain       string `json:"domain"`
 	Nickname     string `json:"nickname,omitempty"`
+	Remark       string `json:"remark,omitempty"` // 用户自定义备注（本地元信息，刷新与重登时保留）
 	SavedAt      int64  `json:"saved_at"`
 }
 
@@ -219,6 +220,44 @@ func (s *TokenStore) Clear() error {
 	return nil
 }
 
+// UpdateRemark 更新当前内存与磁盘凭证的备注。
+// uid 非空时仅在匹配当前凭证 UID 时生效（防止并发换号写错账号）；未登录或不匹配静默忽略。
+// 就地改写字段而不替换 s.t 指针，避免中断正在进行的 refresh() 单飞校验（s.t == t）。
+func (s *TokenStore) UpdateRemark(uid, remark string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.t == nil || (uid != "" && s.t.UID != uid) {
+		return nil
+	}
+	prev := s.t.Remark
+	s.t.Remark = remark
+	data, err := json.MarshalIndent(s.t, "", "  ")
+	if err != nil {
+		s.t.Remark = prev
+		return err
+	}
+	if dir := filepath.Dir(s.path); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			s.t.Remark = prev
+			return err
+		}
+	}
+	if err := os.WriteFile(s.path, data, 0o600); err != nil {
+		s.t.Remark = prev
+		return err
+	}
+	return nil
+}
+
+// SetRemarkInMemory 仅更新内存副本的备注，不写盘（供号池同步同路径档案时避免重复落盘）。
+func (s *TokenStore) SetRemarkInMemory(remark string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.t != nil {
+		s.t.Remark = remark
+	}
+}
+
 // EnsureValid 单飞刷新过期 token。刷新 HTTP 在 token 锁外执行，不阻塞并发 Get。
 func (s *TokenStore) EnsureValid(refreshFn func(t *Token) (*Token, error)) error {
 	s.mu.RLock()
@@ -270,5 +309,7 @@ func (s *TokenStore) refresh(refreshFn func(t *Token) (*Token, error), force boo
 	if s.t != t {
 		return nil // 期间 token 已被替换（如重新登录），放弃本次刷新结果
 	}
+	// 刷新 HTTP 在锁外执行，期间用户可能修改了备注；上游不感知本地备注，以写锁内最新值为准。
+	nt.Remark = s.t.Remark
 	return s.saveLocked(nt)
 }
