@@ -948,13 +948,18 @@ func (a *aggregated) hasAnyToolCalls() bool {
 
 // ── models / health ──
 
-// Models 处理 GET /v1/models。对话模型后按实验开关追加嵌入模型（挂 /v1/embeddings，
-// 默认关闭，开启由管理后台「实验」页控制），便于客户端发现；上游嵌入注册表与 chat
-// 模型列表相互独立，故不并入 ModelCache。
+// Models 处理 GET /v1/models。对话模型后按实验开关追加嵌入/生图模型。
+// 生图覆盖国内与国际两个区，模型 ID 从 /v3/config 的 text-to-image /
+// image-to-image 标签独立发现；目录为空时回退该区内置实测表。
 func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 	ids := h.models.List()
 	if h.cfg.Get().EmbeddingsEnabled {
 		ids = append(ids, upstream.EmbeddingsModel)
+	}
+	if h.cfg.Get().ImagesEnabled {
+		for _, m := range h.imagesFor(h.cfg.Get().Region) {
+			ids = append(ids, m.ID)
+		}
 	}
 	data := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {

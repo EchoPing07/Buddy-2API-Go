@@ -3,6 +3,8 @@ PAGE('labs', {
   /* ── 嵌入模型示例（纯展示；开关状态 labs.embeddings_enabled 放壳层） ──
      用 location.origin 推导端点的原因见 pages/keys.js（全 view 常驻，pathname 不可靠）。 */
   get embUrl(){ return location.origin + '/v1/embeddings'; },
+  get imageUrl(){ return location.origin + '/v1/images/generations'; },
+  get imageEditUrl(){ return location.origin + '/v1/images/edits'; },
   /* 示例 Key 一律用占位符（同密钥页）：代码块会被截图外传，填真实 Key 等于泄凭证。 */
   get sampleKey(){ return 'sk-xxxxxx'; },
   /* 嵌入模型当前仅 bge-m3（上游嵌入注册表实测唯一可用项，见 /v1/embeddings 实现注释） */
@@ -13,10 +15,18 @@ PAGE('labs', {
   -d '{"model":"bge-m3","input":["你好，世界"]}'`;
   },
 
+  get imageCurlSample(){
+    return `curl ${this.imageUrl} \\
+  -H "Authorization: Bearer ${this.sampleKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"hunyuan-image-alpha","prompt":"一只橘猫，简洁插画","size":"1024x1024","n":1}'`;
+  },
+
   async loadLabs(){
     try{
       const r = await this.api('/admin/experiments');
       this.labs.embeddings_enabled = !!r.embeddings_enabled;
+      this.labs.images_enabled = !!r.images_enabled;
     }catch(e){ /* 静默：实验状态拉不到就用默认值 */ }
   },
   /* 开关即时生效（无「保存」按钮）：非乐观更新，以服务端回值为准；
@@ -27,6 +37,15 @@ PAGE('labs', {
       const r = await this.api('/admin/experiments',{method:'PUT',body:JSON.stringify({embeddings_enabled:next})});
       this.labs.embeddings_enabled = !!r.embeddings_enabled;
       this.toast(r.embeddings_enabled ? '嵌入端点已开启' : '嵌入端点已关闭','ok');
+    })();
+  },
+
+  toggleImages(){
+    const next = !this.labs.images_enabled;
+    this.busy(async()=>{
+      const r = await this.api('/admin/experiments',{method:'PUT',body:JSON.stringify({images_enabled:next})});
+      this.labs.images_enabled = !!r.images_enabled;
+      this.toast(r.images_enabled ? '生图端点已开启' : '生图端点已关闭','ok');
     })();
   },
 

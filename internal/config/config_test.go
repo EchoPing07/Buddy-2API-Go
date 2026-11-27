@@ -479,6 +479,23 @@ func TestPoolStrategyValidationAndNormalize(t *testing.T) {
 	}
 }
 
+func TestImagesEnabledEnvOverride(t *testing.T) {
+	t.Setenv("BUDDY2API_IMAGES_ENABLED", "true")
+	m, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Get().ImagesEnabled {
+		t.Fatal("env 应开启生图实验")
+	}
+	if err := m.Update(func(c *Config) error { c.ImagesEnabled = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !m.Get().ImagesEnabled {
+		t.Error("env 锁定字段不得被 Update 覆盖")
+	}
+}
+
 // TestPoolStrategyEnvOverride 验证 BUDDY2API_POOL_STRATEGY 覆盖与 Update 保护，及非法 env 回退。
 func TestPoolStrategyEnvOverride(t *testing.T) {
 	t.Run("valid env locked against Update", func(t *testing.T) {

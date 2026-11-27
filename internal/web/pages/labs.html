@@ -44,5 +44,48 @@
           </template>
         </div>
 
-        <p class="field-hint">实验特性依赖上游非公开接口，可能随时变动、失效或被移除；开关状态保存在 config.json，env <span class="mono">BUDDY2API_EMBEDDINGS_ENABLED</span> 可强制覆盖。</p>
+        <!-- ═══ 国内生图 ═══ -->
+        <div class="card">
+          <div class="card-head"><h3>生图模型</h3></div>
+          <div class="switch-row">
+            <div>
+              <div class="sw-label">生图端点 /v1/images</div>
+              <p class="field-hint" x-text="labs.images_enabled
+                ? '已开启：按区域自动选用模型（国内 hunyuan-image-alpha / 国际 hy-image-3.5），走对应账号池'
+                : '默认关闭；开启后暴露文生图与改图端点，关闭时端点返回 403'"></p>
+            </div>
+            <button type="button" class="switch" :class="{on:!!labs.images_enabled}"
+                    @click="toggleImages()" aria-label="切换生图端点"></button>
+          </div>
+
+          <template x-if="labs.images_enabled">
+            <div>
+              <div class="kv">
+                <span class="k">文生图端点</span>
+                <span class="v"><span class="mono" x-text="imageUrl"></span></span>
+                <button class="btn btn-ghost btn-sm" @click="copy(imageUrl)">复制</button>
+              </div>
+              <div class="kv">
+                <span class="k">改图端点</span>
+                <span class="v"><span class="mono" x-text="imageEditUrl"></span></span>
+                <button class="btn btn-ghost btn-sm" @click="copy(imageEditUrl)">复制</button>
+              </div>
+              <div class="label code-label">调用示例</div>
+              <div class="code-wrap">
+                <button class="btn btn-ghost btn-sm code-copy" @click="copy(imageCurlSample)"
+                        title="复制生图示例" aria-label="复制生图示例">
+                  <span class="ic" x-html="ic('copy')"></span>
+                </button>
+                <pre class="code-block"><code x-text="imageCurlSample"></code></pre>
+              </div>
+              <div class="field-hint code-hint">
+                <div>* 默认返回有效期约 24 小时的腾讯云图片 URL；设 <span class="mono">response_format=b64_json</span> 可转换为 Base64</div>
+                <div>* 一次只生成一张，<span class="mono">n</span> 仅支持 1；国内区 1024x1024 实测消耗 6.8 credits</div>
+                <div>* 改图国内为 <span class="mono">hunyuan-image-alpha-edit</span>，支持 multipart 上传或 data:image Base64 数组；国际区目录暂未下发改图模型</div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <p class="field-hint">实验特性依赖上游非公开接口，可能随时变动、失效或被移除；开关状态保存在 config.json，env <span class="mono">BUDDY2API_EMBEDDINGS_ENABLED</span> / <span class="mono">BUDDY2API_IMAGES_ENABLED</span> 可强制覆盖。</p>
       </section>

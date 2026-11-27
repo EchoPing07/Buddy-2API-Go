@@ -10,7 +10,6 @@ import (
 	_ "time/tzdata" // 内嵌时区库，保证跨平台解析 Asia/Shanghai 等时区
 )
 
-// builtinCraftModels 内置默认模型表，未登录或拉取失败时回退使用。
 var builtinCraftModels = map[string][]string{
 	"cn": {
 		"auto", "hy3", "glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo",
@@ -24,11 +23,26 @@ var builtinCraftModels = map[string][]string{
 	},
 }
 
+// builtinImageModels 各区域已实测的图像模型（拉取 /v3/config 失败或该区无媒体条目时回退）。
+//
+// 国际区目前只见过文生图 hy-image-3.5（参考项目 2026-10-22 实测 200 + credit）；
+// 未见过可用的国际区改图模型，所以不发猜的模型名——改图落空时由目录发现补齐。
+var builtinImageModels = map[string][]ImageModel{
+	"cn": {
+		{ID: ImageGenerationModel, Kind: "text-to-image"},
+		{ID: ImageEditModel, Kind: "image-to-image"},
+	},
+	"global": {
+		{ID: GlobalImageGenerationModel, Kind: "text-to-image"},
+	},
+}
+
 // ModelCache 内存模型列表缓存，失败回退内置默认表。
 type ModelCache struct {
 	mu        sync.RWMutex
 	region    string
 	craft     []string
+	images    []ImageModel
 	models    []ModelInfo
 	promos    []ModelPromotion // 分时段折扣活动（/v3/config modelPromotions）
 	fetchedAt time.Time
@@ -61,6 +75,7 @@ func (mc *ModelCache) Refresh(client *Client) error {
 	defer mc.mu.Unlock()
 	mc.region = region
 	mc.craft = cfg.Craft
+	mc.images = cfg.Images
 	mc.models = cfg.Models
 	mc.promos = cfg.Promotions
 	mc.fetchedAt = time.Now()
@@ -82,6 +97,10 @@ func (mc *ModelCache) applyFallbackLocked(region string) {
 		mc.craft = builtinCraftModels["cn"]
 	}
 	mc.models = nil
+	mc.images = builtinImageModels[region]
+	if mc.images == nil {
+		mc.images = builtinImageModels["cn"]
+	}
 	mc.promos = nil
 	mc.fetchedAt = time.Now()
 	mc.fallback = true
@@ -94,6 +113,52 @@ func (mc *ModelCache) List() []string {
 	out := make([]string, len(mc.craft))
 	copy(out, mc.craft)
 	return out
+}
+
+// ImageModels 返回当前区的图像模型与能力标签（副本）。
+func (mc *ModelCache) ImageModels() []ImageModel {
+	mc.mu.RLock()
+	region, cached := mc.region, mc.images
+	mc.mu.RUnlock()
+	out := make([]ImageModel, len(cached))
+	copy(out, cached)
+	if len(out) == 0 {
+		out = append(out, builtinImageModels[region]...)
+	}
+	return out
+}
+
+// ImageList 返回图像模型 ID（独立于 craft 对话集合）。
+func (mc *ModelCache) ImageList() []string {
+	models := mc.ImageModels()
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		out = append(out, m.ID)
+	}
+	return out
+}
+
+// DefaultImageModel 返回该能力下第一个可用模型；区域未知时按国内实测表回退。
+func DefaultImageModel(models []ImageModel, kind string) string {
+	for _, m := range models {
+		if m.Kind == kind {
+			return m.ID
+		}
+	}
+	for _, m := range builtinImageModels["cn"] {
+		if m.Kind == kind {
+			return m.ID
+		}
+	}
+	return ""
+}
+
+// BuiltinImageModels 返回区域内置图像模型表（调用方在目录为空时回退）。
+func BuiltinImageModels(region string) []ImageModel {
+	if list := builtinImageModels[region]; len(list) > 0 {
+		return list
+	}
+	return builtinImageModels["cn"]
 }
 
 // Models 返回模型详情。

@@ -130,6 +130,8 @@ func main() {
 		r.Use(keys.Authenticate)
 		r.Post("/v1/chat/completions", proxyH.Chat)
 		r.Post("/v1/embeddings", proxyH.Embeddings)
+		r.Post("/v1/images/generations", proxyH.ImagesGenerations)
+		r.Post("/v1/images/edits", proxyH.ImagesEdits)
 		r.Get("/v1/models", proxyH.Models)
 	})
 

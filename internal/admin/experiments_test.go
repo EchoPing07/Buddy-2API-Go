@@ -17,7 +17,7 @@ func TestExperimentsDefaultOff(t *testing.T) {
 		t.Fatalf("GET = %d: %s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, `"embeddings_enabled":false`) {
+	if !strings.Contains(body, `"embeddings_enabled":false`) || !strings.Contains(body, `"images_enabled":false`) {
 		t.Errorf("默认应关闭，得到 %s", body)
 	}
 	for _, legacy := range []string{"pool_enabled", "pool_session_ttl", "pool_max_retry", "pool_cool_max_min", "pool_probe_cron"} {
@@ -36,6 +36,16 @@ func TestPutExperimentsToggle(t *testing.T) {
 		rr := httptest.NewRecorder()
 		h.putExperiments(rr, req)
 		return rr
+	}
+
+	if rr := put(`{"images_enabled":true}`); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"images_enabled":true`) {
+		t.Fatalf("开启生图失败: %d %s", rr.Code, rr.Body.String())
+	}
+	if !h.cfg.Get().ImagesEnabled {
+		t.Error("开启生图后配置未落库")
+	}
+	if rr := put(`{"images_enabled":false}`); rr.Code != http.StatusOK || h.cfg.Get().ImagesEnabled {
+		t.Fatalf("关闭生图失败: %d %s", rr.Code, rr.Body.String())
 	}
 
 	if rr := put(`{"embeddings_enabled":true}`); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"embeddings_enabled":true`) {
@@ -63,7 +73,7 @@ func TestPutExperimentsMissingField(t *testing.T) {
 			t.Errorf("%q 应 400，得到 %d", body, rr.Code)
 		}
 	}
-	if h.cfg.Get().EmbeddingsEnabled {
+	if h.cfg.Get().EmbeddingsEnabled || h.cfg.Get().ImagesEnabled {
 		t.Error("失败请求不得改变开关状态")
 	}
 }
@@ -84,6 +94,16 @@ func TestPutExperimentsEnvLocked(t *testing.T) {
 	}
 	if !h.cfg.Get().EmbeddingsEnabled {
 		t.Error("env 锁定下配置不应被 PUT 关闭")
+	}
+}
+
+func TestPutExperimentsImagesEnvLocked(t *testing.T) {
+	t.Setenv("BUDDY2API_IMAGES_ENABLED", "true")
+	h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+	rr := httptest.NewRecorder()
+	h.putExperiments(rr, httptest.NewRequest(http.MethodPut, "/admin/experiments", strings.NewReader(`{"images_enabled":false}`)))
+	if rr.Code != http.StatusOK || !h.cfg.Get().ImagesEnabled || !strings.Contains(rr.Body.String(), `"images_enabled":true`) {
+		t.Fatalf("env 锁定生图失败: %d %s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -1426,10 +1426,10 @@ func (h *Handler) resourcesAll(w http.ResponseWriter, cfg config.Config, force b
 	accountsSummary := make([]resourceAccountSummary, 0, len(entries))
 	mergedPackages := make([]mergedResourceAccount, 0)
 	var (
-		totalDosage           float64
-		expiring7d            float64
-		globalEarliestExpire  int64
-		latestUpdatedAt       int64
+		totalDosage          float64
+		expiring7d           float64
+		globalEarliestExpire int64
+		latestUpdatedAt      int64
 	)
 
 	for _, e := range entries {
@@ -2415,11 +2415,12 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 // ── 实验特性 ──
 
 // getExperiments 读实验特性开关（GET /admin/experiments）。
-// 多账号调度已升级为原生常驻，此处仅保留 embeddings_enabled。
+// 多账号调度为原生常驻，此处保留可独立关闭的 embeddings/images。
 func (h *Handler) getExperiments(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Get()
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"embeddings_enabled": cfg.EmbeddingsEnabled,
+		"images_enabled":     cfg.ImagesEnabled,
 	})
 }
 
@@ -2428,6 +2429,7 @@ func (h *Handler) getExperiments(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) putExperiments(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		EmbeddingsEnabled *bool `json:"embeddings_enabled"`
+		ImagesEnabled     *bool `json:"images_enabled"`
 		PoolEnabled       any   `json:"pool_enabled"`
 		PoolSessionTTL    any   `json:"pool_session_ttl"`
 		PoolMaxRetry      any   `json:"pool_max_retry"`
@@ -2439,13 +2441,18 @@ func (h *Handler) putExperiments(w http.ResponseWriter, r *http.Request) {
 	}
 	hasLegacyPool := req.PoolEnabled != nil || req.PoolSessionTTL != nil ||
 		req.PoolMaxRetry != nil || req.PoolCoolMaxMin != nil || req.PoolProbeCron != nil
-	if req.EmbeddingsEnabled == nil && !hasLegacyPool {
+	if req.EmbeddingsEnabled == nil && req.ImagesEnabled == nil && !hasLegacyPool {
 		jsonErr(w, http.StatusBadRequest, "未提供任何可修改的字段")
 		return
 	}
-	if req.EmbeddingsEnabled != nil {
+	if req.EmbeddingsEnabled != nil || req.ImagesEnabled != nil {
 		if err := h.cfg.Update(func(c *config.Config) error {
-			c.EmbeddingsEnabled = *req.EmbeddingsEnabled
+			if req.EmbeddingsEnabled != nil {
+				c.EmbeddingsEnabled = *req.EmbeddingsEnabled
+			}
+			if req.ImagesEnabled != nil {
+				c.ImagesEnabled = *req.ImagesEnabled
+			}
 			return nil
 		}); err != nil {
 			jsonErr(w, http.StatusInternalServerError, err.Error())

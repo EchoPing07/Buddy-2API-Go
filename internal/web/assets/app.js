@@ -92,8 +92,8 @@ function appShell(){
     growthBusy:false,           // 上报/领养等长动作锁（与全局 loading 分开：上报要 10s）
     growthRunT:0,               // 总览防抖 timer
     settings:{}, pwForm:{old_password:'',new_password:''},
-    /* 实验特性开关（见 pages/labs.js）：仅保留嵌入端点 */
-    labs:{embeddings_enabled:false},
+    /* 实验特性开关（见 pages/labs.js）：嵌入端点与国内区生图端点 */
+    labs:{embeddings_enabled:false,images_enabled:false},
     models:{models:[],ids:[],state:null,loading:false},
     importModal:false, importMode:'single',
     importForm:{access_token:'',refresh_token:'',domain:'',remark:'',filename:''},

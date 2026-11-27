@@ -42,6 +42,7 @@ func TestWithTokenStore(t *testing.T) {
 	base.MPBaseOverride = "http://mp"
 	base.AuthBaseOverride = "http://auth"
 	base.ChatBaseOverride = "http://chat"
+	base.ConfigBaseOverride = "http://config"
 	base.BillingBaseOverride = "http://billing"
 
 	// nil 返回自身
@@ -67,6 +68,7 @@ func TestWithTokenStore(t *testing.T) {
 		cloned.MPBaseOverride != base.MPBaseOverride ||
 		cloned.AuthBaseOverride != base.AuthBaseOverride ||
 		cloned.ChatBaseOverride != base.ChatBaseOverride ||
+		cloned.ConfigBaseOverride != base.ConfigBaseOverride ||
 		cloned.BillingBaseOverride != base.BillingBaseOverride {
 		t.Errorf("*BaseOverride 字段未完整保留: %+v", cloned)
 	}

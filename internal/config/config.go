@@ -76,6 +76,8 @@ type Config struct {
 	// EmbeddingsEnabled 实验特性：OpenAI 兼容嵌入端点 /v1/embeddings 的总开关，默认关闭。
 	// 管理后台「实验」页切换（PUT /admin/experiments），env BUDDY2API_EMBEDDINGS_ENABLED 可强制。
 	EmbeddingsEnabled bool `json:"embeddings_enabled"`
+	// ImagesEnabled 实验特性：国内区 OpenAI 兼容文生图/改图端点，默认关闭。
+	ImagesEnabled bool `json:"images_enabled"`
 	// ── 号池负载均衡（实验特性，默认关闭）──
 	// 开启后 /v1/chat/completions 分发到全部已存账号；后台任务与余额面板仍走当前活动账号。
 	// 关闭时零行为变化（proxy 侧持 nil Manager，不读档案、不读写池状态表）。
@@ -400,6 +402,7 @@ func Load(dataDir string) (*Manager, error) {
 	envInt("BUDDY2API_LOG_MAX_SIZE_MB", "log_max_size_mb", &cfg.LogMaxSizeMB)
 	envInt("BUDDY2API_CHAT_TIMEOUT_SECONDS", "chat_timeout_seconds", &cfg.ChatTimeoutSeconds)
 	envBool("BUDDY2API_EMBEDDINGS_ENABLED", "embeddings_enabled", &cfg.EmbeddingsEnabled)
+	envBool("BUDDY2API_IMAGES_ENABLED", "images_enabled", &cfg.ImagesEnabled)
 	envBool("BUDDY2API_POOL_ENABLED", "pool_enabled", &cfg.PoolEnabled)
 	envStr("BUDDY2API_POOL_STRATEGY", "pool_strategy", &cfg.PoolStrategy)
 	envInt("BUDDY2API_POOL_SESSION_TTL", "pool_session_ttl", &cfg.PoolSessionTTL)
@@ -556,6 +559,9 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["embeddings_enabled"] {
 		nc.EmbeddingsEnabled = m.cfg.EmbeddingsEnabled
+	}
+	if m.envSets["images_enabled"] {
+		nc.ImagesEnabled = m.cfg.ImagesEnabled
 	}
 	if m.envSets["pool_enabled"] {
 		nc.PoolEnabled = m.cfg.PoolEnabled

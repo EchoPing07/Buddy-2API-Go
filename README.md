@@ -28,7 +28,7 @@
 | 单一活动账号      | 同一时刻只有一份活动凭证（`data/token.json`），OAuth 登录              |
 | 多账号切换       | 登录 / 导入的凭证自动存档到 `data/accounts/`，账号页一键切换（手动，不轮询） |
 | 凭证导入导出      | 导出弹窗可选「当前 / 全部 / 选择」账号，统一输出凭证包；导入分「单个账号」（token.json / 手填 JWT）与「批量导入」（凭证包一次入档，不切换当前账号） |
-| OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/embeddings`（实验，默认关）、`/v1/models`、`/health` |
+| OpenAI 兼容端点 | `/v1/chat/completions`（流式 / 非流式）、`/v1/embeddings`（实验，默认关）、`/v1/images/generations` 与 `/v1/images/edits`（生图实验，默认关，国内/国际均支持）、`/v1/models`、`/health` |
 | 多 API Key   | 随机 / 自定义 Key，支持备注、启停、使用量统计                              |
 | 官方余额        | 实时拉取额度包明细，本地聚合可用额度（剔除周期外幻影/已过期包），官方 TotalDosage 对照展示，标注到期 / 临期，可一键隐藏已用完 / 已过期额度包 |
 | 每日签到        | 独立开关，cron 定时 / 时间范围内随机二选一，失败重试 + 末班兜底，也可手动领取（在「任务」页） |
@@ -265,6 +265,7 @@ curl http://127.0.0.1:10082/v1/embeddings \
 | `BUDDY2API_LOG_MAX_SIZE_MB` | 日志表容量上限 MB（默认 50） |
 | `BUDDY2API_CHAT_TIMEOUT_SECONDS` | chat 上游响应头超时秒数（默认 60，1-3600）。上游自请求发出至开始响应的等待上限，超时即中止本次请求；流式连接建立后（含推理阶段）不再受超时约束。也可在管理后台「设置 → 基本」修改，改后需重启生效 |
 | `BUDDY2API_EMBEDDINGS_ENABLED` | 嵌入端点实验开关强制值（`true`/`false`；设置后管理后台「实验」页的开关不再生效） |
+| `BUDDY2API_IMAGES_ENABLED` | 生图/改图端点实验开关强制值（默认关闭；国内与国际区均可用，env 设置后管理后台开关不再生效） |
 | `BUDDY2API_DATA_DIR` | 数据目录（默认 `./data`） |
 
 指纹头伪装另有 `CB_GATEWAY_USER_AGENT` / `CB_GATEWAY_STAINLESS_OS` 等可选 env（一般无需修改），完整变量见 [.env.example](.env.example)。

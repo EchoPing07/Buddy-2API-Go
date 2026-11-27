@@ -8,7 +8,23 @@
 
 ## [Unreleased]
 
-暂无。
+> 生图实验端点（OpenAI Images 兼容），国内与国际区均支持，默认关闭。
+
+### ✨ 新功能
+
+- **生图实验端点 `/v1/images/generations` 与 `/v1/images/edits`（默认关闭）**。走上游 `POST /v2/images/generations` / `/v2/images/edits`，协议已用国内账号实测（`hunyuan-image-alpha`，1024x1024 约 11 秒返回、6.8 credits）。开关在管理后台「实验」页，env `BUDDY2API_IMAGES_ENABLED` 可强制覆盖；关闭时端点返回 403 `images_disabled`，`/v1/models` 不列生图模型。
+- **生图模型按区域与能力标签发现**：从 `/v3/config` 的 `text-to-image` / `image-to-image` 标签独立取集合，不再只认 `craft` 对话列表，生图模型也不会混进对话模型。目录拉取失败时按区内置表回退——国内 `hunyuan-image-alpha`(-edit)、国际 `hy-image-3.5`。默认模型按能力选（文生图取第一个 `text-to-image`），国际区目录没下发改图模型时**不用国内模型名冒顶**，直接报出可用清单。
+- **生图走账号池并复用同一套错误处置**：额度拒绝（402/14018）、凭证失效（401）、模型限流（429/6004）换号重试；参数错误、审核拒绝、网络与 5xx **不重试**，避免已扣费的请求被重复下发。用量按上游回执写入请求日志与 Key 统计。
+
+### ⚠️ 升级注意
+
+- 生图为实验特性，依赖上游非公开接口，可能随时变动或失效；默认关闭，不开启时零行为变化。
+- 国际区 `hy-image-3.5` 来自同类项目的实测记录，本仓库未用国际账号验证过；若国际区回执的 `usage` 或计费口径与国内不同，`usage` 已按原始 JSON 透传，不会因字段差异失败。
+
+### 🔧 工程与文档
+
+- 新增 `upstream.Client.ConfigBaseOverride`（仅测试用），使 `/v3/config` 发现逻辑可在本地桩上回归，避免用例误触真实上游。
+
 
 ---
 

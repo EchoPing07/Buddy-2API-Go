@@ -34,6 +34,7 @@ type Client struct {
 	MPBaseOverride     string
 	AuthBaseOverride   string
 	ChatBaseOverride   string
+	ConfigBaseOverride string // 模型目录 /v3/config；仅用于本地桩测试
 	// BillingBaseOverride 覆盖 billing 域（余额 / 签到）主机，测试用。
 	BillingBaseOverride string
 }
@@ -586,6 +587,7 @@ type PromoSchedule struct {
 // ModelsConfig /v3/config 解析结果。
 type ModelsConfig struct {
 	Models     []ModelInfo      `json:"models"`     // 全部模型详情
+	Images     []ImageModel     `json:"images"`     // text-to-image / image-to-image（非对话模型）
 	Promotions []ModelPromotion `json:"promotions"` // 分时段折扣活动
 	Craft      []string         `json:"craft"`      // craft agent 可用模型 ID（对话可用集）
 }
@@ -598,7 +600,11 @@ func (c *Client) FetchConfig() (*ModelsConfig, error) {
 	}
 	old := *t
 	old.Domain = orDefault(t.Domain, c.ep().Domain)
-	req, err := http.NewRequest(http.MethodGet, c.ep().Upstream+"/v3/config", nil)
+	base := c.ep().Upstream
+	if c.ConfigBaseOverride != "" {
+		base = c.ConfigBaseOverride
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/v3/config", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -617,9 +623,10 @@ func (c *Client) FetchConfig() (*ModelsConfig, error) {
 		Msg  string `json:"msg"`
 		Data struct {
 			Models []struct {
-				ID      string `json:"id"`
-				Name    string `json:"name"`
-				Credits string `json:"credits"`
+				ID      string   `json:"id"`
+				Name    string   `json:"name"`
+				Credits string   `json:"credits"`
+				Tags    []string `json:"tags"`
 			} `json:"models"`
 			Promotions []ModelPromotion `json:"modelPromotions"`
 			Agents     []struct {
@@ -637,6 +644,12 @@ func (c *Client) FetchConfig() (*ModelsConfig, error) {
 	mc := &ModelsConfig{}
 	for _, m := range env.Data.Models {
 		mc.Models = append(mc.Models, ModelInfo{ID: m.ID, Name: m.Name, Credits: m.Credits})
+		for _, tag := range m.Tags {
+			if tag == "text-to-image" || tag == "image-to-image" {
+				mc.Images = append(mc.Images, ImageModel{ID: m.ID, Kind: tag})
+				break
+			}
+		}
 	}
 	mc.Promotions = env.Data.Promotions
 	for _, a := range env.Data.Agents {
