@@ -80,11 +80,29 @@ type Config struct {
 	// 开启后 /v1/chat/completions 分发到全部已存账号；后台任务与余额面板仍走当前活动账号。
 	// 关闭时零行为变化（proxy 侧持 nil Manager，不读档案、不读写池状态表）。
 	PoolEnabled    bool   `json:"pool_enabled"`
+	PoolStrategy   string `json:"pool_strategy"`     // 号池调度策略："expire_first" | "balanced" | "credits_first"
 	PoolSessionTTL int    `json:"pool_session_ttl"`  // 会话粘性 TTL（分钟，滑动续期），默认 180 = 3h
 	PoolMaxRetry   int    `json:"pool_max_retry"`    // 网关内换号重试上限，默认 2
 	PoolCoolMaxMin int    `json:"pool_cool_max_min"` // 模型冷却截断上限（分钟），默认 360
 	PoolProbeCron  string `json:"pool_probe_cron"`   // 探测 cron（6 段含秒），默认 "0 0 0,6,12,18 * * *"
 	PoolEnabledAt  int64  `json:"pool_enabled_at"`   // 首次开启时间（UI 显示「已运行 N 天」）
+}
+
+// 号池调度策略取值。
+const (
+	PoolStrategyExpireFirst  = "expire_first"
+	PoolStrategyBalanced     = "balanced"
+	PoolStrategyCreditsFirst = "credits_first"
+)
+
+// ValidPoolStrategy 判断是否为合法的号池调度策略。
+func ValidPoolStrategy(s string) bool {
+	switch s {
+	case PoolStrategyExpireFirst, PoolStrategyBalanced, PoolStrategyCreditsFirst:
+		return true
+	default:
+		return false
+	}
 }
 
 // 默认 cron 表达式（defaults() 与 admin 存量兜底共用，避免字面量两处漂移）。
@@ -136,6 +154,7 @@ func defaults() Config {
 		LogRetentionDays:     90,
 		LogMaxSizeMB:         50,
 		ChatTimeoutSeconds:   60,
+		PoolStrategy:         PoolStrategyExpireFirst,
 		PoolSessionTTL:       180,
 		PoolMaxRetry:         2,
 		PoolCoolMaxMin:       360,
@@ -210,6 +229,9 @@ func (c *Config) Normalize() {
 		c.ChatTimeoutSeconds = MaxChatTimeoutSeconds
 	}
 	// 号池参数：envInt 只挡 <=0，超界需重钳（与 ChatTimeoutSeconds 同口径）
+	if !ValidPoolStrategy(c.PoolStrategy) {
+		c.PoolStrategy = d.PoolStrategy
+	}
 	if c.PoolSessionTTL < 5 {
 		c.PoolSessionTTL = d.PoolSessionTTL
 	}
@@ -379,6 +401,7 @@ func Load(dataDir string) (*Manager, error) {
 	envInt("BUDDY2API_CHAT_TIMEOUT_SECONDS", "chat_timeout_seconds", &cfg.ChatTimeoutSeconds)
 	envBool("BUDDY2API_EMBEDDINGS_ENABLED", "embeddings_enabled", &cfg.EmbeddingsEnabled)
 	envBool("BUDDY2API_POOL_ENABLED", "pool_enabled", &cfg.PoolEnabled)
+	envStr("BUDDY2API_POOL_STRATEGY", "pool_strategy", &cfg.PoolStrategy)
 	envInt("BUDDY2API_POOL_SESSION_TTL", "pool_session_ttl", &cfg.PoolSessionTTL)
 	envInt("BUDDY2API_POOL_MAX_RETRY", "pool_max_retry", &cfg.PoolMaxRetry)
 	envInt("BUDDY2API_POOL_COOL_MAX_MIN", "pool_cool_max_min", &cfg.PoolCoolMaxMin)
@@ -395,7 +418,10 @@ func Load(dataDir string) (*Manager, error) {
 	if cfg.GrowthReportJitter > GrowthReportJitterMax {
 		cfg.GrowthReportJitter = GrowthReportJitterMax
 	}
-	// 号池参数同理（envInt 只挡 <=0）
+	// 号池参数同理（envInt 只挡 <=0；非法 strategy 回退默认）
+	if !ValidPoolStrategy(cfg.PoolStrategy) {
+		cfg.PoolStrategy = PoolStrategyExpireFirst
+	}
 	if cfg.PoolSessionTTL > PoolSessionTTLMax {
 		cfg.PoolSessionTTL = PoolSessionTTLMax
 	}
@@ -533,6 +559,9 @@ func (m *Manager) Update(fn func(*Config) error) error {
 	}
 	if m.envSets["pool_enabled"] {
 		nc.PoolEnabled = m.cfg.PoolEnabled
+	}
+	if m.envSets["pool_strategy"] {
+		nc.PoolStrategy = m.cfg.PoolStrategy
 	}
 	if m.envSets["pool_session_ttl"] {
 		nc.PoolSessionTTL = m.cfg.PoolSessionTTL

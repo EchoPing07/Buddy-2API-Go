@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -33,9 +34,8 @@ import (
 // SchedulerControl 由 scheduler 实现：设置变更后重装配定时任务 + 成长任务链手动触发。
 type SchedulerControl interface {
 	Reconfigure()
-	// ResetAccountState 换账号后复位日内状态（内存 + 成长日标志/last_run 镜像）。
-	// 这些状态按日分片而非按账号，不清的话新账号会继承旧账号的「今日已完成」而当天静默跳过；
-	// 镜像必须在 scheduler 内持锁删（原因见 scheduler.ResetAccountState 注释）。
+	// ResetAccountState 换账号后复位旧版无后缀日内状态（内存 + 成长日标志/last_run 镜像）。
+	// 现已全面按 UID 隔离缓存与日内状态，不会清除其他账号的数据。
 	ResetAccountState()
 	RunGrowthChain() scheduler.GrowthChainResult
 	RunTravelTick() scheduler.TravelTickResult
@@ -50,6 +50,26 @@ type taskRunnerProvider interface {
 	Runner() *taskops.Runner
 }
 
+// checkinForScheduler scheduler 可选实现：多账号签到枚举与单号签到。
+type checkinForScheduler interface {
+	EligibleAccountUIDs() []string
+	ClaimCheckinFor(uid string) (credit float64, alreadyChecked bool, err error)
+}
+
+// growthForScheduler scheduler 可选实现：按 UID 执行成长任务链与单项动作。
+type growthForScheduler interface {
+	RunGrowthChainFor(uid string) scheduler.GrowthChainResult
+	RunTravelTickFor(uid string) scheduler.TravelTickResult
+	RunActivityReportsFor(uid string, count int) scheduler.ActivityReportResult
+	RunGrowthAdoptFor(uid string) scheduler.GrowthAdoptResult
+	RunGrowthRedeemFor(uid string, tier string) scheduler.GrowthRedeemActionResult
+}
+
+type uidRunnerEntry struct {
+	ts     *auth.TokenStore
+	runner *taskops.Runner
+}
+
 // Handler 管理后台 API 处理器。
 type Handler struct {
 	cfg     *config.Manager
@@ -61,8 +81,12 @@ type Handler struct {
 	keys    *apikey.Manager
 	sched   SchedulerControl
 	session *Session
-	tasks   *taskops.Runner // 任务动作执行器（New() 中创建，见 tasks.go）
-	// pool 号池（实验特性）。nil = 开关关闭：所有池端点回空视图，不产生任何额外开销。
+	tasks   *taskops.Runner // 主账号任务动作执行器（New() 中创建，见 tasks.go）
+
+	uidRunnersMu sync.Mutex
+	uidRunners   map[string]uidRunnerEntry // 非主账号 per-uid 任务执行器
+
+	// pool 多账号号池管理器（原生常驻）。
 	pool *pool.Manager
 }
 
@@ -103,6 +127,8 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Get("/resources", h.resources)
 			r.Get("/checkin/status", h.checkinStatus)
 			r.Post("/checkin/claim", h.checkinClaim)
+			r.Get("/checkin/summary", h.checkinSummary)
+			r.Post("/checkin/claim_all", h.checkinClaimAll)
 
 			// ── 成长任务（列表 / 接受 / 领奖 / 一键完成 / 扫描 / 补领清扫 / 补偿）──
 			r.Get("/tasks", h.tasksList)
@@ -139,8 +165,9 @@ func (h *Handler) Routes() func(chi.Router) {
 			r.Get("/experiments", h.getExperiments)
 			r.Put("/experiments", h.putExperiments)
 
-			// ── 号池负载均衡（实验特性；开关关闭时回空视图）──
+			// ── 多账号调度 ──
 			r.Get("/pool", h.poolView)
+			r.Put("/pool/strategy", h.poolSetStrategy)
 			r.Post("/pool/accounts/{uid}/disable", h.poolDisable)
 			r.Post("/pool/accounts/{uid}/enable", h.poolEnable)
 			r.Post("/pool/accounts/{uid}/probe", h.poolProbe)
@@ -230,37 +257,125 @@ func (h *Handler) sessionCheck(w http.ResponseWriter, r *http.Request) {
 
 // ── 账号 ──
 
-// invalidateAccountCaches 凭证变更（导入 / 登出 / OAuth 登录）后清掉旧账号的缓存与日内状态。
+// invalidateAccountCaches 切换活动账号后清理旧版无后缀缓存与调度器残留状态。
 //
-// 缓存键都是固定字串（单账号设计），换账号后旧账号的余额/签到/成长会在 TTL 内继续命中，
-// 前端显示上一账号的数据；scheduler 的日内状态还会让新账号继承「今日已完成」而当天跳过定时任务。
-//
-// 只清 admin 自己服务的展示缓存；成长日标志与 last_run 归 scheduler.ResetAccountState()（须持锁删）。
-// checkin_cache/random_target 刻意保留：那是当日随机签到时刻，与账号无关，删了会在同一天重摇。
-//
-// 调用方须先确认真的换了账号（accountSwitched），否则同账号重导当天会重新签到、重报一轮。
+// 现已全面按 UID 隔离余额/签到/成长缓存与日内状态，因此换号不再清其他账号的 scoped 缓存；
+// 此处仅清理历史残留的无后缀键并通知调度器重装配。
 func (h *Handler) invalidateAccountCaches() {
-	// 清缓存失败不阻断换账号（凭证已落盘），但要留痕：静默失败会让新账号读到旧数据。
 	del := func(table, key string) {
 		if err := h.st.DeleteCacheKey(table, key); err != nil {
 			slog.Warn("换账号清理缓存失败", "table", table, "key", key, "error", err)
 		}
 	}
-	// 余额：当前键 + 历史残留键
-	for _, k := range append([]string{resourceCacheKey}, resourceCacheStaleKeys...) {
+	for _, k := range resourceCacheStaleKeys {
 		del("resource_cache", k)
 	}
-	// 签到状态（60s 展示缓存，决定前端「今日已签到」；random_target 保留）
-	del("checkin_cache", "status")
-	// 成长总览（60s 展示缓存；日标志 / last_run 见下）
-	del(growthCacheTable, growthKeyOverview)
-	// 内存日内状态 + 成长日标志/last_run 镜像
+	del(scheduler.CheckinCacheTable, scheduler.CheckinKeyStatus)
+	del(scheduler.GrowthCacheTable, growthKeyOverview)
+	del(scheduler.GrowthCacheTable, scheduler.GrowthKeyOverview)
 	if h.sched != nil {
 		h.sched.ResetAccountState()
-		// 复位后重装配：ResetAccountState 已清掉 report_day，growthCatchupDue 才会判定
-		// 「今日未上报」并排 30s 后的补跑。顺序不可颠倒，否则补跑排不上。
 		h.sched.Reconfigure()
 	}
+}
+
+// clearAccountCaches 删除指定账号的全部 per-uid 缓存，并释放其非主账号 runner。
+// includeRandomTarget=true 时连带清除当日随机签到时刻（删除账号档案用）；
+// 退出登录主账号时保留 random_target（同日重登不重摇）。
+func (h *Handler) clearAccountCaches(uid string, includeRandomTarget bool) {
+	if uid == "" {
+		return
+	}
+	del := func(table, key string) {
+		if err := h.st.DeleteCacheKey(table, key); err != nil {
+			slog.Warn("清理账号缓存失败", "uid", uid, "table", table, "key", key, "error", err)
+		}
+	}
+	del("resource_cache", resourceCacheKey(uid))
+	del(scheduler.CheckinCacheTable, scheduler.CheckinStatusKey(uid))
+	if includeRandomTarget {
+		del(scheduler.CheckinCacheTable, scheduler.CheckinRandomTargetKey(uid))
+	}
+	del(scheduler.GrowthCacheTable, scheduler.GrowthOverviewKey(uid))
+	del(scheduler.GrowthCacheTable, scheduler.GrowthReportDayKey(uid))
+	del(scheduler.GrowthCacheTable, scheduler.GrowthAdoptDayKey(uid))
+	del(scheduler.GrowthCacheTable, scheduler.GrowthRewardDayKey(uid))
+	del(scheduler.GrowthCacheTable, scheduler.GrowthLastRunKey(uid))
+	del(scheduler.GrowthCacheTable, scheduler.TaskLastSweepKey(uid))
+	del(scheduler.GrowthCacheTable, scheduler.TaskLastQueueKey(uid))
+
+	h.uidRunnersMu.Lock()
+	delete(h.uidRunners, uid)
+	h.uidRunnersMu.Unlock()
+}
+
+// regionMatches 与 pool.regionMatches 保持一致：空域视为兼容匹配。
+func regionMatches(domain, regionDomain string) bool {
+	return domain == "" || domain == regionDomain
+}
+
+// accountDisplayLabel 返回账号展示名：优先 remark，其次 nickname，回退 uid 后 8 位。
+func accountDisplayLabel(t *auth.Token) string {
+	if t == nil {
+		return "未命名"
+	}
+	if t.Remark != "" {
+		return t.Remark
+	}
+	if t.Nickname != "" {
+		return t.Nickname
+	}
+	if len(t.UID) <= 8 {
+		if t.UID != "" {
+			return t.UID
+		}
+		return "未命名"
+	}
+	return "…" + t.UID[len(t.UID)-8:]
+}
+
+// resolveUIDClient 按 ?uid= 解析目标账号的 client 与凭证：
+//   - uid 为空或 "active"：返回当前主账号（found=false 表示未登录）；
+//   - uid 非空：支持原始 UID 与档案 ID（m.ID = h_<hex>），校验存在于号池（或池未挂载时匹配主账号）。
+func (h *Handler) resolveUIDClient(uid string) (targetUID string, cli *upstream.Client, tok *auth.Token, found bool) {
+	uid = strings.TrimSpace(uid)
+	active := h.toks.Get()
+	if uid == "" || uid == "active" {
+		if active == nil {
+			return "", h.client, nil, false
+		}
+		return active.UID, h.client, active, true
+	}
+	lookupRaw := func(raw string) (string, *upstream.Client, *auth.Token, bool) {
+		if h.pool != nil {
+			ts, err := h.pool.TokenStore(raw)
+			if err != nil || ts == nil {
+				return raw, nil, nil, false
+			}
+			t := ts.Get()
+			if t == nil {
+				return raw, nil, nil, false
+			}
+			if active != nil && active.UID == raw {
+				return raw, h.client, t, true
+			}
+			return raw, h.client.WithTokenStore(ts), t, true
+		}
+		if active != nil && active.UID == raw {
+			return raw, h.client, active, true
+		}
+		return raw, nil, nil, false
+	}
+	if target, c, t, ok := lookupRaw(uid); ok {
+		return target, c, t, true
+	}
+	// 兼容传入档案 ID（如含 . / @ / : 的 UID 编码为 h_<hex>）
+	if archived, err := h.accountBook().Load(uid); err == nil && archived != nil && archived.UID != "" && archived.UID != uid {
+		if target, c, t, ok := lookupRaw(archived.UID); ok {
+			return target, c, t, true
+		}
+	}
+	return uid, nil, nil, false
 }
 
 // accountSwitched 判定本次凭证写入是否真的换了账号。
@@ -349,6 +464,9 @@ func (h *Handler) oauthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.archiveAccount(tok) // 扫码得到的账号自动入档，切换列表里才看得到
+	if h.pool != nil {
+		h.pool.ReloadMembers()
+	}
 	if accountSwitched(prev, tok) {
 		// 真的换了账号才清；同一账号重新扫码不该丢掉今日「已上报」（见 accountSwitched）
 		h.invalidateAccountCaches()
@@ -395,6 +513,9 @@ func (h *Handler) accountDelete(w http.ResponseWriter, r *http.Request) {
 	// 也让「登出后不该再用这个号」的预期失效。
 	if h.pool != nil && clearedUID != "" {
 		h.pool.DeleteAccount(clearedUID)
+	}
+	if clearedUID != "" {
+		h.clearAccountCaches(clearedUID, false)
 	}
 	h.invalidateAccountCaches()
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
@@ -582,6 +703,7 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 		}
 		if h.pool != nil {
 			h.pool.SetAccountRemark(t.UID, t.Remark)
+			h.pool.ReloadMembers()
 		}
 		jsonWrite(w, http.StatusOK, map[string]any{
 			"ok":       true,
@@ -600,6 +722,7 @@ func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
 	h.archiveAccount(t) // 导入的账号同样入档
 	if h.pool != nil {
 		h.pool.SetAccountRemark(t.UID, t.Remark)
+		h.pool.ReloadMembers()
 	}
 	if accountSwitched(prev, t) {
 		// 同账号重导不清，否则今日上报会按新会话再发一轮（见 accountSwitched）
@@ -784,6 +907,9 @@ func (h *Handler) accountImportBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	// 全部失败时给 400：前端就能用统一的错误气泡，而不是弹一个「成功」再列全红。
 	// 部分成功则以 200 + 逐条结果返回，前端展示明细。
+	if imported > 0 && h.pool != nil {
+		h.pool.ReloadMembers()
+	}
 	status := http.StatusOK
 	if imported == 0 {
 		status = http.StatusBadRequest
@@ -834,27 +960,33 @@ func (h *Handler) existingRemark(uid string, active *auth.Token) string {
 
 // accountItem 账号列表项（不含任何凭证）。
 type accountItem struct {
-	UID          string `json:"uid"`
-	Nickname     string `json:"nickname"`
-	Remark       string `json:"remark"`
-	Domain       string `json:"domain"`
-	ExpiresAt    int64  `json:"expires_at"`
-	ExpiresHuman string `json:"expires_human"`
-	Expired      bool   `json:"expired"`
-	Active       bool   `json:"active"`
-	RegionMatch  bool   `json:"region_match"`
-	// 号池只读字段（开关关闭时恒为默认值）。放在列表里是为了让账号页
-	// 不必为一个开关多拉一次 /admin/pool 才能显示"这个号在池里但被禁用了"。
-	InPool           bool   `json:"in_pool"`
-	PoolAvailable    bool   `json:"pool_available"`
-	PoolAutoDisabled string `json:"pool_auto_disabled"`
+	UID              string  `json:"uid"`
+	RawUID           string  `json:"raw_uid"`
+	Nickname         string  `json:"nickname"`
+	Remark           string  `json:"remark"`
+	Domain           string  `json:"domain"`
+	EnterpriseID     string  `json:"enterprise_id"`
+	HasRefresh       bool    `json:"has_refresh"`
+	ExpiresAt        int64   `json:"expires_at"`
+	ExpiresHuman     string  `json:"expires_human"`
+	Expired          bool    `json:"expired"`
+	Active           bool    `json:"active"`
+	RegionMatch      bool    `json:"region_match"`
+	InPool           bool    `json:"in_pool"`
+	PoolAvailable    bool    `json:"pool_available"`
+	PoolAutoDisabled string  `json:"pool_auto_disabled"`
+	Credits          float64 `json:"credits"`
+	CreditsAt        int64   `json:"credits_at"`
+	EarliestExpireAt int64   `json:"earliest_expire_at"`
+	ExpiringCredits  float64 `json:"expiring_credits"`
 }
 
 // newAccountItem 元信息 → 列表项。active 为当前 token.json（nil = 未登录）。
 func newAccountItem(m auth.AccountMeta, active *auth.Token, regionDomain string) accountItem {
 	t := auth.Token{ExpiresAt: m.ExpiresAt}
-	return accountItem{
+	item := accountItem{
 		UID:          m.ID,
+		RawUID:       m.UID,
 		Nickname:     m.Nickname,
 		Remark:       m.Remark,
 		Domain:       m.Domain,
@@ -862,7 +994,34 @@ func newAccountItem(m auth.AccountMeta, active *auth.Token, regionDomain string)
 		ExpiresHuman: t.ExpiresInHuman(),
 		Expired:      t.IsExpired(),
 		Active:       active != nil && active.UID == m.UID,
-		RegionMatch:  m.Domain == regionDomain,
+		RegionMatch:  regionMatches(m.Domain, regionDomain),
+	}
+	if item.Active && active != nil {
+		item.EnterpriseID = active.EnterpriseID
+		item.HasRefresh = active.RefreshToken != ""
+	}
+	return item
+}
+
+// enrichAccountPoolInfo 从号池填充账号的调度状态、额度摘要与凭证元信息（无开关门控）。
+func (h *Handler) enrichAccountPoolInfo(item *accountItem, uid string) {
+	if h.pool == nil {
+		return
+	}
+	if st, ok := h.pool.AccountStateOf(uid); ok {
+		item.InPool = true
+		item.PoolAvailable = st.Available()
+		item.PoolAutoDisabled = st.AutoDisabled
+		item.Credits = st.Credits
+		item.CreditsAt = st.CreditsAt
+		item.EarliestExpireAt = st.EarliestExpireAt
+		item.ExpiringCredits = st.ExpiringCredits
+	}
+	if ts, err := h.pool.TokenStore(uid); err == nil && ts != nil {
+		if t := ts.Get(); t != nil {
+			item.EnterpriseID = t.EnterpriseID
+			item.HasRefresh = t.RefreshToken != ""
+		}
 	}
 }
 
@@ -887,13 +1046,7 @@ func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
 	items := make([]accountItem, 0, len(metas))
 	for _, m := range metas {
 		item := newAccountItem(m, active, regionDomain)
-		if h.pool != nil && h.cfg.Get().PoolEnabled {
-			if st, ok := h.pool.AccountStateOf(m.UID); ok {
-				item.InPool = true
-				item.PoolAvailable = st.Available()
-				item.PoolAutoDisabled = st.AutoDisabled
-			}
-		}
+		h.enrichAccountPoolInfo(&item, m.UID)
 		items = append(items, item)
 	}
 	// 当前账号置顶（List 已按 SavedAt 倒序，但刚归档的旧账号会排到前面）。
@@ -1004,13 +1157,9 @@ func (h *Handler) updateAccountProfile(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt: t.ExpiresAt,
 		SavedAt:   t.SavedAt,
 	}, active, regionDomain)
-	if h.pool != nil && h.cfg.Get().PoolEnabled {
-		if st, ok := h.pool.AccountStateOf(t.UID); ok {
-			item.InPool = true
-			item.PoolAvailable = st.Available()
-			item.PoolAutoDisabled = st.AutoDisabled
-		}
-	}
+	item.EnterpriseID = t.EnterpriseID
+	item.HasRefresh = t.RefreshToken != ""
+	h.enrichAccountPoolInfo(&item, t.UID)
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"uid":     item.UID,
@@ -1042,11 +1191,12 @@ func (h *Handler) deleteAccountProfile(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusInternalServerError, "删除账号档案失败: "+err.Error())
 		return
 	}
-	// 一并清掉池状态：否则删了号又重新导入同一个账号，会继承旧的
-	// 「额度耗尽」标记而立刻被跳过（pool_account_state 是独立于档案的）。
+	// 一并清掉池状态与该账号全部 scoped 缓存：否则删了号又重新导入同一个账号，
+	// 会继承旧的「额度耗尽」标记或陈旧缓存。
 	if h.pool != nil {
 		h.pool.DeleteAccount(t.UID)
 	}
+	h.clearAccountCaches(t.UID, true)
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1074,6 +1224,7 @@ type resourceAccount struct {
 	AutoRenewFlag  any     `json:"auto_renew_flag"`
 	Status         any     `json:"status"`
 	ExpireTime     string  `json:"expire_time"`
+	ExpireAt       int64   `json:"expire_at"` // Unix 秒；0 = 未知
 	DaysLeft       *int    `json:"days_left"` // nil = 未知
 	Expired        bool    `json:"expired"`
 	Warn           string  `json:"warn"` // "7d" | "30d" | ""
@@ -1082,6 +1233,28 @@ type resourceAccount struct {
 	// 故以内容指纹为键（内容相同的包渲染等价，允许重复）。不可用数组下标：
 	// 前端「隐藏已用完」过滤数组后，Alpine 会按下标复用 DOM 节点，导致卡片内容错位。
 	Key string `json:"key"`
+}
+
+// mergedResourceAccount 全部账号聚合模式下的额度包明细（附加所属账号）。
+type mergedResourceAccount struct {
+	resourceAccount
+	AccountUID   string `json:"account_uid"`
+	AccountLabel string `json:"account_label"`
+}
+
+// resourceAccountSummary 全部账号聚合模式下的单账号摘要。
+type resourceAccountSummary struct {
+	UID              string  `json:"uid"`
+	Label            string  `json:"label"`
+	Nickname         string  `json:"nickname"`
+	Remark           string  `json:"remark"`
+	Active           bool    `json:"active"`
+	RegionMatch      bool    `json:"region_match"`
+	TotalDosage      float64 `json:"total_dosage"`
+	EarliestExpireAt int64   `json:"earliest_expire_at"`
+	ExpiringCredits  float64 `json:"expiring_credits"`
+	UpdatedAt        int64   `json:"updated_at"`
+	Error            string  `json:"error,omitempty"`
 }
 
 // resourceAccountKey 由额度包展示字段计算稳定指纹，用作前端 x-for 的 :key。
@@ -1115,41 +1288,299 @@ func resourceAccountKey(a resourceAccount) string {
 	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
-// resourceCacheKey 余额缓存键版本：缓存内容为加工后结构，新增或修改字段必须提升版本，
-// 否则会命中旧行、向前端返回缺字段的数据。历史变更：v1→v2 total_dosage 改为本地聚合
-// （旧口径按账户级 Remain 统计）；v2→v3 每个额度包新增稳定标识 key（前端 x-for 的 :key）。
-const resourceCacheKey = "default_v3"
+// resourceCacheKey 构造 per-uid 余额缓存键（v4 新增 expire_at 且按 uid 隔离）。
+func resourceCacheKey(uid string) string {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return "v4:default"
+	}
+	return "v4:" + uid
+}
 
-// resourceCacheStaleKeys 升级时一并清理的旧缓存键；缓存表无清理任务，不删除则永久残留（删除操作幂等）。
-var resourceCacheStaleKeys = []string{"default", "default_v2"}
+// resourceCacheStaleKeys 升级时一并清理的旧版全局缓存键；删除操作幂等。
+var resourceCacheStaleKeys = []string{"default", "default_v2", "default_v3"}
+
+func (h *Handler) writeResourceCache(uid string, processed map[string]any) {
+	if raw, err := json.Marshal(processed); err == nil {
+		_ = h.st.SetCache("resource_cache", resourceCacheKey(uid), string(raw))
+	}
+	for _, stale := range resourceCacheStaleKeys {
+		_ = h.st.DeleteCacheKey("resource_cache", stale)
+	}
+}
 
 func (h *Handler) resources(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Get()
 	force := r.URL.Query().Get("force") == "1"
-	table, key := "resource_cache", resourceCacheKey
+	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
 
+	if uid == "all" {
+		h.resourcesAll(w, cfg, force)
+		return
+	}
+
+	var (
+		targetUID string
+		label     string
+		cli       *upstream.Client
+	)
+	if uid == "" || uid == "active" {
+		t := h.toks.Get()
+		if t != nil {
+			targetUID = t.UID
+			label = accountDisplayLabel(t)
+		}
+		cli = h.client
+	} else {
+		var t *auth.Token
+		var found bool
+		targetUID, cli, t, found = h.resolveUIDClient(uid)
+		if !found {
+			jsonErr(w, http.StatusNotFound, "账号不存在")
+			return
+		}
+		label = accountDisplayLabel(t)
+	}
+
+	key := resourceCacheKey(targetUID)
 	if !force {
-		if payload, updatedAt, ok := h.st.GetCache(table, key, cfg.ResourceCacheSeconds); ok {
+		if payload, updatedAt, ok := h.st.GetCache("resource_cache", key, cfg.ResourceCacheSeconds); ok {
 			var parsed any
 			_ = json.Unmarshal([]byte(payload), &parsed)
-			jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "data": parsed})
+			jsonWrite(w, http.StatusOK, map[string]any{
+				"mode":       "single",
+				"cached":     true,
+				"updated_at": updatedAt,
+				"uid":        targetUID,
+				"label":      label,
+				"data":       parsed,
+			})
 			return
 		}
 	}
-	res, err := h.client.Resources()
+	res, err := cli.Resources()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	now := time.Now()
 	processed := processResources(res.Raw)
-	// 缓存与返回同为加工后结构，保证命中缓存时前端形状一致
-	if raw, err := json.Marshal(processed); err == nil {
-		_ = h.st.SetCache(table, key, string(raw))
+	h.writeResourceCache(targetUID, processed)
+	if h.pool != nil && targetUID != "" {
+		h.pool.UpdateQuotaFromResource(targetUID, billing.QuotaSummary(res.Data), now.Unix())
 	}
-	for _, stale := range resourceCacheStaleKeys {
-		_ = h.st.DeleteCacheKey(table, stale)
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"mode":       "single",
+		"cached":     false,
+		"updated_at": now.Unix(),
+		"uid":        targetUID,
+		"label":      label,
+		"data":       processed,
+	})
+}
+
+func (h *Handler) resourcesAll(w http.ResponseWriter, cfg config.Config, force bool) {
+	type targetEntry struct {
+		uid    string
+		tok    *auth.Token
+		cli    *upstream.Client
+		active bool
 	}
-	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "data": processed})
+	regionDomain := config.EndpointOf(cfg.Region).Domain
+	active := h.toks.Get()
+	activeUID := ""
+	if active != nil {
+		activeUID = active.UID
+	}
+
+	var entries []targetEntry
+	if h.pool != nil {
+		for _, mUID := range h.pool.Members() {
+			ts, err := h.pool.TokenStore(mUID)
+			if err != nil || ts == nil {
+				continue
+			}
+			t := ts.Get()
+			if t == nil || !regionMatches(t.Domain, regionDomain) {
+				continue
+			}
+			cli := h.client
+			if mUID != activeUID {
+				cli = h.client.WithTokenStore(ts)
+			}
+			entries = append(entries, targetEntry{
+				uid: mUID, tok: t, cli: cli, active: mUID == activeUID,
+			})
+		}
+	} else if active != nil && regionMatches(active.Domain, regionDomain) {
+		entries = append(entries, targetEntry{
+			uid: active.UID, tok: active, cli: h.client, active: true,
+		})
+	}
+	// 主账号排在最前，其余保持成员序。
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].active && !entries[j].active
+	})
+
+	now := time.Now()
+	accountsSummary := make([]resourceAccountSummary, 0, len(entries))
+	mergedPackages := make([]mergedResourceAccount, 0)
+	var (
+		totalDosage           float64
+		expiring7d            float64
+		globalEarliestExpire  int64
+		latestUpdatedAt       int64
+	)
+
+	for _, e := range entries {
+		label := accountDisplayLabel(e.tok)
+		sumItem := resourceAccountSummary{
+			UID:         e.uid,
+			Label:       label,
+			Nickname:    e.tok.Nickname,
+			Remark:      e.tok.Remark,
+			Active:      e.active,
+			RegionMatch: true,
+		}
+
+		var (
+			pkgs      []resourceAccount
+			acctTotal float64
+			acctSum   billing.Summary
+			updatedAt int64
+			gotCache  bool
+		)
+		if !force {
+			if payload, uAt, ok := h.st.GetCache("resource_cache", resourceCacheKey(e.uid), cfg.ResourceCacheSeconds); ok {
+				var parsed struct {
+					TotalDosage float64           `json:"total_dosage"`
+					Accounts    []resourceAccount `json:"accounts"`
+				}
+				if err := json.Unmarshal([]byte(payload), &parsed); err == nil {
+					pkgs = parsed.Accounts
+					acctTotal = parsed.TotalDosage
+					acctSum = summarizeResourcePackages(pkgs, acctTotal, now)
+					updatedAt = uAt
+					gotCache = true
+				}
+			}
+		}
+
+		if !gotCache {
+			res, err := e.cli.Resources()
+			if err != nil {
+				sumItem.Error = err.Error()
+				accountsSummary = append(accountsSummary, sumItem)
+				continue
+			}
+			fetchAt := time.Now()
+			processed := processResources(res.Raw)
+			h.writeResourceCache(e.uid, processed)
+			acctSum = billing.QuotaSummary(res.Data)
+			if h.pool != nil {
+				h.pool.UpdateQuotaFromResource(e.uid, acctSum, fetchAt.Unix())
+			}
+			if rawPkgs, ok := processed["accounts"].([]resourceAccount); ok {
+				pkgs = rawPkgs
+			}
+			if td, ok := processed["total_dosage"].(float64); ok {
+				acctTotal = td
+			} else {
+				acctTotal = acctSum.Total
+			}
+			updatedAt = fetchAt.Unix()
+		}
+
+		sumItem.TotalDosage = math.Round(acctTotal*100) / 100
+		sumItem.EarliestExpireAt = acctSum.EarliestExpireAt
+		sumItem.ExpiringCredits = acctSum.ExpiringCredits
+		sumItem.UpdatedAt = updatedAt
+		accountsSummary = append(accountsSummary, sumItem)
+
+		totalDosage += sumItem.TotalDosage
+		if updatedAt > latestUpdatedAt {
+			latestUpdatedAt = updatedAt
+		}
+		if acctSum.EarliestExpireAt > 0 && (globalEarliestExpire == 0 || acctSum.EarliestExpireAt < globalEarliestExpire) {
+			globalEarliestExpire = acctSum.EarliestExpireAt
+		}
+		for _, pkg := range pkgs {
+			merged := mergedResourceAccount{
+				resourceAccount: pkg,
+				AccountUID:      e.uid,
+				AccountLabel:    label,
+			}
+			// 全部模式下同一额度包可能在不同账号间指纹相同，叠加 uid 保证 Alpine :key 全局唯一。
+			merged.Key = e.uid + ":" + pkg.Key
+			if !pkg.Expired && pkg.CapacityRemain > 0 && pkg.DaysLeft != nil && *pkg.DaysLeft <= 7 {
+				expiring7d += pkg.CapacityRemain
+			}
+			mergedPackages = append(mergedPackages, merged)
+		}
+	}
+
+	sort.SliceStable(mergedPackages, func(i, j int) bool {
+		ei, ej := mergedPackages[i].ExpireAt, mergedPackages[j].ExpireAt
+		switch {
+		case ei == 0 && ej == 0:
+			return false
+		case ei == 0:
+			return false // 无到期时间排最后
+		case ej == 0:
+			return true
+		default:
+			return ei < ej
+		}
+	})
+	if latestUpdatedAt == 0 && len(entries) > 0 {
+		latestUpdatedAt = now.Unix()
+	}
+
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"mode":               "all",
+		"updated_at":         latestUpdatedAt,
+		"total_dosage":       math.Round(totalDosage*100) / 100,
+		"expiring_7d":        math.Round(expiring7d*100) / 100,
+		"earliest_expire_at": globalEarliestExpire,
+		"accounts_summary":   accountsSummary,
+		"accounts":           mergedPackages,
+	})
+}
+
+// summarizeResourcePackages 从已加工的 resourceAccount 切片推导 CST 到期摘要（缓存命中时复用）。
+func summarizeResourcePackages(pkgs []resourceAccount, total float64, now time.Time) billing.Summary {
+	sum := billing.Summary{Total: math.Round(total*100) / 100}
+	for _, p := range pkgs {
+		if p.CapacityRemain <= 0 || p.ExpireAt <= 0 {
+			continue
+		}
+		et := time.Unix(p.ExpireAt, 0)
+		if et.Before(now) {
+			continue
+		}
+		if sum.EarliestExpireAt == 0 || p.ExpireAt < sum.EarliestExpireAt {
+			sum.EarliestExpireAt = p.ExpireAt
+		}
+	}
+	if sum.EarliestExpireAt == 0 {
+		return sum
+	}
+	earliestDay := time.Unix(sum.EarliestExpireAt, 0).In(billing.TZ).Format("2006-01-02")
+	var expiring float64
+	for _, p := range pkgs {
+		if p.CapacityRemain <= 0 || p.ExpireAt <= 0 {
+			continue
+		}
+		et := time.Unix(p.ExpireAt, 0)
+		if et.Before(now) {
+			continue
+		}
+		if et.In(billing.TZ).Format("2006-01-02") == earliestDay {
+			expiring += p.CapacityRemain
+		}
+	}
+	sum.ExpiringCredits = math.Round(expiring*100) / 100
+	return sum
 }
 
 // processResources 解包 data.Response.Data 并本地加工。
@@ -1210,6 +1641,7 @@ func processResources(raw json.RawMessage) map[string]any {
 			disp, et, ok := resolveExpireTime(acc)
 			a.ExpireTime = disp
 			if ok {
+				a.ExpireAt = et.Unix()
 				days := int(et.Sub(now).Hours() / 24)
 				a.DaysLeft = &days
 				a.Expired = et.Before(now)
@@ -1263,41 +1695,293 @@ func processResources(raw json.RawMessage) map[string]any {
 
 // ── 签到 ──
 
-func (h *Handler) checkinStatus(w http.ResponseWriter, r *http.Request) {
-	// 附带今日随机签到时刻（random 模式下由调度器生成并缓存，重启不重摇）
-	randomTarget := ""
-	if payload, _, ok := h.st.GetCache("checkin_cache", "random_target", 48*3600); ok {
+func (h *Handler) checkinRandomTarget(uid string) string {
+	key := scheduler.CheckinRandomTargetKey(uid)
+	if payload, _, ok := h.st.GetCache(scheduler.CheckinCacheTable, key, 48*3600); ok {
 		if t, err := time.Parse(time.RFC3339, payload); err == nil && t.Format("2006-01-02") == time.Now().Format("2006-01-02") {
-			randomTarget = t.Format("15:04")
+			return t.Format("15:04")
 		}
 	}
-	// 优先读缓存（60s），避免高频查询
-	if payload, updatedAt, ok := h.st.GetCache("checkin_cache", "status", 60); ok {
+	return ""
+}
+
+func (h *Handler) checkinStatus(w http.ResponseWriter, r *http.Request) {
+	reqUID := strings.TrimSpace(r.URL.Query().Get("uid"))
+	var (
+		targetUID string
+		cli       *upstream.Client
+	)
+	if reqUID == "" {
+		if t := h.toks.Get(); t != nil {
+			targetUID = t.UID
+		}
+		cli = h.client
+	} else {
+		var found bool
+		targetUID, cli, _, found = h.resolveUIDClient(reqUID)
+		if !found {
+			jsonErr(w, http.StatusNotFound, "账号不存在")
+			return
+		}
+	}
+
+	randomTarget := h.checkinRandomTarget(targetUID)
+	statusKey := scheduler.CheckinStatusKey(targetUID)
+	// 优先读缓存（60s），避免高频查询；同时兼容旧版无后缀键（仅无 uid 参数时回退）
+	if payload, updatedAt, ok := h.st.GetCache(scheduler.CheckinCacheTable, statusKey, 60); ok {
 		var parsed any
 		_ = json.Unmarshal([]byte(payload), &parsed)
-		jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "random_target": randomTarget, "data": parsed})
+		jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "uid": targetUID, "random_target": randomTarget, "data": parsed})
 		return
 	}
-	res, err := h.client.CheckinStatus()
+	if reqUID == "" && statusKey != scheduler.CheckinKeyStatus {
+		if payload, updatedAt, ok := h.st.GetCache(scheduler.CheckinCacheTable, scheduler.CheckinKeyStatus, 60); ok {
+			var parsed any
+			_ = json.Unmarshal([]byte(payload), &parsed)
+			jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "uid": targetUID, "random_target": randomTarget, "data": parsed})
+			return
+		}
+	}
+
+	res, err := cli.CheckinStatus()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	_ = h.st.SetCache("checkin_cache", "status", string(res.Raw))
+	_ = h.st.SetCache(scheduler.CheckinCacheTable, statusKey, string(res.Raw))
 	var parsed any
 	_ = json.Unmarshal(res.Raw, &parsed)
-	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "random_target": randomTarget, "data": parsed})
+	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "uid": targetUID, "random_target": randomTarget, "data": parsed})
 }
 
 func (h *Handler) checkinClaim(w http.ResponseWriter, r *http.Request) {
-	res, err := h.client.ClaimCheckin()
+	reqUID := strings.TrimSpace(r.URL.Query().Get("uid"))
+	var (
+		targetUID string
+		cli       *upstream.Client
+	)
+	if reqUID == "" {
+		if t := h.toks.Get(); t != nil {
+			targetUID = t.UID
+		}
+		cli = h.client
+	} else {
+		var found bool
+		targetUID, cli, _, found = h.resolveUIDClient(reqUID)
+		if !found {
+			jsonErr(w, http.StatusNotFound, "账号不存在")
+			return
+		}
+	}
+	res, err := cli.ClaimCheckin()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// 清掉状态缓存，确保前端紧接着 loadCheckin/loadCheckinSummary 拿到最新的 today_checked_in / streak_days。
+	_ = h.st.DeleteCacheKey(scheduler.CheckinCacheTable, scheduler.CheckinStatusKey(targetUID))
+	if reqUID == "" {
+		_ = h.st.DeleteCacheKey(scheduler.CheckinCacheTable, scheduler.CheckinKeyStatus)
+	}
 	var parsed any
 	_ = json.Unmarshal(res.Raw, &parsed)
-	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "data": parsed})
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "uid": targetUID, "data": parsed})
+}
+
+type checkinSummaryItem struct {
+	UID         string  `json:"uid"`
+	Label       string  `json:"label"`
+	Active      bool    `json:"active"`
+	RegionMatch bool    `json:"region_match"`
+	CheckedIn   bool    `json:"checked_in"`
+	TodayCredit float64 `json:"today_credit"`
+	StreakDays  int     `json:"streak_days"`
+	Error       string  `json:"error,omitempty"`
+}
+
+type checkinSummaryResp struct {
+	Items        []checkinSummaryItem `json:"items"`
+	CheckedCount int                  `json:"checked_count"`
+	TotalCount   int                  `json:"total_count"`
+}
+
+func (h *Handler) eligibleCheckinUIDs() []string {
+	if cs, ok := h.sched.(checkinForScheduler); ok {
+		return cs.EligibleAccountUIDs()
+	}
+	regionDomain := config.EndpointOf(h.cfg.Get().Region).Domain
+	if h.pool != nil {
+		var out []string
+		for _, uid := range h.pool.Members() {
+			ts, err := h.pool.TokenStore(uid)
+			if err != nil || ts == nil || ts.Get() == nil {
+				continue
+			}
+			if st, ok := h.pool.AccountStateOf(uid); ok && st.AutoDisabled == pool.AutoCredential {
+				continue
+			}
+			if t := ts.Get(); !regionMatches(t.Domain, regionDomain) {
+				continue
+			}
+			out = append(out, uid)
+		}
+		return out
+	}
+	if t := h.toks.Get(); t != nil && regionMatches(t.Domain, regionDomain) && t.UID != "" {
+		return []string{t.UID}
+	}
+	return nil
+}
+
+func (h *Handler) buildCheckinSummary() checkinSummaryResp {
+	uids := h.eligibleCheckinUIDs()
+	regionDomain := config.EndpointOf(h.cfg.Get().Region).Domain
+	active := h.toks.Get()
+	activeUID := ""
+	if active != nil {
+		activeUID = active.UID
+	}
+
+	items := make([]checkinSummaryItem, 0, len(uids))
+	checkedCount := 0
+	for _, uid := range uids {
+		_, cli, t, ok := h.resolveUIDClient(uid)
+		if !ok || t == nil {
+			continue
+		}
+		item := checkinSummaryItem{
+			UID:         uid,
+			Label:       accountDisplayLabel(t),
+			Active:      uid == activeUID,
+			RegionMatch: regionMatches(t.Domain, regionDomain),
+		}
+		statusKey := scheduler.CheckinStatusKey(uid)
+		var raw []byte
+		if payload, _, hit := h.st.GetCache(scheduler.CheckinCacheTable, statusKey, 60); hit && payload != "" {
+			raw = []byte(payload)
+		} else {
+			res, err := cli.CheckinStatus()
+			if err != nil {
+				item.Error = err.Error()
+				items = append(items, item)
+				continue
+			}
+			raw = res.Raw
+			_ = h.st.SetCache(scheduler.CheckinCacheTable, statusKey, string(raw))
+		}
+		var env struct {
+			Data struct {
+				TodayCheckedIn bool    `json:"today_checked_in"`
+				TodayCredit    float64 `json:"today_credit"`
+				StreakDays     int     `json:"streak_days"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &env); err == nil {
+			item.CheckedIn = env.Data.TodayCheckedIn
+			item.TodayCredit = env.Data.TodayCredit
+			item.StreakDays = env.Data.StreakDays
+		}
+		if item.CheckedIn {
+			checkedCount++
+		}
+		items = append(items, item)
+	}
+	return checkinSummaryResp{
+		Items:        items,
+		CheckedCount: checkedCount,
+		TotalCount:   len(items),
+	}
+}
+
+func (h *Handler) checkinSummary(w http.ResponseWriter, r *http.Request) {
+	jsonWrite(w, http.StatusOK, h.buildCheckinSummary())
+}
+
+func (h *Handler) checkinClaimAll(w http.ResponseWriter, r *http.Request) {
+	type claimResult struct {
+		UID            string  `json:"uid"`
+		Label          string  `json:"label"`
+		Status         string  `json:"status"` // claimed | skipped | failed
+		Credit         float64 `json:"credit,omitempty"`
+		AlreadyChecked bool    `json:"already_checked,omitempty"`
+		Error          string  `json:"error,omitempty"`
+	}
+
+	uids := h.eligibleCheckinUIDs()
+	cs, hasSchedClaimer := h.sched.(checkinForScheduler)
+	results := make([]claimResult, 0, len(uids))
+	claimed, skipped, failed := 0, 0, 0
+
+	for _, uid := range uids {
+		_, cli, t, ok := h.resolveUIDClient(uid)
+		if !ok || t == nil {
+			continue
+		}
+		label := accountDisplayLabel(t)
+		var (
+			credit  float64
+			already bool
+			err     error
+		)
+		if hasSchedClaimer {
+			credit, already, err = cs.ClaimCheckinFor(uid)
+		} else {
+			credit, already, err = claimCheckinDirect(cli)
+		}
+		switch {
+		case err != nil:
+			failed++
+			results = append(results, claimResult{UID: uid, Label: label, Status: "failed", Error: err.Error()})
+		case already:
+			skipped++
+			results = append(results, claimResult{UID: uid, Label: label, Status: "skipped", AlreadyChecked: true})
+		default:
+			claimed++
+			// 清除由 daily-checkin 写入的部分响应缓存，使紧随其后的 summary 拉取完整的 streak_days/today_credit。
+			_ = h.st.DeleteCacheKey(scheduler.CheckinCacheTable, scheduler.CheckinStatusKey(uid))
+			results = append(results, claimResult{UID: uid, Label: label, Status: "claimed", Credit: credit})
+		}
+	}
+
+	summary := h.buildCheckinSummary()
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"claimed": claimed,
+		"skipped": skipped,
+		"failed":  failed,
+		"results": results,
+		"summary": summary,
+	})
+}
+
+func claimCheckinDirect(cli *upstream.Client) (float64, bool, error) {
+	if res, serr := cli.CheckinStatus(); serr == nil {
+		var env struct {
+			Data struct {
+				TodayCheckedIn bool `json:"today_checked_in"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(res.Raw, &env) == nil && env.Data.TodayCheckedIn {
+			return 0, true, nil
+		}
+	}
+	res, err := cli.ClaimCheckin()
+	if err != nil {
+		return 0, false, err
+	}
+	var env struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Credit         float64 `json:"credit"`
+			TodayCheckedIn bool    `json:"today_checked_in"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(res.Raw, &env)
+	if env.Code == 0 && (env.Data.Credit > 0 || env.Data.TodayCheckedIn) {
+		return env.Data.Credit, env.Data.Credit <= 0 && env.Data.TodayCheckedIn, nil
+	}
+	return 0, false, fmt.Errorf("签到未成功: code=%d msg=%s", env.Code, env.Msg)
 }
 
 // ── keys ──
@@ -1365,9 +2049,17 @@ func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	accountUID := strings.TrimSpace(q.Get("account_uid"))
+	if accountUID != "" {
+		if resolved, _, _, ok := h.resolveUIDClient(accountUID); ok && resolved != "" {
+			accountUID = resolved
+		} else if archived, err := h.accountBook().Load(accountUID); err == nil && archived != nil && archived.UID != "" {
+			accountUID = archived.UID
+		}
+	}
 	f := store.LogFilter{
 		Model:      strings.TrimSpace(q.Get("model")),
-		AccountUID: strings.TrimSpace(q.Get("account_uid")),
+		AccountUID: accountUID,
 		Status:     0,
 		Page:       atoiDefault(q.Get("page"), 1),
 		PageSize:   atoiDefault(q.Get("page_size"), 20),
@@ -1437,6 +2129,11 @@ func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
 		"log_retention_days":     cfg.LogRetentionDays,
 		"log_max_size_mb":        cfg.LogMaxSizeMB,
 		"chat_timeout_seconds":   cfg.ChatTimeoutSeconds,
+		"pool_strategy":          cfg.PoolStrategy,
+		"pool_session_ttl":       cfg.PoolSessionTTL,
+		"pool_max_retry":         cfg.PoolMaxRetry,
+		"pool_cool_max_min":      cfg.PoolCoolMaxMin,
+		"pool_probe_cron":        cfg.PoolProbeCron,
 	})
 }
 
@@ -1465,6 +2162,11 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		LogRetentionDays     *int    `json:"log_retention_days"`
 		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
 		ChatTimeoutSeconds   *int    `json:"chat_timeout_seconds"`
+		PoolStrategy         *string `json:"pool_strategy"`
+		PoolSessionTTL       *int    `json:"pool_session_ttl"`
+		PoolMaxRetry         *int    `json:"pool_max_retry"`
+		PoolCoolMaxMin       *int    `json:"pool_cool_max_min"`
+		PoolProbeCron        *string `json:"pool_probe_cron"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -1617,6 +2319,49 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			c.ChatTimeoutSeconds = *req.ChatTimeoutSeconds
 		}
+		if req.PoolStrategy != nil {
+			s := strings.TrimSpace(*req.PoolStrategy)
+			if !config.ValidPoolStrategy(s) {
+				return fmt.Errorf("pool_strategy 仅支持 expire_first/balanced/credits_first")
+			}
+			c.PoolStrategy = s
+		}
+		if req.PoolSessionTTL != nil {
+			n := *req.PoolSessionTTL
+			if n < 5 {
+				n = 5
+			}
+			if n > config.PoolSessionTTLMax {
+				n = config.PoolSessionTTLMax
+			}
+			c.PoolSessionTTL = n
+		}
+		if req.PoolMaxRetry != nil {
+			n := *req.PoolMaxRetry
+			if n < 0 {
+				n = 0
+			}
+			if n > config.PoolMaxRetryMax {
+				n = config.PoolMaxRetryMax
+			}
+			c.PoolMaxRetry = n
+		}
+		if req.PoolCoolMaxMin != nil {
+			n := *req.PoolCoolMaxMin
+			if n < 5 {
+				n = 5
+			}
+			if n > config.PoolCoolMaxMinMax {
+				n = config.PoolCoolMaxMinMax
+			}
+			c.PoolCoolMaxMin = n
+		}
+		if req.PoolProbeCron != nil {
+			if !validCron(*req.PoolProbeCron) {
+				return fmt.Errorf("号池探测 cron 表达式非法（需 6 段含秒，如 0 0 0,6,12,18 * * *）")
+			}
+			c.PoolProbeCron = strings.TrimSpace(*req.PoolProbeCron)
+		}
 		// 存量 cron 兜底：请求未携带该字段时（前端在功能关闭时不下发），
 		// 校验存量值；非法（常见来源是 env 写错位数）则回落默认，
 		// 避免一条用户看不见/改不了的非法 cron 永久阻断无关设置保存。
@@ -1640,6 +2385,10 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("存量 blackcat_cron 非法，回落默认", "value", c.BlackcatCron)
 			c.BlackcatCron = config.DefaultBlackcatCron
 		}
+		if req.PoolProbeCron == nil && !validCron(c.PoolProbeCron) {
+			slog.Warn("存量 pool_probe_cron 非法，回落默认", "value", c.PoolProbeCron)
+			c.PoolProbeCron = config.DefaultPoolProbeCron
+		}
 		return nil
 	})
 	if err != nil {
@@ -1654,7 +2403,7 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 			_ = err
 		}
 	}
-	// 签到开关/cron 变化 → 重装配定时任务
+	// 签到/成长/探测开关或 cron 变化 → 重装配定时任务
 	if h.sched != nil {
 		h.sched.Reconfigure()
 	}
@@ -1666,86 +2415,42 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 // ── 实验特性 ──
 
 // getExperiments 读实验特性开关（GET /admin/experiments）。
-// 单独成组而非并入 settings：实验开关按特性逐个挂、生命周期不稳定，
-// 不进设置页的大表单契约（设置页整单 PUT，字段增删会牵连前端提交体）。
+// 多账号调度已升级为原生常驻，此处仅保留 embeddings_enabled。
 func (h *Handler) getExperiments(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Get()
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"embeddings_enabled": cfg.EmbeddingsEnabled,
-		"pool_enabled":       cfg.PoolEnabled,
-		"pool_session_ttl":   cfg.PoolSessionTTL,
-		"pool_max_retry":     cfg.PoolMaxRetry,
-		"pool_cool_max_min":  cfg.PoolCoolMaxMin,
-		"pool_probe_cron":    cfg.PoolProbeCron,
 	})
 }
 
 // putExperiments 改实验特性开关（PUT /admin/experiments）。
-//
-// 请求体**逐字段可选**：每个字段用指针，nil 表示「本次不改」。
-// 不能要求必填——实验开关是按特性逐个挂的，多一个特性就让老前端提交 400，
-// 每加一个开关都要改前端才能不报错。
-//
-// env 锁定的字段由 cfg.Update 保持 env 值（与设置页同口径），响应恒回服务端真值。
+// 兼容忽略旧版请求体里的 pool_* 字段（不报错、不改写）。
 func (h *Handler) putExperiments(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EmbeddingsEnabled *bool   `json:"embeddings_enabled"`
-		PoolEnabled       *bool   `json:"pool_enabled"`
-		PoolSessionTTL    *int    `json:"pool_session_ttl"`
-		PoolMaxRetry      *int    `json:"pool_max_retry"`
-		PoolCoolMaxMin    *int    `json:"pool_cool_max_min"`
-		PoolProbeCron     *string `json:"pool_probe_cron"`
+		EmbeddingsEnabled *bool `json:"embeddings_enabled"`
+		PoolEnabled       any   `json:"pool_enabled"`
+		PoolSessionTTL    any   `json:"pool_session_ttl"`
+		PoolMaxRetry      any   `json:"pool_max_retry"`
+		PoolCoolMaxMin    any   `json:"pool_cool_max_min"`
+		PoolProbeCron     any   `json:"pool_probe_cron"`
 	}
 	if !readJSON(w, r, &req) {
 		return
 	}
-	// 一个字段都没给：仍回 400（空请求没有意义，且能挡住前端拼错字段名的静默无效）
-	if req.EmbeddingsEnabled == nil && req.PoolEnabled == nil && req.PoolSessionTTL == nil &&
-		req.PoolMaxRetry == nil && req.PoolCoolMaxMin == nil && req.PoolProbeCron == nil {
+	hasLegacyPool := req.PoolEnabled != nil || req.PoolSessionTTL != nil ||
+		req.PoolMaxRetry != nil || req.PoolCoolMaxMin != nil || req.PoolProbeCron != nil
+	if req.EmbeddingsEnabled == nil && !hasLegacyPool {
 		jsonErr(w, http.StatusBadRequest, "未提供任何可修改的字段")
 		return
 	}
-	if req.PoolProbeCron != nil && !validCron(*req.PoolProbeCron) {
-		jsonErr(w, http.StatusBadRequest, "探测 cron 表达式非法（需 6 段含秒，如 0 0 0,6,12,18 * * *）")
-		return
-	}
-	if err := h.cfg.Update(func(c *config.Config) error {
-		if req.EmbeddingsEnabled != nil {
+	if req.EmbeddingsEnabled != nil {
+		if err := h.cfg.Update(func(c *config.Config) error {
 			c.EmbeddingsEnabled = *req.EmbeddingsEnabled
+			return nil
+		}); err != nil {
+			jsonErr(w, http.StatusInternalServerError, err.Error())
+			return
 		}
-		if req.PoolEnabled != nil {
-			c.PoolEnabled = *req.PoolEnabled
-			if *req.PoolEnabled && c.PoolEnabledAt == 0 {
-				c.PoolEnabledAt = time.Now().Unix()
-			}
-		}
-		if req.PoolSessionTTL != nil {
-			c.PoolSessionTTL = *req.PoolSessionTTL
-		}
-		if req.PoolMaxRetry != nil {
-			c.PoolMaxRetry = *req.PoolMaxRetry
-		}
-		if req.PoolCoolMaxMin != nil {
-			c.PoolCoolMaxMin = *req.PoolCoolMaxMin
-		}
-		if req.PoolProbeCron != nil {
-			c.PoolProbeCron = *req.PoolProbeCron
-		}
-		return nil
-	}); err != nil {
-		jsonErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// 号池开关变化：重扫池成员（刚导入的账号要立刻参与分发）。
-	// Manager 常驻（main 构造），开关只控制行为，因此这里不需要重建——
-	// 重建会丢掉内存里的粘性表与观测计数，且改动期间请求会短暂退化。
-	nowEnabled := h.cfg.Get().PoolEnabled
-	if nowEnabled && h.pool != nil {
-		h.pool.ReloadMembers()
-	}
-	if h.sched != nil {
-		h.sched.Reconfigure() // 号池探测 cron 跟着开关挂/摘
 	}
 	h.getExperiments(w, r)
 }

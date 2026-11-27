@@ -77,18 +77,11 @@ func main() {
 	models := upstream.NewModelCache(cfg.Get().Region, client)
 	keys := apikey.New(st)
 
-	// 号池（实验特性，默认关闭）。
-	//
-	// Manager 常驻构造而不是「开关开了才建」：构造只做两次 SQLite 读 + 一次档案目录
-	// 扫描（个位数账号，<1ms），换来的是「开关切换不需要重建」——重建会丢内存粘性表
-	// 与观测计数，且热建路径要额外在 admin 与 proxy 之间接线。
-	// 关闭时 proxy 侧每个请求只多一次 `h.pool.Enabled()`（一次原子级配置读）。
+	// 号池（原生常驻开启）：构造时加载账号档案与持久化状态，并在有 client 时异步补全未探测额度。
 	poolMgr := pool.New(cfg, st, toks, client)
 	sched := scheduler.New(cfg, client, st, models)
 	// SetPool 之后必须再 Reconfigure 一次：scheduler.New 内部那次 Reconfigure
-	// 运行时 s.pool 还是 nil，探测 cron 挂不上。不补这一下的话，
-	// 「env 开启号池」或「上次 UI 开过然后重启」的部署，自动探测完全失效——
-	// auto_disabled=quota 的号永远探不回来，只能等用户进实验页点一下开关。
+	// 运行时 s.pool 还是 nil，探测 cron 挂不上。
 	sched.SetPool(poolMgr)
 	sched.Reconfigure()
 
@@ -107,6 +100,8 @@ func main() {
 	//   - 任务队列：每日 cron，扫描待办并逐个跑动作（Sequential 族每日解锁一环）。
 	sched.SetTaskSweepHook(adminH.RunTaskSweep)
 	sched.SetTaskQueueHook(adminH.RunTaskQueueOnce)
+	sched.SetTaskSweepForHook(adminH.RunTaskSweepFor)
+	sched.SetTaskQueueForHook(adminH.RunTaskQueueFor)
 
 	// 前端：启动时解析模板并预渲染全部页面。
 	// app.js 必须排在 alpine.js 之前：alpine.min.js 末尾以 queueMicrotask(Alpine.start())

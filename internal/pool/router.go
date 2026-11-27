@@ -2,10 +2,25 @@ package pool
 
 import (
 	"hash/fnv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"buddy2api-go/internal/billing"
+	"buddy2api-go/internal/config"
 )
+
+// CandidateInfo 路由选号时的候选账号元数据快照。
+//
+// 由调用方（Manager）在持自己锁时一次性收集，避免 Router 回调 Manager 导致锁顺序反转。
+type CandidateInfo struct {
+	UID              string
+	Credits          float64
+	CreditsAt        int64
+	EarliestExpireAt int64
+	Inflight         int64
+}
 
 // bindEntry 一条会话绑定。
 //
@@ -54,84 +69,259 @@ func sessionKey(key, model string) string {
 	return key + "\x00" + model
 }
 
-// Resolve 返回该会话应使用的账号；ok=false 表示池内无可用账号。
+// entryModel 从绑定键提取模型名。
+func entryModel(ek string) string {
+	if i := strings.LastIndexByte(ek, 0); i >= 0 {
+		return ek[i+1:]
+	}
+	return ""
+}
+
+// Resolve 返回该会话应使用的账号（默认 balanced 策略）；ok=false 表示池内无可用账号。
 //
-// 分配策略是 **idle-first 双段**：先只在「未被任何活跃绑定占用的号」里挑，
-// 挑空了才回落到全池。效果是 4 个账号 4 个不同对话时必然各占一个号，
-// 第 5 个对话才开始共享——这正是「不同对话尽量分散到不同账号」要的行为。
-//
-// avail 必须是**调用方已确认可用**的集合（账号未禁用、该模型未冷却、不在本次 tried 里）。
-//
-// **本方法绝不回调调用方**。早期版本接受 `usable func(uid) bool` 回调来做二次校验，
-// 结果形成 Router.mu.Lock → Manager.mu.RLock 的反向依赖，与
-// Snapshot 的 Manager.mu.RLock → Router.mu.RLock 构成 ABBA 死锁
-// （`TestLockOrderInversion` 会复现）。现在锁顺序被强制为**单向：Manager → Router**，
-// Router 只读自己受锁保护的 entries，不看池状态。
+// **本方法绝不回调调用方**。锁顺序强制单向 Manager → Router。
 func (r *Router) Resolve(key, model string, avail []string) (uid string, hit bool) {
 	if len(avail) == 0 {
 		return "", false
 	}
-	usable := func(u string) bool {
-		for _, v := range avail {
-			if v == u {
-				return true
-			}
-		}
-		return false
+	cands := make([]CandidateInfo, len(avail))
+	for i, u := range avail {
+		cands[i] = CandidateInfo{UID: u}
+	}
+	return r.ResolveWithStrategy(key, model, cands, config.PoolStrategyBalanced)
+}
+
+// ResolveWithStrategy 按指定策略选号：
+//   - 有会话键且存在未过期绑定且仍在候选集内 → 粘性命中（三种策略共用，保住前缀缓存）
+//   - 否则按 strategy（expire_first / balanced / credits_first）+ 在途并发 + 活跃绑定数选号
+//
+// 锁顺序强制单向 Manager → Router，本方法绝不回调调用方。
+func (r *Router) ResolveWithStrategy(key, model string, candidates []CandidateInfo, strategy string) (uid string, hit bool) {
+	if len(candidates) == 0 {
+		return "", false
+	}
+	candSet := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		candSet[c.UID] = struct{}{}
 	}
 	k := sessionKey(key, model)
-	// 无会话键：纯分发，不写表（否则每次都是一条永不复用的垃圾条目）。
-	//
-	// 用 roundRobin 而非 hash(model)：只 hash model 会让**所有**无会话键的请求
-	// 恒定落到同一个号上（实测 100/100），池化在这个分支上完全失效，
-	// 而且那个号会被单点压垮。轮转让它们均匀铺开。
+
+	// 无会话键：纯分发，不写表（否则每次都是一条永不复用的垃圾条目），
+	// 但仍遵循所选策略与当前活跃绑定负载。
 	if k == "" {
-		n := int(r.rr.Add(1))
-		return avail[n%len(avail)], false
+		modelByUID, totalByUID := r.activeCounts(model)
+		uid = r.selectCandidate("", candidates, strategy, modelByUID, totalByUID, time.Now().Unix())
+		return uid, false
 	}
 
 	// ── 快路径：命中且绑定的号仍在本次可用集合里 ──
 	r.mu.RLock()
 	e, ok := r.entries[k]
 	r.mu.RUnlock()
-	if ok && r.fresh(e) && usable(e.UID) {
-		r.touch(k)
-		r.hit.Add(1)
-		return e.UID, true
+	if ok && r.fresh(e) {
+		if _, in := candSet[e.UID]; in {
+			r.touchIfNeeded(k, e.LastActive)
+			r.hit.Add(1)
+			return e.UID, true
+		}
 	}
 
 	// ── 慢路径 ──
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// 重查：等锁期间可能已被同会话的另一个 goroutine 分配好
-	if e, ok := r.entries[k]; ok && r.fresh(e) && usable(e.UID) {
-		r.entries[k] = bindEntry{UID: e.UID, LastActive: time.Now()}
-		r.hit.Add(1)
-		return e.UID, true
-	}
-	// 绑定存在但已不可用（号被禁用 / 该模型冷却 / TTL 过期）：先摘掉再重分配。
-	// 不摘的话它会一直占着 idle-first 的「已占用」名额，把空闲号挡在门外。
-	delete(r.entries, k)
-
-	bound := make(map[string]bool, len(r.entries))
-	for _, v := range r.entries {
-		bound[v.UID] = true
-	}
-	idle := make([]string, 0, len(avail))
-	for _, u := range avail {
-		if !bound[u] {
-			idle = append(idle, u)
+	if e, ok := r.entries[k]; ok && r.fresh(e) {
+		if _, in := candSet[e.UID]; in {
+			if r.shouldTouch(e.LastActive) {
+				r.entries[k] = bindEntry{UID: e.UID, LastActive: time.Now()}
+			}
+			r.hit.Add(1)
+			return e.UID, true
 		}
 	}
-	pick := idle
-	if len(pick) == 0 {
-		pick = avail
+	// 绑定存在但已不可用（号被禁用 / 该模型冷却 / TTL 过期）：先摘掉再重分配。
+	delete(r.entries, k)
+
+	// 扫描活跃绑定并顺手清理所有已过期僵尸条目，避免继续占着绑定计数名额。
+	modelByUID := make(map[string]int, len(candidates))
+	totalByUID := make(map[string]int, len(candidates))
+	for ek, ev := range r.entries {
+		if !r.fresh(ev) {
+			delete(r.entries, ek)
+			continue
+		}
+		totalByUID[ev.UID]++
+		if entryModel(ek) == model {
+			modelByUID[ev.UID]++
+		}
 	}
-	uid = pick[hashIndex(k, len(pick))]
+
+	uid = r.selectCandidate(k, candidates, strategy, modelByUID, totalByUID, time.Now().Unix())
 	r.entries[k] = bindEntry{UID: uid, LastActive: time.Now()}
 	r.miss.Add(1)
 	r.evictLocked()
 	return uid, false
+}
+
+// activeCounts 在读锁下统计指定模型的绑定数与总绑定数（跳过过期条目）。
+func (r *Router) activeCounts(model string) (modelByUID, totalByUID map[string]int) {
+	modelByUID = make(map[string]int, 8)
+	totalByUID = make(map[string]int, 8)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for ek, ev := range r.entries {
+		if !r.fresh(ev) {
+			continue
+		}
+		totalByUID[ev.UID]++
+		if entryModel(ek) == model {
+			modelByUID[ev.UID]++
+		}
+	}
+	return modelByUID, totalByUID
+}
+
+func (r *Router) selectCandidate(k string, candidates []CandidateInfo, strategy string, modelByUID, totalByUID map[string]int, now int64) string {
+	switch strategy {
+	case config.PoolStrategyBalanced:
+		return r.pickBalanced(k, candidates, modelByUID, totalByUID)
+	case config.PoolStrategyCreditsFirst:
+		return r.pickCreditsFirst(k, candidates, modelByUID, totalByUID)
+	default: // config.PoolStrategyExpireFirst
+		return r.pickExpireFirst(k, candidates, modelByUID, totalByUID, now)
+	}
+}
+
+// pickExpireFirst 临期优先（按北京时间自然日分桶）：
+//   - Tier 1：存在未来到期时间（EarliestExpireAt > now）的候选，按 CST 自然日取最早一天桶；
+//   - Tier 2（仅当 Tier 1 为空）：其余全部候选（永久包 / 未探测 / 已过期）；
+//   - 桶内按在途并发 → (uid, model) 活跃绑定 → 总活跃绑定 → hash/rr 均衡分摊。
+func (r *Router) pickExpireFirst(k string, candidates []CandidateInfo, modelByUID, totalByUID map[string]int, now int64) string {
+	var minDay string
+	for _, c := range candidates {
+		if c.EarliestExpireAt <= now {
+			continue
+		}
+		day := time.Unix(c.EarliestExpireAt, 0).In(billing.TZ).Format("2006-01-02")
+		if minDay == "" || day < minDay {
+			minDay = day
+		}
+	}
+	var bucket []CandidateInfo
+	if minDay != "" {
+		bucket = make([]CandidateInfo, 0, len(candidates))
+		for _, c := range candidates {
+			if c.EarliestExpireAt > now &&
+				time.Unix(c.EarliestExpireAt, 0).In(billing.TZ).Format("2006-01-02") == minDay {
+				bucket = append(bucket, c)
+			}
+		}
+	} else {
+		bucket = candidates
+	}
+	return r.pickBalanced(k, bucket, modelByUID, totalByUID)
+}
+
+// pickBalanced 均衡分摊：min Inflight → min (uid, model) 活跃绑定 → min 总活跃绑定 → hash / rr。
+func (r *Router) pickBalanced(k string, candidates []CandidateInfo, modelByUID, totalByUID map[string]int) string {
+	pool := filterMinInflight(candidates)
+	return r.pickByBindingsAndHash(k, pool, modelByUID, totalByUID)
+}
+
+// pickCreditsFirst 高余额优先：
+//   - 先按 min Inflight 过滤（避免同毫秒并发全砸到同一个号）；
+//   - 再按额度梯队过滤：已知正额度 (CreditsAt>0 && Credits>0) > 未知 (CreditsAt==0) > 已知零额度 (Credits<=0)；
+//   - 正额度梯队内取最高额度及其 1.0 额度误差范围内的并列候选；
+//   - 最后按 min (uid, model) 绑定 → min 总绑定 → hash / rr 决胜。
+func (r *Router) pickCreditsFirst(k string, candidates []CandidateInfo, modelByUID, totalByUID map[string]int) string {
+	pool := filterMinInflight(candidates)
+
+	tierOf := func(c CandidateInfo) int {
+		if c.CreditsAt > 0 && c.Credits > 0 {
+			return 2
+		}
+		if c.CreditsAt == 0 {
+			return 1
+		}
+		return 0
+	}
+	bestTier := -1
+	for _, c := range pool {
+		if t := tierOf(c); t > bestTier {
+			bestTier = t
+		}
+	}
+	tiered := make([]CandidateInfo, 0, len(pool))
+	for _, c := range pool {
+		if tierOf(c) == bestTier {
+			tiered = append(tiered, c)
+		}
+	}
+
+	if bestTier == 2 && len(tiered) > 1 {
+		maxCred := tiered[0].Credits
+		for _, c := range tiered[1:] {
+			if c.Credits > maxCred {
+				maxCred = c.Credits
+			}
+		}
+		top := make([]CandidateInfo, 0, len(tiered))
+		for _, c := range tiered {
+			if maxCred-c.Credits <= 1.0+1e-9 {
+				top = append(top, c)
+			}
+		}
+		tiered = top
+	}
+	return r.pickByBindingsAndHash(k, tiered, modelByUID, totalByUID)
+}
+
+func filterMinInflight(candidates []CandidateInfo) []CandidateInfo {
+	if len(candidates) <= 1 {
+		return candidates
+	}
+	minInf := candidates[0].Inflight
+	for _, c := range candidates[1:] {
+		if c.Inflight < minInf {
+			minInf = c.Inflight
+		}
+	}
+	out := make([]CandidateInfo, 0, len(candidates))
+	for _, c := range candidates {
+		if c.Inflight == minInf {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func filterMinInt(candidates []CandidateInfo, score func(CandidateInfo) int) []CandidateInfo {
+	if len(candidates) <= 1 {
+		return candidates
+	}
+	minVal := score(candidates[0])
+	for _, c := range candidates[1:] {
+		if v := score(c); v < minVal {
+			minVal = v
+		}
+	}
+	out := make([]CandidateInfo, 0, len(candidates))
+	for _, c := range candidates {
+		if score(c) == minVal {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (r *Router) pickByBindingsAndHash(k string, candidates []CandidateInfo, modelByUID, totalByUID map[string]int) string {
+	pick := filterMinInt(candidates, func(c CandidateInfo) int { return modelByUID[c.UID] })
+	pick = filterMinInt(pick, func(c CandidateInfo) int { return totalByUID[c.UID] })
+	if k == "" {
+		idx := int(uint64(r.rr.Add(1)-1) % uint64(len(pick)))
+		return pick[idx].UID
+	}
+	return pick[hashIndex(k, len(pick))].UID
 }
 
 // Bind 显式把会话绑到指定账号（请求最终成功后调用）。
@@ -165,7 +355,7 @@ func (r *Router) UnbindIf(key, model, uid string) {
 	r.mu.Unlock()
 }
 
-// BoundUID 返回会话当前绑定的账号（无绑定返回 false）。
+// BoundUID 返回会话当前绑定的账号（无绑定或已过期返回 false）。
 func (r *Router) BoundUID(key, model string) (string, bool) {
 	k := sessionKey(key, model)
 	if k == "" {
@@ -174,23 +364,47 @@ func (r *Router) BoundUID(key, model string) (string, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	e, ok := r.entries[k]
-	return e.UID, ok
+	if !ok || !r.fresh(e) {
+		return "", false
+	}
+	return e.UID, true
 }
 
-// Count 当前活跃绑定数。
+// Count 当前活跃绑定数（忽略已过期条目）。
 func (r *Router) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.entries)
+	n := 0
+	for _, v := range r.entries {
+		if r.fresh(v) {
+			n++
+		}
+	}
+	return n
 }
 
-// CountByUID 统计每个账号被多少个会话绑定（管理页「会话」列）。
+// CountByUID 统计每个账号被多少个活跃会话绑定（管理页「会话」列，忽略过期条目）。
 func (r *Router) CountByUID() map[string]int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make(map[string]int, 8)
 	for _, v := range r.entries {
-		out[v.UID]++
+		if r.fresh(v) {
+			out[v.UID]++
+		}
+	}
+	return out
+}
+
+// CountByUIDModel 统计指定模型上每个账号的活跃会话绑定数（忽略过期条目）。
+func (r *Router) CountByUIDModel(model string) map[string]int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]int, 8)
+	for k, v := range r.entries {
+		if r.fresh(v) && entryModel(k) == model {
+			out[v.UID]++
+		}
 	}
 	return out
 }
@@ -204,7 +418,7 @@ func (r *Router) Reset() {
 
 // DropUID 摘掉所有绑定到 uid 的会话（账号被判不可用时调用）。
 //
-// 没有这一步，被禁用的号会继续作为「已占用」占着 idle-first 的名额，
+// 没有这一步，被禁用的号会继续作为「已占用」占着名额，
 // 同时那些会话每次请求都要走一遍「绑定不可用 → 删除 → 重分配」的慢路径。
 func (r *Router) DropUID(uid string) int {
 	r.mu.Lock()
@@ -212,6 +426,21 @@ func (r *Router) DropUID(uid string) int {
 	n := 0
 	for k, v := range r.entries {
 		if v.UID == uid {
+			delete(r.entries, k)
+			n++
+		}
+	}
+	return n
+}
+
+// DropUIDModel 摘掉该账号在指定模型上的会话绑定（模型限流/短冷却时调用）。
+func (r *Router) DropUIDModel(uid, model string) int {
+	suffix := "\x00" + model
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for k, v := range r.entries {
+		if v.UID == uid && strings.HasSuffix(k, suffix) {
 			delete(r.entries, k)
 			n++
 		}
@@ -237,6 +466,27 @@ func (r *Router) fresh(e bindEntry) bool {
 		return true
 	}
 	return time.Since(e.LastActive) <= ttl
+}
+
+// touchThreshold 返回滑动续期节流阈值：默认 1 分钟；当 TTL < 4 分钟时退化为 ttl/4，
+// 既消除高并发粘性命中的写锁争用，又保证短 TTL 测试滑动续期正常生效。
+func (r *Router) touchThreshold() time.Duration {
+	if r.ttl != nil {
+		if ttl := r.ttl(); ttl > 0 && ttl < 4*time.Minute {
+			return ttl / 4
+		}
+	}
+	return time.Minute
+}
+
+func (r *Router) shouldTouch(lastActive time.Time) bool {
+	return time.Since(lastActive) > r.touchThreshold()
+}
+
+func (r *Router) touchIfNeeded(k string, lastActive time.Time) {
+	if r.shouldTouch(lastActive) {
+		r.touch(k)
+	}
 }
 
 // touch 滑动续期。

@@ -140,7 +140,9 @@ CREATE TABLE IF NOT EXISTS pool_account_state (
   last_probe_ok      INTEGER NOT NULL DEFAULT 0,
   last_probe_msg     TEXT    NOT NULL DEFAULT '',
   credits            REAL    NOT NULL DEFAULT 0,
-  credits_at         INTEGER NOT NULL DEFAULT 0
+  credits_at         INTEGER NOT NULL DEFAULT 0,
+  earliest_expire_at INTEGER NOT NULL DEFAULT 0,
+  expiring_credits   REAL    NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS pool_model_cool (
   uid      TEXT    NOT NULL,
@@ -175,6 +177,8 @@ CREATE INDEX IF NOT EXISTS idx_pool_cool_until ON pool_model_cool(until);
 	for _, col := range [][2]string{
 		{"credits", "REAL NOT NULL DEFAULT 0"},
 		{"credits_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"earliest_expire_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"expiring_credits", "REAL NOT NULL DEFAULT 0"},
 	} {
 		if err := s.ensureColumn("pool_account_state", col[0], col[1]); err != nil {
 			return err
@@ -726,8 +730,10 @@ type PoolAccountRow struct {
 	// Credits 上次探测读到的可用额度 / CreditsAt 读到它的时刻。
 	// 分两个字段而不是用 0 当哨兵：0 是「探测确认额度耗尽」这个有意义的结论，
 	// 与「从未探测过 / 不知道」必须能区分，否则面板会把没探过的号显示成「额度 0」。
-	Credits   float64 `json:"credits"`
-	CreditsAt int64   `json:"credits_at"`
+	Credits          float64 `json:"credits"`
+	CreditsAt        int64   `json:"credits_at"`
+	EarliestExpireAt int64   `json:"earliest_expire_at"`
+	ExpiringCredits  float64 `json:"expiring_credits"`
 }
 
 // PoolCoolRow 模型级冷却（一行一个 (uid, model)）。
@@ -746,7 +752,8 @@ func (s *Store) LoadPoolAccounts() ([]PoolAccountRow, error) {
 	rows, err := s.db.Query(`SELECT uid, COALESCE(manual_disabled,0), COALESCE(manual_disabled_at,0),
 		COALESCE(auto_disabled,''), COALESCE(auto_disabled_at,0), COALESCE(auto_disabled_msg,''),
 		COALESCE(quota_fail_streak,0), COALESCE(last_probe_at,0), COALESCE(last_probe_ok,0), COALESCE(last_probe_msg,''),
-		COALESCE(credits,0), COALESCE(credits_at,0)
+		COALESCE(credits,0), COALESCE(credits_at,0),
+		COALESCE(earliest_expire_at,0), COALESCE(expiring_credits,0)
 		FROM pool_account_state`)
 	if err != nil {
 		return nil, err
@@ -758,7 +765,8 @@ func (s *Store) LoadPoolAccounts() ([]PoolAccountRow, error) {
 		var manual, probeOK int
 		if err := rows.Scan(&r.UID, &manual, &r.ManualDisabledAt, &r.AutoDisabled,
 			&r.AutoDisabledAt, &r.AutoDisabledMsg, &r.QuotaFailStreak,
-			&r.LastProbeAt, &probeOK, &r.LastProbeMsg, &r.Credits, &r.CreditsAt); err != nil {
+			&r.LastProbeAt, &probeOK, &r.LastProbeMsg, &r.Credits, &r.CreditsAt,
+			&r.EarliestExpireAt, &r.ExpiringCredits); err != nil {
 			return nil, err
 		}
 		r.ManualDisabled, r.LastProbeOK = manual != 0, probeOK != 0
@@ -772,18 +780,19 @@ func (s *Store) SavePoolAccount(r *PoolAccountRow) error {
 	_, err := s.db.Exec(`INSERT INTO pool_account_state
 		(uid, manual_disabled, manual_disabled_at, auto_disabled, auto_disabled_at,
 		 auto_disabled_msg, quota_fail_streak, last_probe_at, last_probe_ok, last_probe_msg,
-		 credits, credits_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+		 credits, credits_at, earliest_expire_at, expiring_credits)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(uid) DO UPDATE SET
 		 manual_disabled=excluded.manual_disabled, manual_disabled_at=excluded.manual_disabled_at,
 		 auto_disabled=excluded.auto_disabled, auto_disabled_at=excluded.auto_disabled_at,
 		 auto_disabled_msg=excluded.auto_disabled_msg, quota_fail_streak=excluded.quota_fail_streak,
 		 last_probe_at=excluded.last_probe_at, last_probe_ok=excluded.last_probe_ok,
 		 last_probe_msg=excluded.last_probe_msg,
-		 credits=excluded.credits, credits_at=excluded.credits_at`,
+		 credits=excluded.credits, credits_at=excluded.credits_at,
+		 earliest_expire_at=excluded.earliest_expire_at, expiring_credits=excluded.expiring_credits`,
 		r.UID, boolToInt(r.ManualDisabled), r.ManualDisabledAt, r.AutoDisabled, r.AutoDisabledAt,
 		r.AutoDisabledMsg, r.QuotaFailStreak, r.LastProbeAt, boolToInt(r.LastProbeOK), r.LastProbeMsg,
-		r.Credits, r.CreditsAt)
+		r.Credits, r.CreditsAt, r.EarliestExpireAt, r.ExpiringCredits)
 	return err
 }
 

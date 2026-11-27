@@ -592,18 +592,17 @@ Object.keys(PAGES).forEach(function (k) {
   PAGES[k].load = function () { loads.push('enter:' + k); if (orig) return orig.call(this); };
 });
 ['loadStats', 'loadModels', 'loadKeys', 'loadAccount', 'loadAccounts', 'loadGrowth', 'loadCheckin',
- 'loadSettings', 'loadResources', 'loadLogs', 'loadTasks', 'loadCompensation'].forEach(function (m) {
+ 'loadCheckinSummary', 'loadSettings', 'loadResources', 'loadLogs', 'loadTasks', 'loadCompensation'].forEach(function (m) {
   // 记参数：loadResources/loadGrowth 的 force 标志要被断言（换账号必须强刷）
   if (typeof inst[m] === 'function') {
-    real[m] = inst[m];   // 保留真实现，供 10c/12 直接跑
+    real[m] = inst[m];   // 保留真实现，供 10c/12/17 直接跑
     inst[m] = function () {
       loads.push(arguments.length ? m + '(' + Array.prototype.join.call(arguments, ',') + ')' : m);
     };
   }
 });
-// 号池两个加载器：既要**记录**调用（17 组断言），又要跑**真实现**（要验证它们
-// 自己发请求的顺序与短路条件，stub 掉就等于把被测逻辑删了）。
-['loadPool', 'loadExperiments'].forEach(function (m) {
+// 多账号调度加载器：既记录调用，又保留真实现以验证原生常驻请求
+['loadPool'].forEach(function (m) {
   const orig = inst[m];
   real[m] = orig;
   inst[m] = function () {
@@ -1186,84 +1185,190 @@ inst.parseBatchBundle('weird.json', JSON.stringify({ hello: 'world' }));
 if (!inst.batchForm.error) fail('缺 format 标识时应就地报错，不发请求');
 if (inst.batchForm.items.length !== 0) fail('非法包不该产生预览项');
 
-// 17) 号池卡片：刷新后必须自己出现，不能「只有从实验页跳转才看得见」
-// 回归：labs.pool_enabled 只由实验页的 loadLabs() 填充，刷新后直接停在账号页时
-// 它恒为默认 false → 号池卡片被 x-show 藏起来、loadPool 也直接 return 不发请求。
-// 修法：afterLogin 拉一次实验开关（loadExperiments），loadPool 在开关还未知时等价一次。
-const poolUrls = [];
-function poolFetch(poolEnabled, data) {
-  global.fetch = async function (url) {
-    const u = String(url);
-    poolUrls.push(u);
-    if (u.indexOf('/admin/experiments') === 0) {
+// 17) 原生常驻多账号调度：无需实验开关即可直接拉取 /admin/pool，支持策略切换、余额跨页深链、任务页账号切换与日志账号过滤
+const poolCalls = [];
+global.fetch = async function (url, opts) {
+  const u = String(url);
+  poolCalls.push({ url: u, method: (opts && opts.method) || 'GET', body: opts && opts.body });
+  if (u.indexOf('/admin/pool/strategy') === 0) {
+    const b = JSON.parse(opts.body);
+    return { ok: true, status: 200, json: async function () { return { ok: true, strategy: b.strategy }; } };
+  }
+  if (u.indexOf('/admin/pool') === 0) {
+    return { ok: true, status: 200, json: async function () {
+      return {
+        strategy: 'expire_first', member_count: 2, available_now: 2, session_count: 1,
+        sticky_hit_total: 8, sticky_miss_total: 2,
+        accounts: [
+          { uid: 'acc1', nickname: '账号A', remark: '主力', active: true, region_match: true, credits: 12, credits_at: 1700000000, earliest_expire_at: 1700500000, expiring_credits: 5 },
+          { uid: 'acc2', nickname: '账号B', remark: '', active: false, region_match: true, credits: 80, credits_at: 1700000000 },
+        ],
+      };
+    } };
+  }
+  if (u.indexOf('/admin/resources') === 0) {
+    if (u.indexOf('uid=acc2') >= 0) {
       return { ok: true, status: 200, json: async function () {
-        return { embeddings_enabled: false, pool_enabled: poolEnabled, pool_session_ttl: 180,
-                 pool_max_retry: 2, pool_cool_max_min: 360, pool_probe_cron: '0 0 0,6,12,18 * * *' };
+        return { mode: 'single', uid: 'acc2', label: '账号B', updated_at: 1700000000, data: { total_dosage: 80, accounts: [{ key: 'k2', package_name: 'B包', capacity_remain: 80 }] } };
       } };
     }
-    if (u.indexOf('/admin/pool') === 0) {
-      return { ok: true, status: 200, json: async function () { return data || { accounts: [] }; } };
-    }
-    return { ok: true, status: 200, json: async function () { return {}; } };
-  };
+    return { ok: true, status: 200, json: async function () {
+      return { mode: 'all', updated_at: 1700000000, total_dosage: 92, expiring_7d: 5, earliest_expire_at: 1700500000,
+               accounts_summary: [{ uid: 'acc1', label: '主力', total_dosage: 12 }, { uid: 'acc2', label: '账号B', total_dosage: 80 }],
+               accounts: [{ key: 'k1', account_uid: 'acc1', account_label: '主力', package_name: 'A包', capacity_remain: 12 }] };
+    } };
+  }
+  if (u.indexOf('/admin/logs') === 0) {
+    return { ok: true, status: 200, json: async function () { return { logs: [], total: 0 }; } };
+  }
+  if (u.indexOf('/admin/checkin/summary') === 0) {
+    return { ok: true, status: 200, json: async function () {
+      return { checked_count: 1, total_count: 2, items: [
+        { uid: 'acc1', label: '主力', checked_in: true },
+        { uid: 'acc2', label: '账号B', checked_in: false },
+      ] };
+    } };
+  }
+  if (u.indexOf('/admin/checkin/claim_all') === 0) {
+    return { ok: true, status: 200, json: async function () { return { claimed: 1, skipped: 1, failed: 0 }; } };
+  }
+  return { ok: true, status: 200, json: async function () { return { ok: true, available: true, tasks: [], data: { data: { today_checked_in: false } } }; } };
+};
+
+// 17a) loadPool 无条件直连 /admin/pool，不依赖 /admin/experiments
+inst.pool = null; inst.poolLoaded = false;
+poolCalls.length = 0;
+await inst.loadPool();
+if (poolCalls.some(function (c) { return /\/admin\/experiments/.test(c.url); })) {
+  fail('原生常驻号池不应再请求 /admin/experiments: ' + JSON.stringify(poolCalls));
+}
+if (!inst.pool || inst.pool.accounts.length !== 2 || inst.pool.strategy !== 'expire_first') {
+  fail('loadPool 未正确写入快照: ' + JSON.stringify(inst.pool));
 }
 
-// 17a) 登录进场时必须拉实验开关（这是刷新后号池能出现的前提）
-inst._experimentsLoaded = false;
-loads.length = 0;
-poolUrls.length = 0;
-poolFetch(true);
-inst.afterLogin();
+// 17b) 策略切换 PUT /admin/pool/strategy
+poolCalls.length = 0;
+inst.setPoolStrategy('credits_first');
 await new Promise(function (r) { setTimeout(r, 0); });
-if (count('loadExperiments') !== 1) {
-  fail('afterLogin 必须拉一次实验开关（否则刷新在账号页时 labs.pool_enabled 恒为默认 false）: '
-       + JSON.stringify(loads));
+if (!poolCalls.some(function (c) { return c.method === 'PUT' && c.url === '/admin/pool/strategy' && /credits_first/.test(c.body); })) {
+  fail('setPoolStrategy 未发 PUT /admin/pool/strategy: ' + JSON.stringify(poolCalls));
 }
-if (!inst.labs.pool_enabled) fail('实验开关拉回后 labs.pool_enabled 应为 true');
-if (!inst._experimentsLoaded) fail('_experimentsLoaded 未置位（loadPool 无法判断「开关未知」）');
 
-// 17b) 刷新在账号页：开关未拉到时 loadPool 必须等价一次，而不是当场返回 null
-// 这正是「只能从实验页跳转才看得见」的根因。
-inst._experimentsLoaded = false;
-inst.labs.pool_enabled = false;
+// 17c) 账号页点击额度深链到余额页指定账号（openAccountResources）
+inst.loadResources = real.loadResources;
+poolCalls.length = 0;
+inst.entered = { resources: Date.now() };
+inst.view = 'account';
+inst.openAccountResources('acc2');
+await new Promise(function (r) { setTimeout(r, 0); });
+if (inst.view !== 'resources') fail('openAccountResources 未跳转到 resources 页: ' + inst.view);
+if (inst.resourceUID !== 'acc2') fail('openAccountResources 未设置 resourceUID=acc2: ' + inst.resourceUID);
+if (!poolCalls.some(function (c) { return /\/admin\/resources\?.*uid=acc2/.test(c.url); })) {
+  fail('openAccountResources 未请求 ?uid=acc2: ' + JSON.stringify(poolCalls));
+}
+if (inst.resources.mode !== 'single' || inst.resources.total_dosage !== 80) {
+  fail('指定账号余额模式未正确写入: ' + JSON.stringify(inst.resources));
+}
+
+// 17d) 任务页快速切换账号：仅切本页 growthUID，所有任务/签到/成长请求带 ?uid=，且确认框标明目标账号名
+inst.loadGrowth = real.loadGrowth;
+inst.loadCheckin = real.loadCheckin;
+inst.loadTasks = real.loadTasks;
+inst.loadCompensation = real.loadCompensation;
+inst.accounts = { loaded: true, items: [
+  { uid: 'acc1', nickname: '账号A', remark: '主力', active: true },
+  { uid: 'acc2', nickname: '账号B', remark: '', active: false },
+] };
+poolCalls.length = 0;
+inst.selectGrowthUID('acc2');
+await new Promise(function (r) { setTimeout(r, 0); });
+if (inst.growthUID !== 'acc2') fail('selectGrowthUID 未更新 growthUID');
+if (!inst.accounts.items[0].active) fail('selectGrowthUID 不得修改全局主账号');
+['/admin/growth/overview', '/admin/checkin/status', '/admin/tasks', '/admin/compensation'].forEach(function (ep) {
+  if (!poolCalls.some(function (c) { return c.url.indexOf(ep) === 0 && c.url.indexOf('uid=acc2') >= 0; })) {
+    fail('任务页切换账号后 ' + ep + ' 未携带 uid=acc2: ' + JSON.stringify(poolCalls));
+  }
+});
+inst.runGrowthChain();
+if (!inst.confirmBox.open || inst.confirmBox.message.indexOf('账号B') < 0) {
+  fail('执行全部确认框未包含目标账号名: ' + JSON.stringify(inst.confirmBox));
+}
+inst.confirmBox.open = false;
+
+// 17e) 日志页账号过滤
+inst.loadLogs = real.loadLogs;
+poolCalls.length = 0;
+inst.logFilter.account_uid = 'acc2';
+await inst.loadLogs(1);
+if (!poolCalls.some(function (c) { return /\/admin\/logs\?.*account_uid=acc2/.test(c.url); })) {
+  fail('loadLogs 未传递 account_uid 查询参数: ' + JSON.stringify(poolCalls));
+}
+// 17f) /growth 首屏加载与 loadAccounts 并发不得丢弃响应或卡在加载态，且 raw_uid 优先于安全 ID (m.ID)
+const savedLoadAccounts17f = inst.loadAccounts;
+inst.loadAccounts = real.loadAccounts;
+inst.accounts = { items: [], loaded: false };
 inst.pool = null;
-poolUrls.length = 0;
-poolFetch(true, { accounts: [{ uid: 'acc1', nickname: '账号A', credits: 12, credits_at: 1700000000 }],
-                  member_count: 1, available_now: 1, session_count: 0 });
-await inst.loadPool();
-if (!/\/admin\/pool/.test(poolUrls.join(','))) {
-  fail('刷新在账号页时 loadPool 必须真的请求 /admin/pool（早期直接 return 了）: ' + JSON.stringify(poolUrls));
+inst.growthUID = '';
+inst.growth = Object.assign({}, inst.growth, { loaded: false });
+inst.checkin = { loaded: false }; inst.checkinPending = false;
+inst.tasksLoaded = false; inst.compLoaded = false;
+let releaseGrowth = null;
+const growthRaceURLs = [];
+global.fetch = function (url) {
+  const u = String(url);
+  growthRaceURLs.push(u);
+  if (u === '/admin/accounts') {
+    return Promise.resolve({ ok: true, status: 200, json: async function () {
+      return { items: [
+        { uid: 'h_deadbeef', raw_uid: 'user@example.com', nickname: '邮箱号', active: true },
+        { uid: 'acc2', raw_uid: 'acc2', nickname: '账号B', active: false },
+      ] };
+    } });
+  }
+  if (u === '/admin/pool') {
+    return Promise.resolve({ ok: true, status: 200, json: async function () {
+      return { strategy: 'expire_first', accounts: [{ uid: 'user@example.com', nickname: '邮箱号', active: true }] };
+    } });
+  }
+  if (u.indexOf('/admin/growth/overview') === 0 || u.indexOf('/admin/checkin/status') === 0 ||
+      u.indexOf('/admin/tasks') === 0 || u.indexOf('/admin/compensation') === 0) {
+    return new Promise(function (resolve) {
+      const prev = releaseGrowth;
+      releaseGrowth = function () {
+        if (prev) prev();
+        resolve({ ok: true, status: 200, json: async function () {
+          return { ok: true, available: true, streak: { days: 7 }, tasks: [], data: { data: { today_checked_in: true } } };
+        } });
+      };
+    });
+  }
+  return Promise.resolve({ ok: true, status: 200, json: async function () { return {}; } });
+};
+const loadAllP = inst.loadAll(false);
+await new Promise(function (r) { setTimeout(r, 0); });
+if (releaseGrowth) releaseGrowth();
+await loadAllP;
+await new Promise(function (r) { setTimeout(r, 0); });
+if (!inst.growth.loaded || inst.checkinPending || !inst.tasksLoaded || !inst.compLoaded) {
+  fail('/growth 首屏加载卡死在加载态: ' + JSON.stringify({
+    growthLoaded: inst.growth.loaded, checkinPending: inst.checkinPending,
+    tasksLoaded: inst.tasksLoaded, compLoaded: inst.compLoaded,
+  }));
 }
-if (!inst.pool || inst.pool.accounts.length !== 1) {
-  fail('loadPool 未把号池快照写进状态: ' + JSON.stringify(inst.pool));
+if (inst.accountUID(inst.accounts.items[0]) !== 'user@example.com') {
+  fail('accountUID 应优先返回 raw_uid: ' + inst.accountUID(inst.accounts.items[0]));
 }
-if (!inst.labs.pool_enabled) fail('loadPool 等价拉开关后 labs.pool_enabled 应为 true');
-
-// 17c) 开关确实关着时不得请求 /admin/pool（省一次无意义请求）
-inst._experimentsLoaded = false;
-inst.labs.pool_enabled = false;
-inst.pool = { accounts: [{ uid: 'stale' }] };   // 脏值应被清空
-poolUrls.length = 0;
-poolFetch(false);
-await inst.loadPool();
-if (/\/admin\/pool/.test(poolUrls.join(','))) {
-  fail('号池关闭时不应请求 /admin/pool: ' + JSON.stringify(poolUrls));
+if (inst.growthEffectiveUID() !== 'user@example.com') {
+  fail('growthEffectiveUID 应返回 raw_uid（user@example.com），实得 ' + inst.growthEffectiveUID());
 }
-if (inst.pool !== null) fail('号池关闭时 pool 快照应清空（否则残留上一轮账号列表），得到 ' + JSON.stringify(inst.pool));
-
-// 17d) 开关未知时并发调用 loadPool 不得重复打 /admin/experiments（在途去重）
-inst._experimentsLoaded = false;
-inst.labs.pool_enabled = false;
-poolUrls.length = 0;
-poolFetch(true);
-await Promise.all([inst.loadPool(), inst.loadPool()]);
-const expHits = poolUrls.filter(function (u) { return /\/admin\/experiments/.test(u); }).length;
-if (expHits !== 1) fail('并发 loadPool 应只拉一次实验开关，实际 ' + expHits + ' 次: ' + JSON.stringify(poolUrls));
-
-// 17e) 会话边界（登出/401）后必须重新拉开关：换会话前的实验状态不可信
-inst._experimentsLoaded = true;
-inst.resetSession();
-if (inst._experimentsLoaded) fail('resetSession 未清 _experimentsLoaded（重新登录会沿用上一会话的实验开关）');
+if (inst.poolAccountName('user@example.com') !== '邮箱号') {
+  fail('poolAccountName 应能通过 raw_uid 匹配 accounts.items: ' + inst.poolAccountName('user@example.com'));
+}
+inst.loadAccounts = savedLoadAccounts17f;
+inst.logFilter.account_uid = '';
+inst.growthUID = '';
+inst.resourceUID = 'all';
+global.fetch = savedFetch;
 
 // 18) 统计页时间范围切换：五档（all/24h/7d/30d/90d）拉对应 ?range= 参数、持久化、
 // 丢弃先发后到的旧响应（防快速切换时页面跳回旧范围）
@@ -1706,13 +1811,8 @@ func TestAccountPageExportImportUI(t *testing.T) {
 	}
 }
 
-// TestAccountPagePoolCreditsColumn 号池卡片必须显示**每个**号的额度，且能区分「未知」与「额度 0」。
-//
-// 两个回归点：
-//  1. 额度列原来用 `credits>0` 判显隐，探测确认耗尽（credits=0, credits_at>0）的号会被
-//     当成「未知」显示 —，用户看不出它到底是没探过还是真的用完了；
-//  2. 卡片原来 `x-show="labs.pool_enabled"`，而该字段只有实验页会拉，刷新在账号页时
-//     恒为 false → 号池状态整块看不见（只能从实验页跳过去才出现）。
+// TestAccountPagePoolCreditsColumn 统一账号与调度控制台必须显示每个号的额度、到期信息与策略切换，
+// 且能区分「未知」与「额度 0」、无实验开关门控。
 func TestAccountPagePoolCreditsColumn(t *testing.T) {
 	html, err := pageFS.ReadFile("pages/account.html")
 	if err != nil {
@@ -1722,48 +1822,112 @@ func TestAccountPagePoolCreditsColumn(t *testing.T) {
 	for _, want := range []string{
 		"a.credits_at>0", // 「未知」判定靠探测时刻，而非额度是否大于 0
 		"fmtDosage(a.credits)",
-		"号池状态",
-		"loadPool()", // 手动刷新按钮
+		"账号与调度",
+		"setPoolStrategy(opt.key)",
+		"openAccountResources(accountUID(a))",
+		"a.earliest_expire_at>0",
+		"refreshPoolConsole()",
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("account.html 缺少 %q", want)
 		}
 	}
-	if strings.Contains(page, "x-if=\"a.credits>0\"") {
+	if strings.Contains(page, `x-if="a.credits>0"`) {
 		t.Error("account.html 仍用 credits>0 判显隐（探测确认耗尽的号会被误显成「未知」）")
+	}
+	if strings.Contains(page, "labs.pool_enabled") {
+		t.Error("account.html 仍残留实验开关 labs.pool_enabled 门控")
 	}
 }
 
-// TestExperimentsLoadedOnLogin 登录进场必须拉实验开关（号池卡片的可见性依赖它）。
-//
-// 只看源码文本是因为这条约束同时横跨“谁调它”与“谁不覆盖它”：
-// afterLogin 必须调；页面层不得再定义同名成员（重名会顶掉共享层实现，由
-// TestPageLayerDoesNotShadowShell 兵底）。行为验证在 harness 第 17 组。
-func TestExperimentsLoadedOnLogin(t *testing.T) {
-	src, err := assetFS.ReadFile("assets/app.js")
+// TestNativeMultiAccountUI 原生常驻多账号路由 UI 契约：
+// 实验页移除号池开关，设置页承载多账号调度参数与 models.json 示例，余额/任务/日志页接入多账号能力。
+func TestNativeMultiAccountUI(t *testing.T) {
+	appSrc, err := assetFS.ReadFile("assets/app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
-	js := string(src)
-	for _, want := range []string{
-		"afterLogin(){ this.loadHealth(); this.loadExperiments();",
-		"async loadPool(){",
-		"if(!this._experimentsLoaded) await this.loadExperiments();",
-		"applyExperiments(r){",
-	} {
-		if !strings.Contains(js, want) {
-			t.Errorf("app.js 缺少 %q（刷新后号池不可见的回归）", want)
-		}
+	if strings.Contains(string(appSrc), "pool_enabled") {
+		t.Error("app.js 仍残留实验开关 pool_enabled")
 	}
-	// 页面层不得重复实现（两份会静默漂移）
-	labs, err := assetFS.ReadFile("assets/pages/labs.js")
+
+	labsHTML, err := pageFS.ReadFile("pages/labs.html")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, banned := range []string{"applyExperiments(r){", "async loadPool(){"} {
-		if strings.Contains(string(labs), banned) {
-			t.Errorf("labs.js 重复定义了 %q（应一律用共享层实现）", banned)
+	labsJS, err := assetFS.ReadFile("assets/pages/labs.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"号池负载均衡", "togglePool", "BUDDY2API_POOL_ENABLED", "pool_enabled"} {
+		if strings.Contains(string(labsHTML), banned) || strings.Contains(string(labsJS), banned) {
+			t.Errorf("labs 页面仍残留旧号池实验开关 %q", banned)
 		}
+	}
+
+	settingsHTML, err := pageFS.ReadFile("pages/settings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settingsJS, err := assetFS.ReadFile("assets/pages/settings.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"多账号调度", "pool_strategy", "pool_session_ttl", "pool_max_retry", "pool_cool_max_min", "pool_probe_cron", "poolModelsJsonSample"} {
+		if !strings.Contains(string(settingsHTML), want) {
+			t.Errorf("settings.html 缺少 %q", want)
+		}
+		if want != "多账号调度" && !strings.Contains(string(settingsJS), want) {
+			t.Errorf("settings.js 缺少 %q", want)
+		}
+	}
+
+	resHTML, err := pageFS.ReadFile("pages/resources.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"resourceUID", "selectResourceUID(", "accounts_summary", "expiring_7d", "account_label"} {
+		if !strings.Contains(string(resHTML), want) {
+			t.Errorf("resources.html 缺少 %q", want)
+		}
+	}
+
+	growthHTML, err := pageFS.ReadFile("pages/growth.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	growthJS, err := assetFS.ReadFile("assets/pages/growth.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"selectGrowthUID(", "checkinSummary", "claimCheckinAll()", "全账号今日签到", "一键全签"} {
+		if !strings.Contains(string(growthHTML), want) {
+			t.Errorf("growth.html 缺少 %q", want)
+		}
+	}
+	for _, want := range []string{"/admin/checkin/summary", "/admin/checkin/claim_all", "withGrowthUID(", "growthTargetLabel("} {
+		if !strings.Contains(string(growthJS), want) {
+			t.Errorf("growth.js 缺少 %q", want)
+		}
+	}
+
+	logsHTML, err := pageFS.ReadFile("pages/logs.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logsJS, err := assetFS.ReadFile("assets/pages/logs.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logsHTML), "logFilter.account_uid") {
+		if !strings.Contains(string(logsHTML), "accountUID(a)") {
+			t.Error("logs.html 应使用 accountUID(a) 作为账号筛选选项值（兼容 raw_uid）")
+		}
+	} else {
+		t.Error("logs.html 缺少账号筛选 logFilter.account_uid")
+	}
+	if !strings.Contains(string(logsJS), "qs.set('account_uid'") || !strings.Contains(string(logsJS), "this.loadAccounts()") {
+		t.Error("logs.js 缺少 account_uid 查询参数或 loadAccounts() 进场加载")
 	}
 }
 
@@ -1858,7 +2022,7 @@ func TestAccountPageRemarkUI(t *testing.T) {
 	}
 	page, script := string(html), string(js)
 	for _, want := range []string{
-		"<th>备注</th>",
+		"<th>账号 / 备注</th>",
 		"updateAccountRemark(",
 		"accountLabel(",
 		"importForm.remark",

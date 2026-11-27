@@ -99,36 +99,83 @@ func ParseFlexibleTime(v any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// TotalDosage 从 get-user-resource 的 data 节点算「真实可用额度」。
+// Summary 账号额度摘要：总可用额度、最早到期时间戳与该日到期额度合计。
+type Summary struct {
+	Total            float64
+	EarliestExpireAt int64   // 有余量且未过期包中的最早到期 Unix 秒；无到期包或无余量时为 0
+	ExpiringCredits  float64 // 与 EarliestExpireAt 同北京时间自然日（CST）到期的余量之和
+}
+
+// QuotaSummary 从 get-user-resource 的 data 节点聚合可用额度与到期摘要。
 //
 // 口径与 admin 余额面板的 total_dosage 一致（Σ 未过期包的周期优先剩余）。**不用**上游的
 // TotalDosage：它按账户级 CapacityRemain 聚合，而按月周期计费的包（体验版/裂变包）
 // 周期额度用尽后账户级 Remain 不随周期扣减，会一直计入幻影剩余
 // （实测：真实可用 0 时 TotalDosage 仍显示 500）。
 //
-// 面板与号池探测共用同一份计算，避免「面板说有额度、探测判定耗尽」的自相矛盾。
-func TotalDosage(data []byte) float64 {
+// EarliestExpireAt 仅纳入 remain > 0 且存在合法未过期到期时间的包（零余量或永久包不参与）；
+// ExpiringCredits 统计与 EarliestExpireAt 同北京时间自然日（CST）到期的所有有余量包之和。
+func QuotaSummary(data []byte) Summary {
+	return quotaSummaryAt(data, time.Now())
+}
+
+func quotaSummaryAt(data []byte, now time.Time) Summary {
 	accs, ok := Accounts(data)
 	if !ok {
-		return 0
+		return Summary{}
 	}
-	now := time.Now()
-	sum := 0.0
+	type expiringPkg struct {
+		et     time.Time
+		remain float64
+	}
+	var (
+		sum      float64
+		earliest time.Time
+		expPkgs  []expiringPkg
+	)
 	for _, acc := range accs {
 		// 到期判定与面板一致：到期未知的包视为有效
-		if _, et, ok := ResolveExpireTime(acc); ok && et.Before(now) {
+		_, et, hasExpire := ResolveExpireTime(acc)
+		if hasExpire && et.Before(now) {
 			continue
 		}
 		// 周期优先：存在周期数据（剩余或已用 > 0）时用周期级，否则回退账户级
+		var remain float64
 		cycRemain := NumField(acc, "CycleCapacityRemainPrecise", "CycleCapacityRemain")
 		cycUsed := NumField(acc, "CycleCapacityUsedPrecise", "CycleCapacityUsed")
 		if cycRemain > 0 || cycUsed > 0 {
-			sum += cycRemain
-			continue
+			remain = cycRemain
+		} else {
+			remain = NumField(acc, "CapacityRemainPrecise", "CapacityRemain")
 		}
-		sum += NumField(acc, "CapacityRemainPrecise", "CapacityRemain")
+		sum += remain
+		if remain > 0 && hasExpire {
+			expPkgs = append(expPkgs, expiringPkg{et: et, remain: remain})
+			if earliest.IsZero() || et.Before(earliest) {
+				earliest = et
+			}
+		}
 	}
-	return round2(sum)
+	res := Summary{Total: round2(sum)}
+	if !earliest.IsZero() {
+		res.EarliestExpireAt = earliest.Unix()
+		earliestDay := earliest.In(TZ).Format("2006-01-02")
+		var expSum float64
+		for _, p := range expPkgs {
+			if p.et.In(TZ).Format("2006-01-02") == earliestDay {
+				expSum += p.remain
+			}
+		}
+		res.ExpiringCredits = round2(expSum)
+	}
+	return res
+}
+
+// TotalDosage 从 get-user-resource 的 data 节点算「真实可用额度」。
+//
+// 面板与号池探测共用同一份计算，避免「面板说有额度、探测判定耗尽」的自相矛盾。
+func TotalDosage(data []byte) float64 {
+	return QuotaSummary(data).Total
 }
 
 // Accounts 解出 data 节点下的 Accounts 数组。

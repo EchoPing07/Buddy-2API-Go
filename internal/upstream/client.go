@@ -60,6 +60,17 @@ func New(toks *auth.TokenStore, regionProvider func() string, chatTimeoutSeconds
 	}
 }
 
+// WithTokenStore 返回使用指定凭证存储的客户端浅拷贝（共享 long/short HTTP Client、
+// regionProvider 及全部 *BaseOverride 字段）。ts 为 nil 时原样返回 c。
+func (c *Client) WithTokenStore(ts *auth.TokenStore) *Client {
+	if ts == nil {
+		return c
+	}
+	cp := *c
+	cp.toks = ts
+	return &cp
+}
+
 func (c *Client) ep() config.Endpoint { return config.EndpointOf(c.regionProvider()) }
 
 // authBase token 刷新请求主机。包级变量便于单测以 httptest 替换（生产恒为当前端点）；
@@ -194,7 +205,7 @@ func sendOnce(cl *http.Client, build func() (*http.Request, error)) (int, []byte
 // 既有的可见文案（proxy 会把它变成 503 + 这句话），不能为号池改变它，
 // 否则关闭号池时会看到不一致的报错。号池走 DoChatWith，那里返回合成的 401 响应。
 func (c *Client) DoChat(ctx context.Context, body []byte) (*http.Response, error) {
-	return c.doChatWith(ctx, c.toks, body, false)
+	return c.doChatWith(ctx, c.toks, body, false, "")
 }
 
 // DoChatWith 用指定账号的凭证发 chat（号池专用）。
@@ -210,14 +221,23 @@ func (c *Client) DoChat(ctx context.Context, body []byte) (*http.Response, error
 // 刻意不把 c.toks 改成 map：scheduler / admin / growth 全都依赖
 // 「当前活动账号」语义，改 map 会牵连一大片（见 docs/POOL-LOADBALANCE.md §9.1）。
 func (c *Client) DoChatWith(ctx context.Context, ts *auth.TokenStore, body []byte) (*http.Response, error) {
+	return c.DoChatWithSession(ctx, ts, body, "")
+}
+
+// DoChatWithSession 用指定账号的凭证及会话键发 chat（号池专用）。
+//
+// 在 DoChatWith 基础上显式注入由 (uid, sessionKey) 派生的账号隔离 prompt_cache_key：
+// 即使客户端自带了 prompt_cache_key，号池路径也会用 uid 二次隔离，确保故障转移换号时
+// 不跨账号复用缓存键。
+func (c *Client) DoChatWithSession(ctx context.Context, ts *auth.TokenStore, body []byte, sessionKey string) (*http.Response, error) {
 	if ts == nil {
 		return nil, ErrNoToken
 	}
-	return c.doChatWith(ctx, ts, body, true)
+	return c.doChatWith(ctx, ts, body, true, sessionKey)
 }
 
 // doChatWith chat 主流程：ts 决定用哪份凭证、走哪个刷新单飞。
-func (c *Client) doChatWith(ctx context.Context, ts *auth.TokenStore, body []byte, synth401 bool) (*http.Response, error) {
+func (c *Client) doChatWith(ctx context.Context, ts *auth.TokenStore, body []byte, synth401 bool, sessionKey string) (*http.Response, error) {
 	t := ts.Get()
 	if t == nil {
 		return nil, ErrNoToken
@@ -229,8 +249,13 @@ func (c *Client) doChatWith(ctx context.Context, ts *auth.TokenStore, body []byt
 	}
 
 	// 注入上游前缀缓存命中键（按账号隔离）。放在凭证确定之后，因为键里要嵌 uid。
-	// 这是「缓存命中率与 usage 缓存字段恒为 0」的根因修复：此前既不透传也不注入。
-	body = InjectPromptCacheKey(body, t.UID)
+	// 号池路径（synth401）或显式指定 sessionKey 时强制走 InjectPromptCacheKeyWithSession，
+	// 保证按会话稳定且跨账号严格隔离；单账号无 sessionKey 路径维持 InjectPromptCacheKey 既有语义。
+	if synth401 || strings.TrimSpace(sessionKey) != "" {
+		body = InjectPromptCacheKeyWithSession(body, t.UID, sessionKey)
+	} else {
+		body = InjectPromptCacheKey(body, t.UID)
+	}
 
 	resp, err := c.chatOnce(ctx, body, t)
 	if err != nil {

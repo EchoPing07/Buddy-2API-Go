@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -31,9 +33,16 @@ const (
 //
 // 行为用「每个账号一个脚本」表达：script 是响应动作的序列，用完后重复最后一个。
 // 这样单测能精确表达「第一次 6004、之后 200」这种场景。
+type capturedReq struct {
+	UID            string
+	ConversationID string
+	PromptCacheKey string
+}
+
 type fakeChat struct {
 	mu       sync.Mutex
 	hits     map[string]int
+	reqs     []capturedReq
 	scripts  map[string][]func(w http.ResponseWriter)
 	default_ func(w http.ResponseWriter)
 }
@@ -76,9 +85,19 @@ func respSSEWithErrorFrame(frame string) func(http.ResponseWriter) {
 
 func (f *fakeChat) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	uid := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer at-")
+	rawBody, _ := io.ReadAll(r.Body)
+	var bodyObj map[string]any
+	_ = json.Unmarshal(rawBody, &bodyObj)
+	cacheKey, _ := bodyObj["prompt_cache_key"].(string)
+
 	f.mu.Lock()
 	f.hits[uid]++
 	n := f.hits[uid] - 1
+	f.reqs = append(f.reqs, capturedReq{
+		UID:            uid,
+		ConversationID: r.Header.Get("X-Conversation-ID"),
+		PromptCacheKey: cacheKey,
+	})
 	steps := f.scripts[uid]
 	f.mu.Unlock()
 
@@ -227,22 +246,35 @@ func (f *poolFixture) maxLogID(t *testing.T) int64 {
 	return logs[0].ID
 }
 
-// TestPoolDisabledZeroChange 开关关闭：走单账号路径，account_uid 为空。
-func TestPoolDisabledZeroChange(t *testing.T) {
+// TestPoolNilUsesSingleAccount h.pool 为 nil 时走单账号路径，account_uid 为空；
+// 当 h.pool 非 nil 时即使配置中 PoolEnabled=false 也常驻启用多账号调度。
+func TestPoolNilUsesSingleAccount(t *testing.T) {
 	f := newPoolFixture(t, "acc1", "acc2")
+	// 1. h.pool 非 nil 且 PoolEnabled=false：仍走号池（原生常驻）
 	if err := f.cfg.Update(func(c *config.Config) error { c.PoolEnabled = false; return nil }); err != nil {
 		t.Fatal(err)
 	}
+	f.pin("s-on", "glm", "acc2")
 	before := f.maxLogID(t)
+	if rr := f.chat(t, "s-on", "glm"); rr.Code != http.StatusOK {
+		t.Fatalf("应成功，得到 %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := f.lastLog(t, before).AccountUID; got != "acc2" {
+		t.Errorf("原生常驻号池时应按粘性命中 acc2，得到 %q", got)
+	}
+
+	// 2. h.pool == nil（隔离单测模式）：退回单账号路径，account_uid 为空
+	f.h.pool = nil
+	before = f.maxLogID(t)
 	rr := f.chat(t, "s1", "glm")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("应成功，得到 %d: %s", rr.Code, rr.Body.String())
 	}
 	if got := f.lastLog(t, before).AccountUID; got != "" {
-		t.Errorf("号池关闭时 account_uid 应为空，得到 %q", got)
+		t.Errorf("pool 为 nil 时 account_uid 应为空，得到 %q", got)
 	}
-	if f.up.hits["acc1"] != 1 || f.up.hits["acc2"] != 0 {
-		t.Errorf("应只请求当前活动账号 acc1，实际 %v", f.up.hits)
+	if f.up.hits["acc1"] != 1 || f.up.hits["acc2"] != 1 {
+		t.Errorf("pool 为 nil 时应只再请求当前活动账号 acc1，实际 %v", f.up.hits)
 	}
 }
 
@@ -345,27 +377,35 @@ func TestPoolRetryStopsAtMaxRetry(t *testing.T) {
 	}
 }
 
-// TestPoolQuotaDisablesAfterTwo acc1 连续 14018 → 禁用；请求仍能被 acc2 接住。
+// TestPoolQuotaDisablesAfterTwo acc1 首次 14018 进入 60s 短冷却并摘掉该模型绑定，
+// 同一模型下毫秒请求直接落到 acc2；再次在另一模型撞 14018 达 streak=2 后整号禁用。
 func TestPoolQuotaDisablesAfterTwo(t *testing.T) {
 	f := newPoolFixture(t, "acc1", "acc2")
 	f.up.plan("acc1", respErr(http.StatusTooManyRequests, errBody14018))
 	f.pin("s1", "glm", "acc1")
 	f.pin("s2", "glm", "acc1")
+	f.pin("s3", "deepseek", "acc1")
 
-	// 第 1 次：acc1 额度耗尽（连击 1）→ 换号到 acc2 成功
+	// 第 1 次：acc1 glm 额度耗尽（连击 1）→ 换号到 acc2 成功，并对 (acc1, glm) 加 60s 短冷却
 	if rr := f.chat(t, "s1", "glm"); rr.Code != http.StatusOK {
 		t.Fatalf("应换号成功，得到 %d: %s", rr.Code, rr.Body.String())
 	}
 	st, ok := f.m.AccountStateOf("acc1")
-	if !ok {
-		t.Fatal("应有 acc1 状态")
+	if !ok || !st.Available() || st.QuotaFailStreak != 1 {
+		t.Fatalf("第 1 次 14018 不应整号禁用（avail=%v streak=%d）", st.Available(), st.QuotaFailStreak)
 	}
-	if !st.Available() {
-		t.Error("第 1 次 14018 不应禁用")
-	}
-	// 第 2 次：再撞一次 → 禁用
+	// 同一模型下毫秒内再次请求：应避开处于 60s 短冷却的 acc1，不增加 acc1 命中次数
+	hitsBefore := f.up.hits["acc1"]
 	if rr := f.chat(t, "s2", "glm"); rr.Code != http.StatusOK {
-		t.Fatalf("应仍能成功，得到 %d", rr.Code)
+		t.Fatalf("应直接命中 acc2 成功，得到 %d", rr.Code)
+	}
+	if f.up.hits["acc1"] != hitsBefore {
+		t.Errorf("首次 14018 后 (acc1, glm) 应进入 60s 短冷却，不应再被撞到（hits %d -> %d）", hitsBefore, f.up.hits["acc1"])
+	}
+
+	// 第 2 次撞 14018（另一模型 deepseek）→ 达到 streak=2 整号禁用
+	if rr := f.chat(t, "s3", "deepseek"); rr.Code != http.StatusOK {
+		t.Fatalf("应仍能换号成功，得到 %d", rr.Code)
 	}
 	st, _ = f.m.AccountStateOf("acc1")
 	if st.Available() {
@@ -576,5 +616,122 @@ func TestPoolCooldownUsesRouteModel(t *testing.T) {
 	// 用**请求 model**（glm）查询必须能看到冷却
 	if avail := f.m.Available("glm"); len(avail) != 1 || avail[0] == "acc1" {
 		t.Errorf("冷却应记在请求 model 上（glm），实际可用集合 %v", avail)
+	}
+}
+
+// TestPoolSSEInline14018ReachesStreakTwoAndDisables 验证 HTTP 200 流内 14018 不会在开流时被
+// NoteSuccess 清零连击计数，连续两次流内 14018 后整号禁用，且首次会解绑并加 60s 短冷却。
+func TestPoolSSEInline14018ReachesStreakTwoAndDisables(t *testing.T) {
+	f := newPoolFixture(t, "acc1", "acc2")
+	f.up.plan("acc1", respSSEWithErrorFrame(errBody14018))
+	f.pin("s1", "glm", "acc1")
+	f.pin("s2", "deepseek", "acc1")
+
+	if rr := f.chatStream(t, "s1", "glm"); rr.Code != http.StatusOK {
+		t.Fatalf("开流应 200，得到 %d", rr.Code)
+	}
+	st, _ := f.m.AccountStateOf("acc1")
+	if st.QuotaFailStreak != 1 || st.AutoDisabled != "" {
+		t.Fatalf("首次流内 14018 后 streak 应保持 1（不被 NoteSuccess 清零），实际 %+v", st)
+	}
+	if avail := f.m.Available("glm"); len(avail) != 1 || avail[0] != "acc2" {
+		t.Errorf("首次流内 14018 后 glm 应短冷却避开 acc1，实际 %v", avail)
+	}
+
+	if rr := f.chatStream(t, "s2", "deepseek"); rr.Code != http.StatusOK {
+		t.Fatalf("第二次开流应 200，得到 %d", rr.Code)
+	}
+	st, _ = f.m.AccountStateOf("acc1")
+	if st.QuotaFailStreak != 2 || st.AutoDisabled != pool.AutoQuota {
+		t.Errorf("连续两次流内 14018 应禁用账号为 quota，实际 %+v", st)
+	}
+
+	// 非流式 aggregate 遇流内 14018 同样不调用 NoteSuccess/Bind
+	f2 := newPoolFixture(t, "acc1", "acc2")
+	f2.up.plan("acc1", respSSEWithErrorFrame(errBody14018))
+	f2.pin("s-agg", "glm", "acc1")
+	if rr := f2.chat(t, "s-agg", "glm"); rr.Code != http.StatusOK {
+		t.Fatalf("aggregate 返回 %d", rr.Code)
+	}
+	stAgg, _ := f2.m.AccountStateOf("acc1")
+	if stAgg.QuotaFailStreak != 1 {
+		t.Errorf("非流式流内 14018 后 streak 应为 1，实际 %d", stAgg.QuotaFailStreak)
+	}
+}
+
+// TestPoolInflightTrackedAndReleased 验证在途请求计数在流式请求期间准确置 1、结束后准确归 0。
+func TestPoolInflightTrackedAndReleased(t *testing.T) {
+	f := newPoolFixture(t, "acc1", "acc2")
+	f.pin("s-inf", "glm", "acc1")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	f.up.plan("acc1", func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `data: {"id":"c1","model":"glm","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`+"\n\n")
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		close(started)
+		<-release
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- f.chatStream(t, "s-inf", "glm")
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("等待上游流开始超时")
+	}
+	if inf := f.m.Inflight("acc1"); inf != 1 {
+		t.Errorf("请求进行中 acc1 inflight 应为 1，实际 %d", inf)
+	}
+	close(release)
+	rr := <-done
+	if rr.Code != http.StatusOK {
+		t.Fatalf("流式请求失败: %d", rr.Code)
+	}
+	if inf := f.m.Inflight("acc1"); inf != 0 {
+		t.Errorf("流结束后 acc1 inflight 应归 0，实际 %d", inf)
+	}
+}
+
+// TestPoolSessionCacheKeyPropagation 验证 sessKey 传入 DoChatWithSession 后生成按账号隔离的
+// prompt_cache_key 与稳定 X-Conversation-ID，换号重试时不跨号共享缓存键。
+func TestPoolSessionCacheKeyPropagation(t *testing.T) {
+	f := newPoolFixture(t, "acc1", "acc2")
+	f.up.plan("acc1", respErr(http.StatusTooManyRequests, errBody6004))
+	f.pin("sess-cache", "glm", "acc1")
+
+	// 第 1 次请求：acc1 6004 → 重试 acc2 成功
+	if rr := f.chat(t, "sess-cache", "glm"); rr.Code != http.StatusOK {
+		t.Fatalf("应换号成功，得到 %d", rr.Code)
+	}
+	// 第 2 次请求：同会话应粘在 acc2 且使用完全相同的 prompt_cache_key / X-Conversation-ID
+	if rr := f.chat(t, "sess-cache", "glm"); rr.Code != http.StatusOK {
+		t.Fatalf("第二次请求失败: %d", rr.Code)
+	}
+
+	f.up.mu.Lock()
+	reqs := append([]capturedReq(nil), f.up.reqs...)
+	f.up.mu.Unlock()
+	if len(reqs) != 3 {
+		t.Fatalf("应有 3 次上游请求（acc1 失败 + acc2 成功 + acc2 复用），实际 %d: %+v", len(reqs), reqs)
+	}
+	rAcc1, rAcc2First, rAcc2Second := reqs[0], reqs[1], reqs[2]
+	if rAcc1.PromptCacheKey == "" || rAcc1.ConversationID == "" {
+		t.Fatalf("出站请求缺少 prompt_cache_key 或 X-Conversation-ID: %+v", rAcc1)
+	}
+	if rAcc1.PromptCacheKey == rAcc2First.PromptCacheKey || rAcc1.ConversationID == rAcc2First.ConversationID {
+		t.Errorf("换号重试跨账号不得复用同一缓存键/会话头: acc1=%+v acc2=%+v", rAcc1, rAcc2First)
+	}
+	if rAcc2First.PromptCacheKey != rAcc2Second.PromptCacheKey || rAcc2First.ConversationID != rAcc2Second.ConversationID {
+		t.Errorf("同账号同会话续轮必须复用完全一致的缓存键/会话头: %+v vs %+v", rAcc2First, rAcc2Second)
 	}
 }

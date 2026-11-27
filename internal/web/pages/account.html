@@ -2,48 +2,150 @@
         <header class="page-head">
           <h1>账号</h1>
           <div class="page-actions">
-            <button class="btn btn-secondary btn-sm" @click="openExport()" :disabled="loading"><span class="ic" x-html="ic('upload')"></span>导出凭证</button>
+            <div class="seg seg-sm" role="tablist" aria-label="多账号路由策略">
+              <template x-for="opt in poolStrategies" :key="opt.key">
+                <button type="button" class="seg-btn" role="tab"
+                        :class="{'is-active':poolStrategy===opt.key}"
+                        :aria-selected="poolStrategy===opt.key?'true':'false'"
+                        :disabled="loading"
+                        @click="setPoolStrategy(opt.key)"
+                        x-text="opt.label"></button>
+              </template>
+            </div>
+            <button class="btn btn-secondary btn-sm" @click="poolProbeAll()" :disabled="loading">全部探测</button>
+            <button class="btn btn-secondary btn-sm" @click="poolResetSessions()" :disabled="loading">重置会话</button>
             <button class="btn btn-secondary btn-sm" @click="openImport()"><span class="ic" x-html="ic('download')"></span>导入凭证</button>
-            <template x-if="account.logged_in">
-              <button class="btn btn-secondary btn-sm" @click="refreshToken()" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新 Token</button>
-            </template>
-            <template x-if="account.logged_in">
-              <button class="btn btn-secondary btn-sm" @click="testAccount()" :disabled="loading"><span class="ic" x-html="ic('shield')"></span>测试连通</button>
-            </template>
-            <template x-if="account.logged_in">
-              <button class="btn btn-danger btn-sm" @click="deleteAccount()" :disabled="loading"><span class="ic" x-html="ic('logout')"></span>退出登录</button>
-            </template>
+            <button class="btn btn-secondary btn-sm" @click="openExport()" :disabled="loading"><span class="ic" x-html="ic('upload')"></span>导出凭证</button>
           </div>
         </header>
 
-        <template x-if="account.logged_in">
-          <div class="card">
-            <div class="card-head">
-              <h3>OAuth 凭证</h3>
-              <span class="badge" :class="account.expired?'badge-err':'badge-ok'" x-text="account.expired?'已过期':'正常'"></span>
-              <span class="badge" :class="account.region_match?'badge-muted':'badge-warn'" x-text="account.region_match?'与当前端点匹配':'凭证属于另一端点'"></span>
-              <div class="spacer"></div>
-              <span class="muted-xs" x-text="'uid '+(account.uid||'—')"></span>
-            </div>
-            <div class="kv-grid">
-              <div class="kv"><span class="k">昵称</span><span class="v" x-text="account.nickname||'—'"></span></div>
-              <div class="kv"><span class="k">备注</span><span class="v"><input class="cell-edit" :value="account.remark||''" placeholder="添加备注" maxlength="64" aria-label="当前账号备注" @keydown.enter="$event.target.blur()" @change="updateAccountRemark(account, $event.target.value, $event.target)"></span></div>
-              <div class="kv"><span class="k">enterprise_id</span><span class="v" x-text="account.enterprise_id||'（个人账号）'"></span></div>
-              <div class="kv"><span class="k">domain</span><span class="v" x-text="account.domain||'—'"></span></div>
-              <div class="kv"><span class="k">access_token</span><span class="v mono" x-text="account.access_token"></span></div>
-              <div class="kv"><span class="k">refresh_token</span><span class="v" x-text="account.has_refresh?'已保存':'无'"></span></div>
-              <div class="kv"><span class="k">过期时间</span><span class="v" x-text="account.expires_human+(account.expires_at?'（'+ts(account.expires_at)+'）':'')"></span></div>
-            </div>
-          </div>
-        </template>
-
+        <!-- ═══ 统一账号与调度控制台（原生常驻多账号路由） ═══ -->
         <div class="card">
-          <div class="card-head"><h3 x-text="account.logged_in?'重新登录':'登录'"></h3></div>
+          <div class="card-head">
+            <h3>账号与调度</h3>
+            <span class="muted-xs" x-show="pool"
+                  x-text="(pool?pool.member_count:0)+' 个账号 · '+(pool?pool.available_now:0)+' 个可用 · '+(pool?pool.session_count:0)+' 个活跃会话'"></span>
+            <div class="spacer"></div>
+            <button class="btn btn-ghost btn-sm" @click="refreshPoolConsole()" :disabled="loading" title="刷新账号与调度快照">
+              <span class="ic" x-html="ic('refresh')"></span>刷新
+            </button>
+          </div>
+
+          <div class="empty" x-show="!poolLoaded && !unifiedAccounts.length">
+            <span class="spin" style="width:18px;height:18px"></span>加载中…
+          </div>
+          <div class="empty" x-show="poolLoaded && !unifiedAccounts.length">
+            <span class="ic ic-lg" x-html="ic('account')"></span>
+            还没有账号，请在下方登录或点击右上角导入凭证
+          </div>
+
+          <div class="table-wrap" x-show="unifiedAccounts.length">
+            <table>
+              <thead>
+                <tr>
+                  <th>账号 / 备注</th>
+                  <th>调度状态</th>
+                  <th>可用额度与到期</th>
+                  <th>限额中的模型</th>
+                  <th>会话 / 成功失败</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="a in unifiedAccounts" :key="a.uid">
+                  <tr>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <span style="font-weight:500" x-text="a.nickname||'未命名'"></span>
+                        <span class="badge badge-ok" x-show="a.active" title="默认主账号">主账号</span>
+                        <span class="badge badge-warn" x-show="!a.region_match" title="凭证属于另一端点">端点不匹配</span>
+                        <span class="badge badge-err" x-show="a.expired" title="access_token 已过期">Token已过期</span>
+                      </div>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap;margin-top:2px">
+                        <input class="cell-edit cell-edit-sm" :value="a.remark||''" placeholder="添加备注" maxlength="64"
+                               aria-label="账号备注" @keydown.enter="$event.target.blur()"
+                               @change="updateAccountRemark(a, $event.target.value, $event.target)">
+                        <span class="mono muted-xs" :title="a.uid" x-text="'…'+(a.uid||'').slice(-8)"></span>
+                      </div>
+                    </td>
+                    <td>
+                      <span class="badge" :class="poolStateClass(a)" x-text="poolStateText(a)"></span>
+                      <div class="muted-xs" x-show="a.auto_disabled_msg" :title="a.auto_disabled_msg"
+                           x-text="a.auto_disabled_msg.slice(0,36)"></div>
+                    </td>
+                    <td>
+                      <!-- credits_at = 0 表示从未探测过（显示 —）；探测确认耗尽时 credits_at > 0 且 credits = 0，显示 0 -->
+                      <button type="button" class="credits-link" @click="openAccountResources(accountUID(a))"
+                              :title="(a.credits_at>0 ? ('上次探测于 '+ts(a.credits_at)+' · ') : '尚未探测 · ')+'点击查看该账号余额明细'">
+                        <template x-if="a.credits_at>0">
+                          <span style="font-weight:600;font-variant-numeric:tabular-nums" x-text="fmtDosage(a.credits)"></span>
+                        </template>
+                        <template x-if="!(a.credits_at>0)">
+                          <span class="muted-xs">—</span>
+                        </template>
+                        <span x-show="a.earliest_expire_at>0"
+                              :class="isExpiringSoon(a.earliest_expire_at)?'badge badge-warn':'muted-xs'"
+                              x-text="expireHint(a.earliest_expire_at, a.expiring_credits)"></span>
+                      </button>
+                    </td>
+                    <td>
+                      <template x-for="c in (a.model_cooldowns||[])" :key="c.model">
+                        <div class="row" style="gap:6px;flex-wrap:nowrap">
+                          <span class="mono" x-text="c.model"></span>
+                          <span class="muted-xs" :title="'上游重置时间 '+ts(c.reset_at)+'；实际生效截止 '+ts(c.until)+(c.reset_at&&c.reset_at!==c.until?'（已被上限截断）':'')"
+                                x-text="'剩 '+coolLeft(c.until)"></span>
+                          <button class="btn btn-ghost btn-sm" @click="poolClearCool(a,c)"
+                                  :disabled="loading" title="手动清除该模型冷却">清除</button>
+                        </div>
+                      </template>
+                      <span class="muted-xs" x-show="!(a.model_cooldowns||[]).length">—</span>
+                    </td>
+                    <td>
+                      <div class="row" style="gap:6px;flex-wrap:nowrap">
+                        <span x-text="(a.bound_sessions||0)+' 会话'"></span>
+                        <span class="badge badge-warn" x-show="a.inflight>0" x-text="a.inflight+' 进行中'"></span>
+                      </div>
+                      <div class="muted-xs">
+                        <span class="mono" x-text="(a.success_count||0)+' / '+(a.error_count||0)"></span>
+                        <span x-show="a.last_probe_at" :title="a.last_probe_msg" x-text="' · 探测 '+ts(a.last_probe_at)"></span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="row" style="gap:4px;flex-wrap:nowrap">
+                        <button class="btn btn-ghost btn-sm" x-show="!a.manual_disabled"
+                                style="color:var(--destructive)" @click="poolDisable(a)" :disabled="loading">禁用</button>
+                        <button class="btn btn-secondary btn-sm" x-show="a.manual_disabled"
+                                @click="poolEnable(a)" :disabled="loading">启用</button>
+                        <button class="btn btn-ghost btn-sm" @click="poolProbe(a)"
+                                :disabled="loading||a.manual_disabled" title="探测凭证状态、剩余额度与最早到期日">探测</button>
+                        <button class="btn btn-secondary btn-sm" x-show="!a.active"
+                                @click="switchAccount(a)" :disabled="loading">设为主账号</button>
+                        <button class="btn btn-ghost btn-sm" style="color:var(--destructive)" x-show="!a.active"
+                                @click="removeAccount(a)" :disabled="loading">移除</button>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="field-hint code-hint" x-show="pool">
+            <div>* 粘性命中率 <span class="mono" x-text="pool?pool.sticky_hit_total+' / '+(pool.sticky_hit_total+pool.sticky_miss_total):'—'"></span>
+                 · 调度策略与会话粘性参数可在「设置 → 多账号调度」调整</div>
+            <div>* 「可用额度与到期」来自上次探测，点击可直接跳转「余额」页查看该账号各额度包明细</div>
+          </div>
+        </div>
+
+        <!-- ═══ 添加 / 重新登录账号（OAuth 设备流） ═══ -->
+        <div class="card">
+          <div class="card-head">
+            <h3>添加 / 重新登录账号</h3>
+            <div class="spacer"></div>
+            <button class="btn btn-sm" x-show="!oauth.state" @click="oauthStart()" :disabled="loading"><span class="ic" x-html="ic('external')"></span>开始登录</button>
+          </div>
           <template x-if="!oauth.state">
-            <div>
-              <p class="oauth-desc">点击开始后，在打开的浏览器页面中完成授权登录。凭证仅保存在本地 data 目录。</p>
-              <button class="btn" @click="oauthStart()" :disabled="loading"><span class="ic" x-html="ic('external')"></span>开始登录</button>
-            </div>
+            <p class="oauth-desc" style="margin:0;max-width:none">通过浏览器完成 OAuth 授权登录，登录后自动存档并参与多账号调度；凭证仅保存在本地 data 目录。</p>
           </template>
           <template x-if="oauth.state">
             <div class="oauth-box">
@@ -59,145 +161,35 @@
           </template>
         </div>
 
-        <!-- 多账号档案：切换只改活动凭证（token.json），不轮询、不故障转移 -->
-        <div class="card">
-          <div class="card-head">
-            <h3>账号切换</h3>
-            <span class="muted-xs" x-show="accounts.loaded" x-text="accounts.items.length+' 个已存账号'"></span>
-            <div class="spacer"></div>
-            <span class="muted-xs">登录或导入凭证后自动存档</span>
+        <!-- ═══ 主账号 OAuth 凭证详情（次要/可折叠） ═══ -->
+        <template x-if="account.logged_in">
+          <div class="card">
+            <div class="card-head" style="margin-bottom:0">
+              <h3>主账号 OAuth 凭证</h3>
+              <span class="muted-xs" x-text="accountLabel(account)"></span>
+              <span class="badge" :class="account.expired?'badge-err':'badge-ok'" x-text="account.expired?'已过期':'正常'"></span>
+              <span class="badge" :class="account.region_match?'badge-muted':'badge-warn'" x-text="account.region_match?'与当前端点匹配':'凭证属于另一端点'"></span>
+              <div class="spacer"></div>
+              <button class="btn btn-secondary btn-sm" @click="refreshToken()" :disabled="loading"><span class="ic" x-html="ic('refresh')"></span>刷新 Token</button>
+              <button class="btn btn-secondary btn-sm" @click="testAccount()" :disabled="loading"><span class="ic" x-html="ic('shield')"></span>测试连通</button>
+              <button class="btn btn-danger btn-sm" @click="deleteAccount()" :disabled="loading"><span class="ic" x-html="ic('logout')"></span>退出登录</button>
+            </div>
+            <details class="details-box">
+              <summary>展开主账号令牌与元数据（uid <span class="mono" x-text="account.uid||'—'"></span>）</summary>
+              <div class="details-body">
+                <div class="kv-grid">
+                  <div class="kv"><span class="k">昵称</span><span class="v" x-text="account.nickname||'—'"></span></div>
+                  <div class="kv"><span class="k">备注</span><span class="v"><input class="cell-edit" :value="account.remark||''" placeholder="添加备注" maxlength="64" aria-label="当前账号备注" @keydown.enter="$event.target.blur()" @change="updateAccountRemark(account, $event.target.value, $event.target)"></span></div>
+                  <div class="kv"><span class="k">enterprise_id</span><span class="v" x-text="account.enterprise_id||'（个人账号）'"></span></div>
+                  <div class="kv"><span class="k">domain</span><span class="v" x-text="account.domain||'—'"></span></div>
+                  <div class="kv"><span class="k">access_token</span><span class="v mono" x-text="account.access_token"></span></div>
+                  <div class="kv"><span class="k">refresh_token</span><span class="v" x-text="account.has_refresh?'已保存':'无'"></span></div>
+                  <div class="kv"><span class="k">过期时间</span><span class="v" x-text="account.expires_human+(account.expires_at?'（'+ts(account.expires_at)+'）':'')"></span></div>
+                </div>
+              </div>
+            </details>
           </div>
-          <div class="empty" x-show="accounts.loaded && !accounts.items.length">
-            <span class="ic ic-lg" x-html="ic('account')"></span>
-            还没有其它账号
-          </div>
-          <div class="table-wrap" x-show="accounts.items.length">
-            <table>
-              <thead><tr><th>账号</th><th>备注</th><th>uid</th><th>端点</th><th>有效期</th><th></th></tr></thead>
-              <tbody>
-                <template x-for="a in accounts.items" :key="a.uid">
-                  <tr>
-                    <td>
-                      <div class="row" style="gap:6px;flex-wrap:nowrap">
-                        <span x-text="a.nickname||'未命名'"></span>
-                        <span class="badge" :class="a.active?'badge-ok':(a.expired?'badge-err':'badge-muted')"
-                              x-text="a.active?'当前':(a.expired?'已过期':'正常')"></span>
-                        <span class="badge badge-warn" x-show="!a.region_match" title="凭证属于另一端点">端点不匹配</span>
-                      </div>
-                    </td>
-                    <td><input class="cell-edit" :value="a.remark||''" placeholder="添加备注" maxlength="64" aria-label="账号备注" @keydown.enter="$event.target.blur()" @change="updateAccountRemark(a, $event.target.value, $event.target)"></td>
-                    <td class="mono" x-text="(a.uid||'').slice(-10)"></td>
-                    <td x-text="a.domain||'—'"></td>
-                    <td x-text="a.expires_at?ts(a.expires_at)+'（'+a.expires_human+'）':'—'"></td>
-                    <td>
-                      <div class="row" style="gap:6px;flex-wrap:nowrap">
-                        <button class="btn btn-secondary btn-sm" x-show="!a.active"
-                                @click="switchAccount(a)" :disabled="loading">切换</button>
-                        <button class="btn btn-ghost btn-sm" style="color:var(--destructive)" x-show="!a.active"
-                                @click="removeAccount(a)" :disabled="loading">移除</button>
-                      </div>
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <!-- ═══ 号池状态（实验特性；仅开关开启时渲染） ═══
-             数据来自 GET /admin/pool（内存快照）+ /admin/accounts（档案元信息）。
-             与上面「账号切换」的区别：那一块是切换**当前活动账号**（后台任务跟着走），
-             这一块只是分发策略，切换这里不会改当前账号。 -->
-        <div class="card" x-show="labs.pool_enabled">
-          <div class="card-head">
-            <h3>号池状态</h3>
-            <span class="muted-xs" x-show="pool"
-                  x-text="(pool?pool.member_count:0)+' 个账号 · '+(pool?pool.available_now:0)+' 个可用 · '+(pool?pool.session_count:0)+' 个活跃会话'"></span>
-            <div class="spacer"></div>
-            <button class="btn btn-ghost btn-sm" @click="poolProbeAll()" :disabled="loading">全部探测</button>
-            <button class="btn btn-ghost btn-sm" @click="loadPool()" :disabled="loading" title="刷新号池快照">
-              <span class="ic" x-html="ic('refresh')"></span>刷新</button>
-            <button class="btn btn-ghost btn-sm" @click="poolResetSessions()" :disabled="loading">重置会话绑定</button>
-          </div>
-          <p class="field-hint">
-            只有 <span class="mono">/v1/chat/completions</span> 走号池；签到 / 成长任务 / 余额面板仍走<b>当前活动账号</b>（即下方「账号切换」里标「当前」那个）。
-          </p>
-          <div class="empty" x-show="pool && !pool.accounts.length">
-            <span class="ic ic-lg" x-html="ic('account')"></span>
-            号池里还没有账号
-          </div>
-          <div class="table-wrap" x-show="pool && pool.accounts.length">
-            <table>
-              <thead><tr><th>账号</th><th>状态</th><th>额度</th><th>限额中的模型</th><th>会话</th><th>成功 / 失败</th><th>操作</th></tr></thead>
-              <tbody>
-                <template x-for="a in (pool?pool.accounts:[])" :key="a.uid">
-                  <tr>
-                    <td>
-                      <div class="row" style="gap:6px;flex-wrap:nowrap">
-                        <span x-text="accountLabel(a)"></span>
-                        <span class="badge badge-ok" x-show="a.active" title="当前活动账号（后台任务与余额面板走它）">当前</span>
-                        <span class="badge badge-warn" x-show="!a.region_match" title="凭证属于另一端点">端点不匹配</span>
-                      </div>
-                      <div class="muted-xs"><span x-show="a.remark && a.nickname" x-text="a.nickname+' · '"></span><span class="mono" x-text="(a.uid||'').slice(-10)"></span></div>
-                    </td>
-                    <td>
-                      <span class="badge" :class="poolStateClass(a)" x-text="poolStateText(a)"></span>
-                      <div class="muted-xs" x-show="a.auto_disabled_msg" :title="a.auto_disabled_msg"
-                           x-text="a.auto_disabled_msg.slice(0,40)"></div>
-                    </td>
-                    <td>
-                      <!-- credits_at = 0 表示从未读到过额度（探测还没跑过），显示 — 而不是 0；
-                           探测确认耗尽时 credits_at 有值、credits 为 0，那时才显示 0。
-                           具体探测时刻已在「成功 / 失败」列下方展示，这里只把时刻放进 title。 -->
-                      <template x-if="a.credits_at>0">
-                        <span x-text="fmtDosage(a.credits)"
-                              :title="'上次探测读到于 '+ts(a.credits_at)+'（刷新面板不会打上游，想看最新额度点「探测」）'"></span>
-                      </template>
-                      <template x-if="!(a.credits_at>0)">
-                        <span class="muted-xs" title="尚未探测过，点「探测」读取额度">—</span>
-                      </template>
-                    </td>
-                    <td>
-                      <template x-for="c in (a.model_cooldowns||[])" :key="c.model">
-                        <div class="row" style="gap:6px;flex-wrap:nowrap">
-                          <span class="mono" x-text="c.model"></span>
-                          <span class="muted-xs" :title="'上游重置时间 '+ts(c.reset_at)+'；实际生效截止 '+ts(c.until)+(c.reset_at&&c.reset_at!==c.until?'（已被上限截断）':'')"
-                                x-text="'剩 '+coolLeft(c.until)"></span>
-                          <button class="btn btn-ghost btn-sm" @click="poolClearCool(a,c)"
-                                  :disabled="loading" title="我知道它好了，让我试试">清除</button>
-                        </div>
-                      </template>
-                      <span class="muted-xs" x-show="!(a.model_cooldowns||[]).length">—</span>
-                    </td>
-                    <td x-text="a.bound_sessions"></td>
-                    <td>
-                      <span class="mono" x-text="a.success_count+' / '+a.error_count"></span>
-                      <div class="muted-xs" x-show="a.last_probe_at"
-                           :title="a.last_probe_msg"
-                           x-text="'探测 '+ts(a.last_probe_at)"></div>
-                    </td>
-                    <td>
-                      <div class="row" style="gap:6px;flex-wrap:nowrap">
-                        <button class="btn btn-ghost btn-sm" x-show="!a.manual_disabled"
-                                style="color:var(--destructive)" @click="poolDisable(a)" :disabled="loading">禁用</button>
-                        <button class="btn btn-secondary btn-sm" x-show="a.manual_disabled"
-                                @click="poolEnable(a)" :disabled="loading">启用</button>
-                        <button class="btn btn-ghost btn-sm" @click="poolProbe(a)"
-                                :disabled="loading||a.manual_disabled" title="调 billing 接口查凭证与额度">探测</button>
-                      </div>
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
-          </div>
-          <div class="field-hint code-hint" x-show="pool">
-            <div>* 粘性命中率 <span class="mono" x-text="pool?pool.sticky_hit_total+' / '+(pool.sticky_hit_total+pool.sticky_miss_total):'—'"></span>
-                 （低命中率说明会话键不稳定，去「实验」页看客户端接入示例）</div>
-            <div>* 「额度」列是**上次探测读到的值**（面板刷新不会主动打上游，N 个号一起查太贵）；
-                 想看最新额度点该行的「探测」，或「全部探测」</div>
-            <div>* 「限额中的模型」只影响该模型；整个账号被禁用看「状态」列</div>
-          </div>
-        </div>
+        </template>
 
       </section>
 
@@ -217,9 +209,9 @@
       </div>
       <div x-show="exportForm.scope==='current'" class="field-hint" style="margin-top:12px">
         <template x-if="account.logged_in">
-          <span x-text="'将导出当前活动账号：'+accountLabel(account)+'（'+(account.uid||'—')+'）'"></span>
+          <span x-text="'将导出当前主账号：'+accountLabel(account)+'（'+(account.uid||'—')+'）'"></span>
         </template>
-        <template x-if="!account.logged_in"><span>当前没有活动账号，无可导出内容。</span></template>
+        <template x-if="!account.logged_in"><span>当前没有主账号，无可导出内容。</span></template>
       </div>
       <div x-show="exportForm.scope==='selected'">
         <div class="row" style="margin:12px 0 8px;gap:8px">
@@ -234,7 +226,7 @@
               <input type="checkbox" :checked="exportForm.uids.includes(a.uid)" @change="toggleExportUID(a.uid)">
               <span class="pick-name" x-text="accountLabel(a)" :title="a.remark && a.nickname ? (a.remark+'（'+a.nickname+'）') : accountLabel(a)"></span>
               <span class="mono muted-xs" x-text="'…'+(a.uid||'').slice(-8)"></span>
-              <span class="badge" :class="a.active?'badge-ok':'badge-muted'" x-show="a.active">当前</span>
+              <span class="badge" :class="a.active?'badge-ok':'badge-muted'" x-show="a.active">主账号</span>
               <span class="badge badge-err" x-show="a.expired&&!a.active">已过期</span>
               <span class="badge badge-warn" x-show="!a.region_match">端点不匹配</span>
             </label>
@@ -269,7 +261,7 @@
 
       <!-- 单个账号：手动填写或选 token.json -->
       <div x-show="importMode==='single'">
-        <p class="modal-msg" style="margin-top:12px">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。<br>「仅导入」只存入账号列表，当前账号不变；「导入并启用」会立即切换为当前账号。</p>
+        <p class="modal-msg" style="margin-top:12px">从 token.json 文件导入，或手动填写 access_token（合法 JWT，其余字段可留空，将从 JWT 自动解析）。<br>「仅导入」只存入账号列表并参与调度，主账号不变；「导入并启用」会同时设为主账号。</p>
         <div class="form-row">
           <label class="label">从文件导入</label>
           <div class="row">
@@ -292,9 +284,9 @@
         </div>
       </div>
 
-      <!-- 批量导入：凭证包一次性入档，恒不切换当前账号 -->
+      <!-- 批量导入：凭证包一次性入档，恒不切换主账号 -->
       <div x-show="importMode==='batch'">
-        <p class="modal-msg" style="margin-top:12px">选择由「导出凭证」生成的凭证包（.json），可一次导入多个账号。<br><strong>批量导入只会存入账号列表，不会切换当前账号</strong>；导入完成后到「账号切换」卡片点「切换」启用。</p>
+        <p class="modal-msg" style="margin-top:12px">选择由「导出凭证」生成的凭证包（.json），可一次导入多个账号。<br><strong>批量导入只会存入账号列表并自动参与调度，不会切换主账号</strong>；需要变更主账号时可在列表中点「设为主账号」。</p>
         <div class="form-row">
           <label class="label">凭证包文件</label>
           <div class="row">
@@ -305,7 +297,7 @@
           <p class="field-hint" x-show="batchForm.error" style="color:var(--err-fg)" x-text="batchForm.error"></p>
         </div>
         <div x-show="batchForm.items.length">
-          <p class="field-hint" x-text="'已读取 '+batchForm.items.length+' 个账号，将全部仅导入到账号列表：'"></p>
+          <p class="field-hint" x-text="'已读取 '+batchForm.items.length+' 个账号，将导入到账号列表：'"></p>
           <div class="pick-list">
             <template x-for="(a,i) in batchForm.items" :key="i">
               <div class="pick-row">

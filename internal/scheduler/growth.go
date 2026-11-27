@@ -1,11 +1,8 @@
-// growth.go 成长任务链编排：活跃上报 → 连登自检 → 领养 → 礼包/补签 → 兑换 → 抽奖 → 旅行巡检。
+// growth.go 多账号成长任务链编排：活跃上报 → 连登自检 → 领养 → 礼包/补签 → 兑换 → 抽奖 → 旅行巡检。
 //
-// 移植自 references/workbuddy2api 的 runActivity/claimGrowthRewards/travel 状态机，
-// 单账号化简化：单次调用 + 账号内上报间隔 1.5s（防风控保留）；当日防抖从参考项目的
-// 进程内内存 map 升级为 growthDay 内存态 + SQLite growth_cache 镜像（跨重启持久）。
-//
-// 幂等语义：上报按日标志 report_day；领养 adopt_day 防同日轰炸；兑换 reward_day +
-// 服务端 409 兜底，且领取类写失败当日不重试（次日自然重置）。
+// 幂等语义：按账号 UID 隔离内存态 growthStates[uid] 与 SQLite growth_cache 键
+// （report_day:<uid> / adopt_day:<uid> / reward_day:<uid> / last_run:<uid>），
+// 每账号独立互斥锁（growthLocks[uid]），不同账号手动触发互不阻塞。
 package scheduler
 
 import (
@@ -14,10 +11,12 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"time"
 
 	"buddy2api-go/internal/auth"
 	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/upstream"
 )
 
@@ -42,14 +41,13 @@ var growthReportGap = 1500 * time.Millisecond
 // （测试可拉长，避免 Reconfigure 排出的真实 timer 在测试结束后触发）。
 var growthCatchupDelay = 30 * time.Second
 
-// growthCacheTable growth 相关缓存的表名与 key 常量。
-// 日标志（report/adopt/reward_day）的值为 CST 日期串，便于跨日直接比对。
+// growthCacheTable growth 相关缓存的表名与 key 内部别名。
 const (
-	growthCacheTable   = "growth_cache"
-	growthKeyReportDay = "report_day"
-	growthKeyAdoptDay  = "adopt_day"
-	growthKeyRewardDay = "reward_day"
-	growthKeyLastRun   = "last_run"
+	growthCacheTable   = GrowthCacheTable
+	growthKeyReportDay = GrowthKeyReportDay
+	growthKeyAdoptDay  = GrowthKeyAdoptDay
+	growthKeyRewardDay = GrowthKeyRewardDay
+	growthKeyLastRun   = GrowthKeyLastRun
 )
 
 // growthClient 成长链依赖的上游接口（*upstream.Client 实现；测试可注入 fake）。
@@ -82,8 +80,9 @@ type GrowthStep struct {
 	Detail string `json:"detail,omitempty"` // 人话摘要（前端直接展示）
 }
 
-// GrowthChainResult 成长链单次执行的逐步结果（自动/手动共用，落 last_run 缓存 + 返回给前端）。
+// GrowthChainResult 成长链单次执行的逐步结果（自动/手动共用，落 last_run:<uid> 缓存 + 返回给前端）。
 type GrowthChainResult struct {
+	UID    string       `json:"uid,omitempty"`    // 执行目标账号 UID
 	Day    string       `json:"day"`              // CST 日期
 	At     int64        `json:"at,omitempty"`     // 执行时刻（unix 秒，前端「上次执行」展示）
 	Ran    bool         `json:"ran"`              // false = 本次跳过（未登录/global/互斥占用）
@@ -95,9 +94,9 @@ type GrowthChainResult struct {
 func (r *GrowthChainResult) add(key, status, detail string) {
 	r.Steps = append(r.Steps, GrowthStep{Key: key, Status: status, Detail: detail})
 	if status == "fail" || status == "warn" {
-		slog.Warn("growth", "step", key, "status", status, "detail", detail)
+		slog.Warn("growth", "uid", uidTail(r.UID), "step", key, "status", status, "detail", detail)
 	} else {
-		slog.Info("growth", "step", key, "status", status, "detail", detail)
+		slog.Info("growth", "uid", uidTail(r.UID), "step", key, "status", status, "detail", detail)
 	}
 }
 
@@ -146,7 +145,7 @@ type GrowthRedeemActionResult struct {
 	Granted *upstream.GrowthRedeemResult `json:"granted,omitempty"`
 }
 
-// ── 日内状态（内存 + SQLite 双层）──────────────────────────────────────────────
+// ── 日内状态（内存 + SQLite 双层，按 UID 隔离）──────────────────────────────────
 
 // growthDay 一日内的成长任务状态。day 为 CST 自然日（上游口径），跨日重置。
 type growthDay struct {
@@ -156,63 +155,117 @@ type growthDay struct {
 	rewardDone bool   // 今日奖励链已处理一轮
 }
 
-// rollGrowthDayLocked 跨 CST 日时重置内存状态；内存 day 为空（进程刚启动）或
-// 跨日时从 cache 镜像回填当日标志（服务重启后日标志不丢，双保险）。
-// 调用方需持 growthMu。
-func (s *Scheduler) rollGrowthDayLocked(now time.Time) {
-	day := upstream.GrowthTodayDate(now)
-	if s.growthState.day == day {
-		return
+// growthLock 返回指定 UID 的成长链互斥锁（不同 UID 互不阻塞）。
+func (s *Scheduler) growthLock(uid string) *sync.Mutex {
+	s.growthLocksMu.Lock()
+	defer s.growthLocksMu.Unlock()
+	if s.growthLocks == nil {
+		s.growthLocks = make(map[string]*sync.Mutex)
 	}
-	s.growthState = growthDay{day: day}
-	if payload, _, ok := s.st.GetCache(growthCacheTable, growthKeyReportDay, growthDayTTL); ok && payload == day {
-		s.growthState.reportDone = true
+	mu := s.growthLocks[uid]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.growthLocks[uid] = mu
 	}
-	if payload, _, ok := s.st.GetCache(growthCacheTable, growthKeyAdoptDay, growthDayTTL); ok && payload == day {
-		s.growthState.adoptTried = true
-	}
-	if payload, _, ok := s.st.GetCache(growthCacheTable, growthKeyRewardDay, growthDayTTL); ok && payload == day {
-		s.growthState.rewardDone = true
-	}
+	return mu
 }
 
-// growthPrecondition 成长类操作前置检查：region=cn 且已登录。
+// growthStateOf 返回指定 UID 的日内状态指针（调用方需持该 UID 的 growthLock）。
+func (s *Scheduler) growthStateOf(uid string) *growthDay {
+	s.growthLocksMu.Lock()
+	defer s.growthLocksMu.Unlock()
+	if s.growthStates == nil {
+		s.growthStates = make(map[string]*growthDay)
+	}
+	st := s.growthStates[uid]
+	if st == nil {
+		st = &growthDay{}
+		s.growthStates[uid] = st
+	}
+	return st
+}
+
+// rollGrowthDayLocked 跨 CST 日时重置该账号内存状态；内存 day 为空（进程刚启动）或
+// 跨日时从 cache 镜像回填当日标志（服务重启后日标志不丢，双保险）。
+// 调用方需持 s.growthLock(uid)。
+func (s *Scheduler) rollGrowthDayLocked(uid string, now time.Time) *growthDay {
+	day := upstream.GrowthTodayDate(now)
+	st := s.growthStateOf(uid)
+	if st.day == day {
+		return st
+	}
+	*st = growthDay{day: day}
+	if payload, _, ok := s.st.GetCache(growthCacheTable, GrowthReportDayKey(uid), growthDayTTL); ok && payload == day {
+		st.reportDone = true
+	}
+	if payload, _, ok := s.st.GetCache(growthCacheTable, GrowthAdoptDayKey(uid), growthDayTTL); ok && payload == day {
+		st.adoptTried = true
+	}
+	if payload, _, ok := s.st.GetCache(growthCacheTable, GrowthRewardDayKey(uid), growthDayTTL); ok && payload == day {
+		st.rewardDone = true
+	}
+	return st
+}
+
+// growthPreconditionFor 成长类操作前置检查：region=cn、账号已登录且非海外域名。
 // 返回非空 reason 表示不可执行（正常态，不发起任何上游调用）。
-func (s *Scheduler) growthPrecondition() string {
+func (s *Scheduler) growthPreconditionFor(uid string) (schedAccount, string) {
 	if s.cfg.Get().Region != "cn" {
-		return "region_global"
+		return schedAccount{}, "region_global"
 	}
-	if s.growth.TokenSummary() == nil {
-		return "not_logged_in"
+	acct, reason := s.resolveAccount(uid)
+	if reason != "" || acct.growth == nil {
+		if reason == "" {
+			reason = "not_logged_in"
+		}
+		return schedAccount{}, reason
 	}
-	return ""
+	t := acct.growth.TokenSummary()
+	if t == nil {
+		return schedAccount{}, "not_logged_in"
+	}
+	if t.Domain != "" && t.Domain != config.EndpointOf("cn").Domain {
+		return schedAccount{}, "region_global"
+	}
+	if acct.uid == "" {
+		acct.uid = t.UID
+	}
+	return acct, ""
 }
 
 // ── 成长任务链（核心编排）──────────────────────────────────────────────────────
 
-// RunGrowthChain 执行一次完整成长链（cron / 手动触发 / 启动补跑共用）。
+// RunGrowthChain 为当前活动账号执行一次完整成长链（向后兼容入口）。
+func (s *Scheduler) RunGrowthChain() GrowthChainResult { return s.RunGrowthChainFor("") }
+
+// RunGrowthChainFor 为指定账号执行一次完整成长链（cron / 手动触发 / 启动补跑共用）。
 // 顺序：上报 → 连登自检 → 领养 → 礼包 → 补签+兑换+抽奖 → 旅行巡检。
-// 任一步失败不阻断后续步（单步记 fail）。growthMu 互斥：已有链在跑 →
-// 直接返回 {ran:false, reason:"busy"}（不等待）。
-func (s *Scheduler) RunGrowthChain() GrowthChainResult {
-	if reason := s.growthPrecondition(); reason != "" {
-		return GrowthChainResult{Ran: false, Reason: reason}
+// 任一步失败不阻断后续步（单步记 fail）。同 UID 互斥：已有链在跑 → 直接返回 busy（不等待）。
+func (s *Scheduler) RunGrowthChainFor(uid string) GrowthChainResult {
+	acct, reason := s.growthPreconditionFor(uid)
+	if reason != "" {
+		return GrowthChainResult{UID: uid, Ran: false, Reason: reason}
 	}
-	if !s.growthMu.TryLock() {
-		return GrowthChainResult{Ran: false, Reason: "busy"}
+	return s.runGrowthChainForAccount(acct)
+}
+
+func (s *Scheduler) runGrowthChainForAccount(acct schedAccount) GrowthChainResult {
+	mu := s.growthLock(acct.uid)
+	if !mu.TryLock() {
+		return GrowthChainResult{UID: acct.uid, Ran: false, Reason: "busy"}
 	}
-	defer s.growthMu.Unlock()
+	defer mu.Unlock()
 
 	now := time.Now()
-	s.rollGrowthDayLocked(now)
+	st := s.rollGrowthDayLocked(acct.uid, now)
 	day := upstream.GrowthTodayDate(now)
-	res := GrowthChainResult{Day: day, At: now.Unix(), Ran: true}
+	res := GrowthChainResult{UID: acct.uid, Day: day, At: now.Unix(), Ran: true}
 	defer func() {
 		if raw, err := json.Marshal(res); err == nil {
-			_ = s.st.SetCache(growthCacheTable, growthKeyLastRun, string(raw))
+			_ = s.st.SetCache(growthCacheTable, GrowthLastRunKey(acct.uid), string(raw))
 		}
-		if s.growthState.reportDone {
-			_ = s.st.SetCache(growthCacheTable, growthKeyReportDay, day)
+		if st.reportDone {
+			_ = s.st.SetCache(growthCacheTable, GrowthReportDayKey(acct.uid), day)
 		}
 	}()
 
@@ -222,25 +275,31 @@ func (s *Scheduler) RunGrowthChain() GrowthChainResult {
 		count = 5 // Normalize 已钳制，双保险
 	}
 	if jitter := cfg.GrowthReportJitter; jitter > 0 {
-		slog.Info("growth 上报条数波动", "base", cfg.GrowthReportCount, "jitter", jitter, "actual", count)
+		slog.Info("growth 上报条数波动", "uid", uidTail(acct.uid), "base", cfg.GrowthReportCount, "jitter", jitter, "actual", count)
 	}
-	_, reported := s.stepReports(&res, count, false)
+	_, reported := s.stepReports(acct, st, &res, count, false)
 	var info *upstream.GrowthStreakInfo
-	s.stepStreakCheck(&res, reported, &info)
-	justAdopted := s.stepAdopt(&res, reported) // 上报刚发满 → force=true 豁免今日早前标记
-	s.stepBonus(&res)
-	s.stepRewardChain(&res, &info)
-	s.stepTravel(&res, true, justAdopted)
+	s.stepStreakCheck(acct, &res, reported, &info)
+	justAdopted := s.stepAdopt(acct, st, &res, reported) // 上报刚发满 → force=true 豁免今日早前标记
+	s.stepBonus(acct, &res)
+	s.stepRewardChain(acct, st, &res, &info)
+	s.stepTravel(acct, st, &res, true, justAdopted)
 
-	slog.Info("growth 链完成", "day", res.Day, "steps", len(res.Steps))
+	slog.Info("growth 链完成", "uid", uidTail(acct.uid), "day", res.Day, "steps", len(res.Steps))
 	return res
 }
 
-// RunActivityReports 手动活跃上报：不查 reportDone（用户显式意图），发满置 report_day。
-// count<=0 时取配置条数并按 jitter 波动一次；显式 count 尊重用户指定，不波动。
-// 结果钳 1..10；growthMu 互斥（与自动链防并发秒发）。
+// RunActivityReports 为当前活动账号执行手动活跃上报（向后兼容入口）。
 func (s *Scheduler) RunActivityReports(count int) ActivityReportResult {
-	if reason := s.growthPrecondition(); reason != "" {
+	return s.RunActivityReportsFor("", count)
+}
+
+// RunActivityReportsFor 为指定账号执行手动活跃上报：不查 reportDone（用户显式意图），发满置 report_day:<uid>。
+// count<=0 时取配置条数并按 jitter 波动一次；显式 count 尊重用户指定，不波动。
+// 结果钳 1..10；同 UID 互斥（与自动链防并发秒发）。
+func (s *Scheduler) RunActivityReportsFor(uid string, count int) ActivityReportResult {
+	acct, reason := s.growthPreconditionFor(uid)
+	if reason != "" {
 		return ActivityReportResult{Ran: false, Reason: reason}
 	}
 	if count <= 0 {
@@ -250,76 +309,96 @@ func (s *Scheduler) RunActivityReports(count int) ActivityReportResult {
 	if count > growthReportCountMax {
 		count = growthReportCountMax
 	}
-	if !s.growthMu.TryLock() {
+	mu := s.growthLock(acct.uid)
+	if !mu.TryLock() {
 		return ActivityReportResult{Ran: false, Reason: "busy"}
 	}
-	defer s.growthMu.Unlock()
+	defer mu.Unlock()
 
 	now := time.Now()
-	s.rollGrowthDayLocked(now)
-	res := GrowthChainResult{Day: upstream.GrowthTodayDate(now), Ran: true}
-	sent, _ := s.stepReports(&res, count, true)
+	st := s.rollGrowthDayLocked(acct.uid, now)
+	res := GrowthChainResult{UID: acct.uid, Day: upstream.GrowthTodayDate(now), Ran: true}
+	sent, _ := s.stepReports(acct, st, &res, count, true)
 	detail := ""
-	if st, ok := res.findStep("report"); ok {
-		detail = st.Detail
+	if stp, ok := res.findStep("report"); ok {
+		detail = stp.Detail
 	}
 	return ActivityReportResult{Ran: true, Sent: sent, Total: count, Detail: detail}
 }
 
-// RunTravelTick 独立旅行巡检（cron / 手动按钮）：单动作状态机（arrived 先领奖，
-// idle 才派出）。不做领养——领养归成长链与手动按钮，避免与链内 adopt 防抖交叉，
-// 无猫仅记 skip。不持 growthMu：单趟只读本地状态、上游幂等，并发时服务端兜底。
-func (s *Scheduler) RunTravelTick() TravelTickResult {
-	if reason := s.growthPrecondition(); reason != "" {
+// RunTravelTick 为当前活动账号执行独立旅行巡检（向后兼容入口）。
+func (s *Scheduler) RunTravelTick() TravelTickResult { return s.RunTravelTickFor("") }
+
+// RunTravelTickFor 为指定账号执行独立旅行巡检（cron / 手动按钮）：单动作状态机（arrived 先领奖，
+// idle 才派出）。不做领养——领养归成长链与手动按钮，避免与链内 adopt 防抖交叉，无猫仅记 skip。
+func (s *Scheduler) RunTravelTickFor(uid string) TravelTickResult {
+	acct, reason := s.growthPreconditionFor(uid)
+	if reason != "" {
 		return TravelTickResult{Ran: false, Reason: reason}
 	}
-	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now()), Ran: true}
-	outcome := s.stepTravel(res, false, false)
+	return s.runTravelTickForAccount(acct)
+}
+
+func (s *Scheduler) runTravelTickForAccount(acct schedAccount) TravelTickResult {
+	res := &GrowthChainResult{UID: acct.uid, Day: upstream.GrowthTodayDate(time.Now()), Ran: true}
+	outcome := s.stepTravel(acct, nil, res, false, false)
 	return TravelTickResult{Ran: true, Status: outcome.status, Action: outcome.action, Detail: outcome.detail}
 }
 
-// RunGrowthAdopt 手动领养（force 语义：豁免今日 adopt_day 防抖）。
-// 门槛未达时置 adopt_day（当日 cron 链不再重试）。
-func (s *Scheduler) RunGrowthAdopt() GrowthAdoptResult {
-	if reason := s.growthPrecondition(); reason != "" {
+// RunGrowthAdopt 为当前活动账号执行手动领养（向后兼容入口）。
+func (s *Scheduler) RunGrowthAdopt() GrowthAdoptResult { return s.RunGrowthAdoptFor("") }
+
+// RunGrowthAdoptFor 为指定账号执行手动领养（force 语义：豁免今日 adopt_day 防抖）。
+// 门槛未达时置 adopt_day:<uid>（当日 cron 链不再重试）。
+func (s *Scheduler) RunGrowthAdoptFor(uid string) GrowthAdoptResult {
+	acct, reason := s.growthPreconditionFor(uid)
+	if reason != "" {
 		return GrowthAdoptResult{Ran: false, Reason: reason}
 	}
-	if !s.growthMu.TryLock() {
+	mu := s.growthLock(acct.uid)
+	if !mu.TryLock() {
 		return GrowthAdoptResult{Ran: false, Reason: "busy"}
 	}
-	defer s.growthMu.Unlock()
+	defer mu.Unlock()
 
 	now := time.Now()
-	s.rollGrowthDayLocked(now)
-	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(now), Ran: true}
-	s.stepAdopt(res, true)
+	st := s.rollGrowthDayLocked(acct.uid, now)
+	res := &GrowthChainResult{UID: acct.uid, Day: upstream.GrowthTodayDate(now), Ran: true}
+	s.stepAdopt(acct, st, res, true)
 	out := GrowthAdoptResult{Ran: true}
-	if st, ok := res.findStep("adopt"); ok {
-		out.Status, out.Detail = st.Status, st.Detail
+	if stp, ok := res.findStep("adopt"); ok {
+		out.Status, out.Detail = stp.Status, stp.Detail
 	}
 	return out
 }
 
-// RunGrowthRedeem 手动兑换指定档位。仅成功时置 reward_day（skip/fail 不置，
-// 用户可换档重试）；正常态（409 已领/403 天数不足）识别为 skip。
+// RunGrowthRedeem 为当前活动账号执行手动兑换（向后兼容入口）。
 func (s *Scheduler) RunGrowthRedeem(tier string) GrowthRedeemActionResult {
-	if reason := s.growthPrecondition(); reason != "" {
+	return s.RunGrowthRedeemFor("", tier)
+}
+
+// RunGrowthRedeemFor 为指定账号执行手动兑换指定档位。仅成功时置 reward_day:<uid>（skip/fail 不置，
+// 用户可换档重试）；正常态（409 已领/403 天数不足）识别为 skip。
+func (s *Scheduler) RunGrowthRedeemFor(uid string, tier string) GrowthRedeemActionResult {
+	acct, reason := s.growthPreconditionFor(uid)
+	if reason != "" {
 		return GrowthRedeemActionResult{Ran: false, Reason: reason}
 	}
-	if !s.growthMu.TryLock() {
+	mu := s.growthLock(acct.uid)
+	if !mu.TryLock() {
 		return GrowthRedeemActionResult{Ran: false, Reason: "busy"}
 	}
-	defer s.growthMu.Unlock()
+	defer mu.Unlock()
 
 	now := time.Now()
-	s.rollGrowthDayLocked(now)
+	st := s.rollGrowthDayLocked(acct.uid, now)
 	day := upstream.GrowthTodayDate(now)
 	out := GrowthRedeemActionResult{Ran: true}
-	r, err := s.growth.GrowthRedeem(tier, "")
+	r, err := acct.growth.GrowthRedeem(tier, "")
 	switch {
 	case err == nil:
-		s.growthState.rewardDone = true
-		_ = s.st.SetCache(growthCacheTable, growthKeyRewardDay, day)
+		st.rewardDone = true
+		_ = s.st.SetCache(growthCacheTable, GrowthRewardDayKey(acct.uid), day)
 		out.Status, out.Granted = "ok", r
 		out.Detail = fmt.Sprintf("兑换 %s：+%d 积分 +%d 能量 +%d 补签卡 +%d 抽奖",
 			tier, r.CreditGranted, r.EnergyGranted, r.CardsGranted, r.ChancesGranted)
@@ -338,16 +417,16 @@ func (s *Scheduler) RunGrowthRedeem(tier string) GrowthRedeemActionResult {
 // stepReports 活跃上报：N 条共用同一 conversationId（模拟同会话多轮），
 // 各条独立 requestId，间隔 growthReportGap 防风控。
 // ignoreDone=false 时尊重日内 reportDone 标志（自动链）；true 为手动意图。
-// 返回已发条数与是否发满；发满置 reportDone + cache。调用方需持 growthMu。
-func (s *Scheduler) stepReports(res *GrowthChainResult, count int, ignoreDone bool) (sent int, full bool) {
-	if !ignoreDone && s.growthState.reportDone {
+// 返回已发条数与是否发满；发满置 reportDone + cache。调用方需持该账号 growthLock。
+func (s *Scheduler) stepReports(acct schedAccount, st *growthDay, res *GrowthChainResult, count int, ignoreDone bool) (sent int, full bool) {
+	if !ignoreDone && st.reportDone {
 		res.add("report", "skip", "今日已完成")
 		return 0, false
 	}
 	cid := fmt.Sprintf("b2a-%d", time.Now().UnixMilli())
 	for i := 1; i <= count; i++ {
 		rid := fmt.Sprintf("%s-r%d", cid, i)
-		if err := s.growth.ReportChatActivity(cid, rid); err != nil {
+		if err := acct.growth.ReportChatActivity(cid, rid); err != nil {
 			// 不发满则 streak 自检无意义，直接 break；链继续走后续步
 			// （奖励链用旧状态判断，不依赖今日上报）
 			res.add("report", "fail", fmt.Sprintf("第 %d/%d 条失败: %v", i, count, err))
@@ -358,13 +437,13 @@ func (s *Scheduler) stepReports(res *GrowthChainResult, count int, ignoreDone bo
 			time.Sleep(growthReportGap) // 1.5s 防风控
 		}
 	}
-	s.growthState.reportDone = true
-	_ = s.st.SetCache(growthCacheTable, growthKeyReportDay, res.Day)
+	st.reportDone = true
+	_ = s.st.SetCache(growthCacheTable, GrowthReportDayKey(acct.uid), res.Day)
 	// 上报补满可能解锁 chat_5 门槛：清掉今日领养防抖，让后续领养尝试
 	// （链内 force 或手动按钮）值得再试；若门槛仍未达，下次失败会重新置位。
-	if s.growthState.adoptTried {
-		s.growthState.adoptTried = false
-		_ = s.st.DeleteCacheKey(growthCacheTable, growthKeyAdoptDay)
+	if st.adoptTried {
+		st.adoptTried = false
+		_ = s.st.DeleteCacheKey(growthCacheTable, GrowthAdoptDayKey(acct.uid))
 	}
 	res.add("report", "ok", fmt.Sprintf("已上报 %d 条（同会话 %s）", count, cid))
 	return sent, true
@@ -373,12 +452,12 @@ func (s *Scheduler) stepReports(res *GrowthChainResult, count int, ignoreDone bo
 // stepStreakCheck 连登回读自检（只读 oracle）：上报发满才执行。
 // days==0 → warn（上报 200 但静默丢弃）；回读失败 → warn 不重试。
 // 成功时把快照存入 pInfo 供奖励链复用（免二次 GET）。
-func (s *Scheduler) stepStreakCheck(res *GrowthChainResult, reported bool, pInfo **upstream.GrowthStreakInfo) {
+func (s *Scheduler) stepStreakCheck(acct schedAccount, res *GrowthChainResult, reported bool, pInfo **upstream.GrowthStreakInfo) {
 	if !reported {
 		res.add("streak", "skip", "本轮上报未发满，跳过连登自检")
 		return
 	}
-	info, err := s.growth.GrowthStreakInfo()
+	info, err := acct.growth.GrowthStreakInfo()
 	if err != nil {
 		res.add("streak", "warn", "连登回读失败: "+err.Error())
 		return
@@ -393,13 +472,13 @@ func (s *Scheduler) stepStreakCheck(res *GrowthChainResult, reported bool, pInfo
 
 // stepAdopt 领养：force=false 尊重今日 adoptTried 防抖；force=true 豁免
 // （上报刚把 chat_5 补满 / 手动按钮）。返回本次是否领养成功，供旅行步判断
-// 「刚领养，本轮不派出」。调用方需持 growthMu。
-func (s *Scheduler) stepAdopt(res *GrowthChainResult, force bool) bool {
-	if !force && s.growthState.adoptTried {
+// 「刚领养，本轮不派出」。调用方需持该账号 growthLock。
+func (s *Scheduler) stepAdopt(acct schedAccount, st *growthDay, res *GrowthChainResult, force bool) bool {
+	if !force && st != nil && st.adoptTried {
 		res.add("adopt", "skip", "今日已尝试领养（门槛未达），明日自动重试")
 		return false
 	}
-	buddy, err := s.growth.BuddyInfo()
+	buddy, err := acct.growth.BuddyInfo()
 	if err != nil {
 		res.add("adopt", "fail", "查询猫档案失败: "+err.Error())
 		return false
@@ -408,19 +487,21 @@ func (s *Scheduler) stepAdopt(res *GrowthChainResult, force bool) bool {
 		res.add("adopt", "skip", "已有猫 "+buddy.Name)
 		return false
 	}
-	if err := s.growth.BuddyAgreement(); err != nil { // 幂等
+	if err := acct.growth.BuddyAgreement(); err != nil { // 幂等
 		res.add("adopt", "fail", "同意协议失败: "+err.Error())
 		return false
 	}
-	err = s.growth.BuddyFirst()
+	err = acct.growth.BuddyFirst()
 	switch {
 	case err == nil:
 		res.add("adopt", "ok", "领养成功（+300 积分）")
 		return true
 	case upstream.IsBuddyTaskIncomplete(err):
 		// 门槛未达（chat_5）：当日不重试轰炸，置日标志；明日链上报后自动重试
-		s.growthState.adoptTried = true
-		_ = s.st.SetCache(growthCacheTable, growthKeyAdoptDay, res.Day)
+		if st != nil {
+			st.adoptTried = true
+		}
+		_ = s.st.SetCache(growthCacheTable, GrowthAdoptDayKey(acct.uid), res.Day)
 		res.add("adopt", "skip", "对话门槛未达（chat_5），明日上报后自动重试")
 		return false
 	default:
@@ -430,27 +511,20 @@ func (s *Scheduler) stepAdopt(res *GrowthChainResult, force bool) bool {
 }
 
 // stepBonus 礼包 + 补偿领取（幂等，有则领）。
-// 两者都静默尝试，只有实际到账才记步（业务错误是常态——绝大多数号早已领过）。
-//
-// 补偿额外做「先查状态 → 待领才领」：补偿带截止日，旧写法把「没有补偿」「已经领过」
-// 与「真的领取失败」压成同一形态，一旦签到停摆就会静默过期。现在查询失败会显式告警。
-func (s *Scheduler) stepBonus(res *GrowthChainResult) {
+func (s *Scheduler) stepBonus(acct schedAccount, res *GrowthChainResult) {
 	var detail []string
-	if credit, err := s.growth.ClaimGift(); err == nil && credit > 0 {
+	if credit, err := acct.growth.ClaimGift(); err == nil && credit > 0 {
 		detail = append(detail, fmt.Sprintf("礼包 +%d 积分", credit))
 	}
-	s.claimCompensationQuiet(res, &detail)
+	s.claimCompensationQuiet(acct, res, &detail)
 	if len(detail) > 0 {
 		res.add("bonus", "ok", strings.Join(detail, " / "))
 	}
 }
 
 // claimCompensationQuiet 补偿领取的可观测化版本：先查状态，待领才领。
-//   - 查询失败 → warn（不把“查不到”当成“没有”）
-//   - 无活动 / 已领 / 零额度 → 静默（正常态，不刷日志）
-//   - 待领但领取失败 → fail（带截止日，必须让人看见）
-func (s *Scheduler) claimCompensationQuiet(res *GrowthChainResult, detail *[]string) {
-	st, err := s.growth.GetCompensationStatus()
+func (s *Scheduler) claimCompensationQuiet(acct schedAccount, res *GrowthChainResult, detail *[]string) {
+	st, err := acct.growth.GetCompensationStatus()
 	if err != nil {
 		res.add("compensation", "warn", "补偿状态查询失败: "+err.Error())
 		return
@@ -458,7 +532,7 @@ func (s *Scheduler) claimCompensationQuiet(res *GrowthChainResult, detail *[]str
 	if !st.Pending() {
 		return // 无活动 / 已领 / 零额度：正常态
 	}
-	credit, cerr := s.growth.ClaimCompensation()
+	credit, cerr := acct.growth.ClaimCompensation()
 	if cerr != nil {
 		msg := "补偿待领但领取失败（截止 " + orDefaultStr(st.EndTime, "未知") + "）: " + cerr.Error()
 		res.add("compensation", "fail", msg)
@@ -479,42 +553,38 @@ func orDefaultStr(s, def string) string {
 	return s
 }
 
-// stepRewardChain 补签 + 兑换 + 抽奖（每日一轮）：
-// 补签保连登（成功则重读天数挑档）→ 挑最高达标档兑换 → 抽奖一次。
-// 处理过一轮即置 rewardDone，无论成败（领取类写失败当日不重试轰炸，
-// 次日自然重置 / 服务端 409 兜底）。调用方需持 growthMu。
-func (s *Scheduler) stepRewardChain(res *GrowthChainResult, pInfo **upstream.GrowthStreakInfo) {
-	if s.growthState.rewardDone {
+// stepRewardChain 补签 + 兑换 + 抽奖（每日一轮）。调用方需持该账号 growthLock。
+func (s *Scheduler) stepRewardChain(acct schedAccount, st *growthDay, res *GrowthChainResult, pInfo **upstream.GrowthStreakInfo) {
+	if st != nil && st.rewardDone {
 		res.add("redeem", "skip", "今日已处理奖励链")
 		return
 	}
 	if *pInfo == nil {
-		info, err := s.growth.GrowthStreakInfo()
+		info, err := acct.growth.GrowthStreakInfo()
 		if err != nil {
 			res.add("redeem", "warn", "连登状态读取失败: "+err.Error())
 			return
 		}
 		*pInfo = info
 	}
-	if s.makeupYesterday(res, *pInfo) {
+	if s.makeupYesterday(acct, res, *pInfo) {
 		// 补签成功 → 重读 streak（天数可能恢复到新档位）
-		if info2, err := s.growth.GrowthStreakInfo(); err == nil {
+		if info2, err := acct.growth.GrowthStreakInfo(); err == nil {
 			*pInfo = info2
 		}
 	}
 	tiers := (*pInfo).EligibleTiers()
 	if len(tiers) == 0 {
-		// 无可领档位：正常态（很多天没到 7d），不 warn；本轮不抽奖（chances 来自兑换）
 		res.add("redeem", "skip", "无可领档位（未达标或已领）")
-		s.growthState.rewardDone = true
-		_ = s.st.SetCache(growthCacheTable, growthKeyRewardDay, res.Day)
+		if st != nil {
+			st.rewardDone = true
+		}
+		_ = s.st.SetCache(growthCacheTable, GrowthRewardDayKey(acct.uid), res.Day)
 		return
 	}
-	// 遍历**所有**已解锁未领的档位（不只最高档）：仅领最高档会让 7d/14d 的奖励
-	// 停留在未领（服务端不会因 28d 已领而自动补发低档）。
 	var granted []string
 	for _, tier := range tiers {
-		r, err := s.growth.GrowthRedeem(tier, "")
+		r, err := acct.growth.GrowthRedeem(tier, "")
 		switch {
 		case err == nil:
 			granted = append(granted, fmt.Sprintf("%s(+%dc +%de 卡×%d 抽奖×%d)",
@@ -530,16 +600,16 @@ func (s *Scheduler) stepRewardChain(res *GrowthChainResult, pInfo **upstream.Gro
 	} else {
 		res.add("redeem", "skip", "已解锁档位已全部领取")
 	}
-	s.growthState.rewardDone = true
-	_ = s.st.SetCache(growthCacheTable, growthKeyRewardDay, res.Day)
-	s.stepLottery(res)
+	if st != nil {
+		st.rewardDone = true
+	}
+	_ = s.st.SetCache(growthCacheTable, GrowthRewardDayKey(acct.uid), res.Day)
+	s.stepLottery(acct, res)
 }
 
 // makeupYesterday 昨日漏签且有补签卡时自动补签（保住连登连续天数）。
-// 判据链：heatmap 昨日格 score==0 → makeup_cards.balance>0 → use。
-// 无卡/无漏签/无该日格/查询失败均静默返回 false（不记步，不影响主流程）。
-func (s *Scheduler) makeupYesterday(res *GrowthChainResult, info *upstream.GrowthStreakInfo) bool {
-	cells, err := s.growth.GrowthHeatmap()
+func (s *Scheduler) makeupYesterday(acct schedAccount, res *GrowthChainResult, info *upstream.GrowthStreakInfo) bool {
+	cells, err := acct.growth.GrowthHeatmap()
 	if err != nil {
 		return false // 只读判据失败：静默（次日再判，无写风险）
 	}
@@ -551,7 +621,7 @@ func (s *Scheduler) makeupYesterday(res *GrowthChainResult, info *upstream.Growt
 	if info.MakeupCards.Balance <= 0 {
 		return false // 无卡
 	}
-	if err := s.growth.UseMakeupCard(yesterday); err != nil {
+	if err := acct.growth.UseMakeupCard(yesterday); err != nil {
 		res.add("makeup", "warn", "补签 "+yesterday+" 失败（次日再判）: "+err.Error())
 		return false
 	}
@@ -560,10 +630,8 @@ func (s *Scheduler) makeupYesterday(res *GrowthChainResult, info *upstream.Growt
 }
 
 // stepLottery 抽奖（自动链：把 chances 抽完）。
-// chances 先查后抽；无次数/未开启是正常态 skip；中实物仅展示奖名（不代填地址）。
-// 抽完而非每日 1 次：抽奖次数只能从兑换获得，留着不生息；兑换后同一天就必须抽掉。
-func (s *Scheduler) stepLottery(res *GrowthChainResult) {
-	chances, err := s.growth.GrowthLotteryChances()
+func (s *Scheduler) stepLottery(acct schedAccount, res *GrowthChainResult) {
+	chances, err := acct.growth.GrowthLotteryChances()
 	if err != nil {
 		res.add("lottery", "warn", "抽奖次数查询失败: "+err.Error())
 		return
@@ -578,7 +646,7 @@ func (s *Scheduler) stepLottery(res *GrowthChainResult) {
 	var wins []string
 	var creditTotal int64
 	for i := 0; i < chances; i++ {
-		draw, err := s.growth.GrowthLotteryDraw("")
+		draw, err := acct.growth.GrowthLotteryDraw("")
 		switch {
 		case err == nil:
 			switch draw.PrizeType {
@@ -611,32 +679,28 @@ func (s *Scheduler) stepLottery(res *GrowthChainResult) {
 
 // travelOutcome 旅行单趟结果（内部传递用）。
 type travelOutcome struct {
-	status string // ok | skip | warn | fail（同步记入 GrowthStep 与 TravelTickResult，前端 toast 分级）
+	status string // ok | skip | warn | fail
 	action string // claim | depart | skip
 	detail string
 }
 
-// stepTravel 旅行巡检（单动作状态机，不轮询不等待）：
-// arrived 先领奖（必带 record_id）→ idle 且未达日限才派出 → traveling 仅展示。
-// fromChain=true 为链内调用：无猫时先尝试领养（force=false），刚领养本轮不派出
-// （「领养立即派出」未经验证，刻意留到下轮巡检）；fromChain=false（独立巡检）
-// 无猫仅记 skip——领养归成长链/手动按钮，避免与 adopt 防抖交叉。
-func (s *Scheduler) stepTravel(res *GrowthChainResult, fromChain, justAdopted bool) travelOutcome {
-	buddy, err := s.growth.BuddyInfo()
+// stepTravel 旅行巡检（单动作状态机，不轮询不等待）。
+func (s *Scheduler) stepTravel(acct schedAccount, st *growthDay, res *GrowthChainResult, fromChain, justAdopted bool) travelOutcome {
+	buddy, err := acct.growth.BuddyInfo()
 	if err != nil {
 		res.add("travel", "fail", "查询猫档案失败: "+err.Error())
 		return travelOutcome{status: "fail", action: "skip", detail: "查询猫档案失败"}
 	}
 	if buddy == nil {
 		if fromChain {
-			s.stepAdopt(res, false)
-			st, _ := res.findStep("adopt")
-			return travelOutcome{status: st.Status, action: "skip", detail: st.Detail}
+			s.stepAdopt(acct, st, res, false)
+			stp, _ := res.findStep("adopt")
+			return travelOutcome{status: stp.Status, action: "skip", detail: stp.Detail}
 		}
 		res.add("travel", "skip", "尚未领养猫咪（领养在成长链/手动触发）")
 		return travelOutcome{status: "skip", action: "skip", detail: "尚未领养猫咪"}
 	}
-	ts, err := s.growth.TravelStatus()
+	ts, err := acct.growth.TravelStatus()
 	if err != nil {
 		res.add("travel", "fail", "旅行状态查询失败: "+err.Error())
 		return travelOutcome{status: "fail", action: "skip", detail: "旅行状态查询失败"}
@@ -647,7 +711,7 @@ func (s *Scheduler) stepTravel(res *GrowthChainResult, fromChain, justAdopted bo
 			res.add("travel", "warn", "已到站但缺少 record_id，无法领奖")
 			return travelOutcome{status: "warn", action: "skip", detail: "已到站但缺少 record_id"}
 		}
-		reward, err := s.growth.TravelClaim(ts.RecordID)
+		reward, err := acct.growth.TravelClaim(ts.RecordID)
 		if err != nil {
 			res.add("travel", "fail", fmt.Sprintf("领取旅行奖励失败: %v", err))
 			return travelOutcome{status: "fail", action: "claim", detail: "领取旅行奖励失败"}
@@ -664,7 +728,7 @@ func (s *Scheduler) stepTravel(res *GrowthChainResult, fromChain, justAdopted bo
 			res.add("travel", "skip", "已领养，下轮巡检派出")
 			return travelOutcome{status: "skip", action: "skip", detail: "已领养，下轮巡检派出"}
 		}
-		if err := s.growth.TravelDepart(travelLocationID); err != nil {
+		if err := acct.growth.TravelDepart(travelLocationID); err != nil {
 			res.add("travel", "fail", fmt.Sprintf("派出失败: %v", err))
 			return travelOutcome{status: "fail", action: "depart", detail: "派出失败"}
 		}
@@ -681,51 +745,92 @@ func (s *Scheduler) stepTravel(res *GrowthChainResult, fromChain, justAdopted bo
 	}
 }
 
-// ── cron 入口 ──────────────────────────────────────────────────────────────────
+// ── cron 入口（多账号串行遍历）──────────────────────────────────────────────────
 
-func (s *Scheduler) tickGrowthChain() { s.RunGrowthChain() }
-func (s *Scheduler) tickTravel()      { s.RunTravelTick() }
+func (s *Scheduler) tickGrowthChain() {
+	if s.cfg.Get().Region != "cn" {
+		return
+	}
+	accts := s.eligibleAccounts()
+	for i, acct := range accts {
+		if acct.growth == nil {
+			continue
+		}
+		s.runGrowthChainForAccount(acct)
+		if i < len(accts)-1 && multiAccountGap > 0 {
+			time.Sleep(multiAccountGap)
+		}
+	}
+}
 
-// scheduleGrowthCatchup 排一次启动补跑（调用方需持 s.mu）：当日已过上报 cron
-// 首个触发时刻、未过深夜窗口、上报未完成 → 30s 后补跑一次链。单账号场景
-// 服务器常在白天重启，错过时点不该白丢一天连登。已在排程中的 timer 直接
-// 重置（多次保存设置不叠加）；timer 由 s.mu 保护，Stop 时取消。
-// 判定只读一条 SQLite，同步执行不影响调度锁持有时长。
-func (s *Scheduler) scheduleGrowthCatchup(cfg config.Config) {
-	if !s.growthCatchupDue(cfg, time.Now()) {
+func (s *Scheduler) tickTravel() {
+	if s.cfg.Get().Region != "cn" {
+		return
+	}
+	accts := s.eligibleAccounts()
+	for i, acct := range accts {
+		if acct.growth == nil {
+			continue
+		}
+		s.runTravelTickForAccount(acct)
+		if i < len(accts)-1 && multiAccountGap > 0 {
+			time.Sleep(multiAccountGap)
+		}
+	}
+}
+
+// scheduleGrowthCatchupLocked 排一次启动补跑（调用方需持 s.mu）：当日已过上报 cron
+// 首个触发时刻、未过深夜窗口、任意合规账号上报未完成 → 30s 后补跑一次。
+func (s *Scheduler) scheduleGrowthCatchupLocked(cfg config.Config) {
+	if !s.growthCatchupDueWithPool(cfg, time.Now(), s.pool) {
 		return
 	}
 	if s.growthCatchupTimer != nil {
 		s.growthCatchupTimer.Stop()
 	}
 	s.growthCatchupTimer = time.AfterFunc(growthCatchupDelay, s.growthCatchupFire)
-	slog.Info("当日成长上报未完成，稍后补跑一次", "at", time.Now().Format("15:04"))
+	slog.Info("当日存在成长上报未完成账号，稍后补跑一次", "at", time.Now().Format("15:04"))
 }
 
 // growthCatchupFire 补跑回调（AfterFunc 独立 goroutine，不持 s.mu）：
-// 触发时复查开关与日标志——排程后的 30s 内上报可能已由 cron 链或手动上报完成，
-// 复查可避免整条链的冗余上游调用（bonus 是写操作）。链内自带 growthMu 互斥
-// 与日内幂等，即使复查后仍与链并发也安全。
+// 复查开关后，为所有今日尚未完成 report_day:<uid> 的合规 CN 账号逐一补跑。
 func (s *Scheduler) growthCatchupFire() {
-	if !s.cfg.Get().AutoGrowth {
-		return // 期间已被关闭
+	cfg := s.cfg.Get()
+	if !cfg.AutoGrowth || cfg.Region != "cn" {
+		return // 期间已被关闭或切到 global
 	}
 	day := upstream.GrowthTodayDate(time.Now())
-	if payload, _, ok := s.st.GetCache(growthCacheTable, growthKeyReportDay, growthDayTTL); ok && payload == day {
-		return // 今日上报已完成（排程后由 cron/手动链完成）
+	accts := s.eligibleAccounts()
+	var pending []schedAccount
+	for _, acct := range accts {
+		if acct.growth == nil {
+			continue
+		}
+		if payload, _, ok := s.st.GetCache(growthCacheTable, GrowthReportDayKey(acct.uid), growthDayTTL); ok && payload == day {
+			continue
+		}
+		pending = append(pending, acct)
 	}
-	res := s.RunGrowthChain()
-	if !res.Ran {
-		slog.Info("成长补跑跳过", "reason", res.Reason)
+	for i, acct := range pending {
+		res := s.runGrowthChainForAccount(acct)
+		if !res.Ran {
+			slog.Info("成长补跑跳过", "uid", uidTail(acct.uid), "reason", res.Reason)
+		}
+		if i < len(pending)-1 && multiAccountGap > 0 {
+			time.Sleep(multiAccountGap)
+		}
 	}
 }
 
-// growthCatchupDue 补跑条件判定（纯逻辑，便于单测矩阵）：
-// region=cn 且已登录；已过当日上报 cron 触发时刻（本地时区口径，与 cron 触发一致，
-// 上游 CST 只影响日标志口径）；当日无触发（如仅工作日 cron）不补；超过 22:00 不补；
-// 今日上报未完成（cache report_day != 今日 CST）。
+// growthCatchupDue 补跑条件判定（供单测调用）。
 func (s *Scheduler) growthCatchupDue(cfg config.Config, now time.Time) bool {
-	if cfg.Region != "cn" || s.growth.TokenSummary() == nil {
+	return s.growthCatchupDueWithPool(cfg, now, s.getPool())
+}
+
+// growthCatchupDueWithPool 补跑条件判定：region=cn、已过当日上报时点、未超 22:00、
+// 且至少有一个合规账号尚未完成今日 report_day:<uid>。
+func (s *Scheduler) growthCatchupDueWithPool(cfg config.Config, now time.Time, p *pool.Manager) bool {
+	if cfg.Region != "cn" {
 		return false
 	}
 	mainAt := fixedMainAt("成长上报", cfg.GrowthReportCron, now)
@@ -735,11 +840,17 @@ func (s *Scheduler) growthCatchupDue(cfg config.Config, now time.Time) bool {
 	if now.Hour()*60+now.Minute() > growthCatchupWindowEndMin {
 		return false // 深夜不打扰（>22:00）
 	}
-	day := upstream.GrowthTodayDate(now)
-	if payload, _, ok := s.st.GetCache(growthCacheTable, growthKeyReportDay, growthDayTTL); ok && payload == day {
-		return false // 今日上报已完成
+	accts := s.eligibleAccountsWithPool(p)
+	if len(accts) == 0 {
+		return false
 	}
-	return true
+	day := upstream.GrowthTodayDate(now)
+	for _, acct := range accts {
+		if payload, _, ok := s.st.GetCache(growthCacheTable, GrowthReportDayKey(acct.uid), growthDayTTL); !ok || payload != day {
+			return true
+		}
+	}
+	return false
 }
 
 // ── 编译期断言 ─────────────────────────────────────────────────────────────────

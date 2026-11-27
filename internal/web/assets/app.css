@@ -199,6 +199,29 @@ tbody tr:hover{background:color-mix(in oklab,var(--secondary) 55%,transparent)}
 .cell-edit{height:26px;border:1px solid transparent;background:transparent;color:var(--fg);font-size:var(--fs-xs);font-family:inherit;border-radius:6px;padding:0 7px;width:130px;outline:none;transition:border-color .15s,background .15s}
 .cell-edit:hover{border-color:var(--input)}
 .cell-edit:focus{border-color:color-mix(in oklab,var(--fg) 30%,var(--input));background:var(--popover)}
+.cell-edit-sm{height:22px;padding:0 5px;margin-left:-5px;width:118px;font-size:var(--fs-2xs);color:var(--muted-fg)}
+.cell-edit-sm:focus{color:var(--fg)}
+.credits-link{display:inline-flex;flex-direction:column;align-items:flex-start;gap:3px;padding:3px 6px;margin:-3px -6px;border:none;border-radius:6px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;transition:background .15s}
+.credits-link:hover{background:var(--secondary)}
+.details-box{margin-top:12px;border:1px solid color-mix(in oklab,var(--border) 75%,transparent);border-radius:9px;padding:10px 12px;background:color-mix(in oklab,var(--secondary) 35%,transparent)}
+.details-box>summary{cursor:pointer;font-size:var(--fs-xs);font-weight:500;color:var(--muted-fg);list-style:none;display:flex;align-items:center;gap:8px;user-select:none}
+.details-box>summary::-webkit-details-marker{display:none}
+.details-box>summary::before{content:"▸";font-size:11px;transition:transform .15s;color:var(--muted-fg)}
+.details-box[open]>summary::before{transform:rotate(90deg)}
+.details-box[open]>summary{color:var(--fg)}
+.details-body{margin-top:12px}
+.acct-pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;padding-top:14px;border-top:1px solid color-mix(in oklab,var(--border) 55%,transparent)}
+.acct-pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg);font-size:var(--fs-xs);font-family:inherit;cursor:pointer;transition:background .15s,border-color .15s}
+.acct-pill:hover{background:var(--secondary);border-color:color-mix(in oklab,var(--fg) 25%,var(--border))}
+.acct-pill-val{font-weight:600;font-variant-numeric:tabular-nums}
+.checkin-bar{display:flex;flex-direction:column;gap:8px;padding:10px 12px;margin-bottom:14px;border-radius:9px;background:color-mix(in oklab,var(--secondary) 60%,transparent);border:1px solid color-mix(in oklab,var(--border) 65%,transparent)}
+.checkin-chips{display:flex;flex-wrap:wrap;gap:6px}
+.checkin-chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:9999px;border:1px solid var(--border);background:var(--card);color:var(--fg);font-size:var(--fs-2xs);font-family:inherit;cursor:pointer;transition:background .15s,border-color .15s}
+.checkin-chip:hover{background:var(--secondary)}
+.checkin-chip.is-current{border-color:var(--primary);font-weight:600}
+.chip-dot{width:7px;height:7px;border-radius:9999px;background:color-mix(in oklab,var(--muted-fg) 40%,transparent);flex-shrink:0}
+.chip-dot.ok{background:var(--ok-fg)}
+.chip-dot.err{background:var(--err-fg)}
 .key-chip{background:var(--secondary);padding:3px 8px;border-radius:6px;white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis;display:inline-block}
 .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
 .filters .input,.filters .select{width:auto}

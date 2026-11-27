@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -419,26 +420,22 @@ func TestResourceAccountsHaveKey(t *testing.T) {
 }
 
 // TestResourceCacheVersionBumped 校验余额缓存键版本随「加工后结构」变更同步提升。
-//
-// 缓存存储加工结果：本版新增额度包 key 字段，若沿用 default_v2 会命中旧行，
-// 前端获得缺 key 的数据（x-for 的 :key 为 undefined，Alpine 报 key 无效或复用错节点）。
 func TestResourceCacheVersionBumped(t *testing.T) {
-	if resourceCacheKey == "default_v2" || resourceCacheKey == "default" {
-		t.Fatalf("resourceCacheKey = %q，新增字段后必须跳版本（否则命中旧结构缓存）", resourceCacheKey)
+	key := resourceCacheKey("u1")
+	if !strings.HasPrefix(key, "v4:") {
+		t.Fatalf("resourceCacheKey = %q，期望 v4: 前缀", key)
 	}
-	// 旧版本必须列入清理清单，否则旧行永久残留
 	stale := map[string]bool{}
 	for _, k := range resourceCacheStaleKeys {
 		stale[k] = true
 	}
-	for _, old := range []string{"default", "default_v2"} {
+	for _, old := range []string{"default", "default_v2", "default_v3"} {
 		if !stale[old] {
 			t.Errorf("旧缓存键 %q 不在 resourceCacheStaleKeys 中（不会被清理）", old)
 		}
 	}
-	// 当前键不得出现在清理清单中，否则写入后即被删除，缓存永久失效
-	if stale[resourceCacheKey] {
-		t.Errorf("当前键 %q 出现在清理清单里，会被自己删掉", resourceCacheKey)
+	if stale[key] {
+		t.Errorf("当前键 %q 出现在清理清单里，会被自己删掉", key)
 	}
 }
 

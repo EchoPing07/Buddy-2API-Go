@@ -63,15 +63,15 @@ function appShell(){
     health:{}, stats:{}, account:{}, keys:[],
     statsRange: (()=>{ const v = localStorage.getItem('buddy2api:statsRange'); return ['all','24h','7d','30d','90d'].includes(v) ? v : 'all'; })(),
     statsLoading:false, _statsSeq:0,
-    accounts:{items:[],loaded:false},   // 多账号档案（切换列表，见 pages/account.js）
+    accounts:{items:[],loaded:false},   // 多账号档案（见 pages/account.js）
     logs:[], logTotal:0, logPage:1, logPageSize:20,
-    logFilter:{model:'',key_id:'',status:''}, _logT:0,
+    logFilter:{model:'',key_id:'',status:'',account_uid:''}, _logT:0,
     keyForm:{name:'',custom_key:''}, keyModal:false,
-    resources:{accounts:[],loaded:false},
-    pool:null,   // 号池状态快照（GET /admin/pool；仅开关开启时有值）
-    // 实验开关是否已从服务端读到。labs 的默认值全是「关」，不区分「还不知道」与
-    // 「确实关着」会让刷新后停在账号页的用户永远看不到号池卡片（见 loadPool）。
-    _experimentsLoaded:false, _experimentsPromise:null,
+    resourceUID:'all',
+    resources:{mode:'all',accounts:[],accounts_summary:[],loaded:false},
+    _resourceSeq:0,
+    pool:null,   // 多账号调度快照（GET /admin/pool；常驻开启）
+    poolLoaded:false,
     _resourceRefetch:false,   // 在途期间到来的强刷意图（见 pages/resources.js loadResources）
     /* 账号代次：换账号 / 删凭证时 +1。账号口径加载器发请求前捕获代次、响应落地时比对，
        不一致则丢弃 —— 否则旧账号响应晚于新账号落地会把新数据覆盖回旧值（last-write-wins）。
@@ -79,7 +79,11 @@ function appShell(){
     _accountGen:0,
     hideDepleted: localStorage.getItem('buddy2api:hideDepleted')==='1', // 默认 false = 全部显示
     checkin:{loaded:false}, checkinOk:false, checkinErr:'', checkinPending:false,
+    checkinSummary:{items:[],checked_count:0,total_count:0,loaded:false},
+    checkinClaimAllBusy:false,
+    _checkinSeq:0, _growthSeq:0, _tasksSeq:0, _compSeq:0,
     /* ── 任务 ── */
+    growthUID:'',               // 任务页当前操作的目标账号 uid（空 = 主账号，不改变全局主账号）
     growth:{available:true, reason:'', loaded:false, streak:null, heatmap:null,
             buddy:null, travel:null, lottery:null, today:null, last_run:null,
             degraded:[], updated_at:0},
@@ -88,10 +92,8 @@ function appShell(){
     growthBusy:false,           // 上报/领养等长动作锁（与全局 loading 分开：上报要 10s）
     growthRunT:0,               // 总览防抖 timer
     settings:{}, pwForm:{old_password:'',new_password:''},
-    /* 实验特性开关（见 pages/labs.js）。号池字段默认全关 + 默认参数，
-       与后端 config.defaults() 同一组默认值（不一致会让开关看起来"自己变了"）。 */
-    labs:{embeddings_enabled:false, pool_enabled:false, pool_session_ttl:180,
-          pool_max_retry:2, pool_cool_max_min:360, pool_probe_cron:'0 0 0,6,12,18 * * *'},
+    /* 实验特性开关（见 pages/labs.js）：仅保留嵌入端点 */
+    labs:{embeddings_enabled:false},
     models:{models:[],ids:[],state:null,loading:false},
     importModal:false, importMode:'single',
     importForm:{access_token:'',refresh_token:'',domain:'',remark:'',filename:''},
@@ -138,7 +140,7 @@ function appShell(){
     },
 
     /* ── 登录后进场：刷壳层数据 + 首屏页数据（走 enter，与后续切页同一入口） ── */
-    afterLogin(){ this.loadHealth(); this.loadExperiments(); this.enter(this.view); },
+    afterLogin(){ this.loadHealth(); this.enter(this.view); },
 
     /* ═══ 软导航：切 view + 换 URL，不重载文档 ═══ */
 
@@ -208,6 +210,17 @@ function appShell(){
     },
     /* 程序化跳转（如任务页「前往登录」）；不再整页跳转，因此现在可以直接跨页调用 */
     go(v){ this.navigate(pageKey(v)); },
+    /* 从账号表直接跳转到余额页并聚焦指定账号 */
+    openAccountResources(uid){
+      const next = uid || 'all';
+      const wasEntered = !!this.entered.resources;
+      this.resourceUID = next;
+      this._resourceRefetch = false;
+      this.resources._loading = false;
+      this.resources.loaded = false;
+      this.navigate('resources');
+      if(wasEntered && typeof this.loadResources === 'function') this.loadResources(false);
+    },
 
     /* ── API / 基础工具 ── */
     async api(path, opts={}){
@@ -228,15 +241,17 @@ function appShell(){
     },
     /* 会话边界：清空「已进场」缓存。401 或退出后再登录属新会话，数据已失效；
        若不清理，afterLogin() → enter(view) 会被 entered 挡下，当前页保留过期前的旧统计 / 旧 Key 列表。 */
-    resetSession(){ this.entered = {}; this._experimentsLoaded = false; },
+    resetSession(){ this.entered = {}; this.poolLoaded = false; },
     /* 凭证被删除：清空账号口径的本地状态并撤销保活。
        此刻已无凭证，不能改成重拉（只会失败弹错）；而状态留着的话，保活会让余额/任务页
        继续展示被删账号的数据。撤销 entered 后下次进入页面重新拉取。 */
     resetAccountData(){
       this._accountGen++;   // 先换代：在途的旧账号响应此后一律丢弃
       this._resourceRefetch = false;   // 上一代的待重取意图随代作废
-      this.resources = {accounts:[],loaded:false};
+      this.resources = {mode:this.resourceUID==='all'?'all':'single',accounts:[],accounts_summary:[],loaded:false};
       this.checkin = {loaded:false}; this.checkinOk = false; this.checkinErr = ''; this.checkinPending = false;
+      this.checkinSummary = {items:[],checked_count:0,total_count:0,loaded:false};
+      this.growthUID = '';
       this.growth = {available:true, reason:'', loaded:false, streak:null, heatmap:null,
                      buddy:null, travel:null, lottery:null, today:null, last_run:null,
                      degraded:[], updated_at:0};
@@ -325,6 +340,32 @@ function appShell(){
       if(!a) return '未命名';
       return a.remark || a.nickname || '未命名';
     },
+    /** 账号真实 UID（与后端 ?uid= / pool / logs 一致；accounts.items 中 uid 为安全 ID m.ID，raw_uid 为原始 t.UID） */
+    accountUID(a){
+      if(!a) return '';
+      return a.raw_uid || a.uid || '';
+    },
+    poolStrategyLabel(s){
+      return {expire_first:'临期优先', balanced:'均衡分摊', credits_first:'高余额优先'}[s] || '临期优先';
+    },
+    expireDaysLeft(unix){
+      if(!unix) return null;
+      const diff = unix - Math.floor(Date.now()/1000);
+      if(diff <= 0) return 0;
+      return Math.ceil(diff / 86400);
+    },
+    expireHint(unix, credits){
+      if(!unix) return '';
+      const d = this.expireDaysLeft(unix);
+      const dayText = d <= 0 ? '今日到期' : (d + ' 天后到期');
+      const cText = credits > 0 ? ('（' + this.fmtDosage(credits) + '）') : '';
+      return dayText + cText;
+    },
+    isExpiringSoon(unix){
+      if(!unix) return false;
+      const d = this.expireDaysLeft(unix);
+      return d !== null && d <= 7;
+    },
 
     /* ── 登录 ── */
     async doLogin(){
@@ -382,58 +423,28 @@ function appShell(){
       this._accountGen++;
       this._resourceRefetch = false;
       this.resources._loading = false;
+      this.growthUID = '';       // 主账号切换后，任务页默认跟随新主账号
       this.loadAccount();
       this.loadHealth();
       this.loadResources(true);
       this.loadCheckin();
+      if(typeof this.loadCheckinSummary === 'function') this.loadCheckinSummary();
       this.loadGrowth(true);
       this.loadTasks();          // 任务中心与成长总览同为账号口径，换账号必须一并刷新
       this.loadCompensation();
-      this.loadPool();           // 号池成员按账号档案枚举，换账号后会变
+      this.loadPool();           // 多账号调度成员按账号档案枚举，换账号后会变
+      if(typeof this.loadAccounts === 'function') this.loadAccounts();
     },
 
-    /* ── 号池 ── */
-    /* loadPool 拉号池快照（GET /admin/pool）。放共享层而不是页面层：
-       账号页与实验页要用同一份 pool 状态，两份实现会静默漂移
-       （见 web_test 的 TestPageLayerDoesNotShadowShell）。
-
-       开关还没拉到（刷新后直接停在账号页，afterLogin 的 loadExperiments 尚在途）时
-       必须先等它：否则 labs.pool_enabled 仍是默认 false，本函数会当场返回 null，
-       号池卡片一直空着 —— 这正是「只能从实验页跳转才看得见」的原因。 */
+    /* ── 多账号调度快照（原生常驻，无开关门控） ── */
     async loadPool(){
-      if(!this._experimentsLoaded) await this.loadExperiments();
-      if(!this.labs.pool_enabled){ this.pool = null; return; }
-      try{ this.pool = await this.api('/admin/pool'); }catch(e){ this.pool = null; }
-    },
-    /* loadExperiments 只拉实验开关（不拉号池统计，供全站公共入口用）。
-       必须由 afterLogin 调一次：开关状态原先只有「实验」页进场才拉，
-       于是刷新停在账号页时 labs.pool_enabled 恒为默认 false，号池卡片被
-       x-show 藏起来、loadPool 也不发请求 —— 看起来「刷新后号池就不见了」。
-
-       成功后置 _experimentsLoaded：账号页刷新与 afterLogin 是并发的，
-       loadPool 靠它判断「开关还不知道」并等价一次，而不是稳当地返回 false。 */
-    loadExperiments(){
-      // 在途去重：afterLogin 与页面 load() 同一轮里都会要它，不得重复打接口
-      if(this._experimentsPromise) return this._experimentsPromise;
-      this._experimentsPromise = (async()=>{
-        try{
-          const r = await this.api('/admin/experiments');
-          this.applyExperiments(r);
-        }catch(e){ /* 静默：实验状态拉不到就用默认值，不阻断其余页面 */ }
-        finally{ this._experimentsPromise = null; }
-      })();
-      return this._experimentsPromise;
-    },
-    /* applyExperiments 把服务端回值灌回 labs（PUT / GET 恒回服务端真值）。
-       放共享层：afterLogin 与实验页都要用。 */
-    applyExperiments(r){
-      this.labs.embeddings_enabled = !!r.embeddings_enabled;
-      this.labs.pool_enabled = !!r.pool_enabled;
-      this.labs.pool_session_ttl = r.pool_session_ttl;
-      this.labs.pool_max_retry = r.pool_max_retry;
-      this.labs.pool_cool_max_min = r.pool_cool_max_min;
-      this.labs.pool_probe_cron = r.pool_probe_cron;
-      this._experimentsLoaded = true;
+      try{
+        this.pool = await this.api('/admin/pool');
+      }catch(e){
+        this.pool = null;
+      }finally{
+        this.poolLoaded = true;
+      }
     },
 
     /** 上报条数区间文案：有波动显示 N±J（实际 a-b 条），无波动显示 N 条 */

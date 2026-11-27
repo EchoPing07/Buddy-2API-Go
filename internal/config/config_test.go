@@ -440,3 +440,84 @@ func TestPoolEnvClampedAfterOverride(t *testing.T) {
 		t.Errorf("env 超界未钳制：%d", got)
 	}
 }
+
+// TestPoolStrategyValidationAndNormalize 校验 PoolStrategy 合法值、默认值与非法回退。
+func TestPoolStrategyValidationAndNormalize(t *testing.T) {
+	for _, s := range []string{PoolStrategyExpireFirst, PoolStrategyBalanced, PoolStrategyCreditsFirst} {
+		if !ValidPoolStrategy(s) {
+			t.Errorf("ValidPoolStrategy(%q) 应为 true", s)
+		}
+	}
+	for _, s := range []string{"", "unknown", "EXPIRE_FIRST", " balanced "} {
+		if ValidPoolStrategy(s) {
+			t.Errorf("ValidPoolStrategy(%q) 应为 false", s)
+		}
+	}
+
+	// defaults 与空 Config 归一化 → expire_first
+	if d := defaults(); d.PoolStrategy != PoolStrategyExpireFirst {
+		t.Errorf("defaults().PoolStrategy = %q，期望 %q", d.PoolStrategy, PoolStrategyExpireFirst)
+	}
+	var c Config
+	c.Normalize()
+	if c.PoolStrategy != PoolStrategyExpireFirst {
+		t.Errorf("空 PoolStrategy 应归一化为 %q，得到 %q", PoolStrategyExpireFirst, c.PoolStrategy)
+	}
+	// 非法值归一化 → expire_first
+	c = Config{PoolStrategy: "bogus"}
+	c.Normalize()
+	if c.PoolStrategy != PoolStrategyExpireFirst {
+		t.Errorf("非法 PoolStrategy 应归一化为 %q，得到 %q", PoolStrategyExpireFirst, c.PoolStrategy)
+	}
+	// 合法自定义保留
+	for _, s := range []string{PoolStrategyExpireFirst, PoolStrategyBalanced, PoolStrategyCreditsFirst} {
+		c = Config{PoolStrategy: s}
+		c.Normalize()
+		if c.PoolStrategy != s {
+			t.Errorf("合法策略 %q 不应被改写，得到 %q", s, c.PoolStrategy)
+		}
+	}
+}
+
+// TestPoolStrategyEnvOverride 验证 BUDDY2API_POOL_STRATEGY 覆盖与 Update 保护，及非法 env 回退。
+func TestPoolStrategyEnvOverride(t *testing.T) {
+	t.Run("valid env locked against Update", func(t *testing.T) {
+		t.Setenv("BUDDY2API_POOL_STRATEGY", "balanced")
+		m, err := Load(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := m.Get().PoolStrategy; got != PoolStrategyBalanced {
+			t.Fatalf("env 覆盖失败: got %q, want %q", got, PoolStrategyBalanced)
+		}
+		if err := m.Update(func(c *Config) error { c.PoolStrategy = PoolStrategyCreditsFirst; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if got := m.Get().PoolStrategy; got != PoolStrategyBalanced {
+			t.Errorf("env 锁定的 pool_strategy 不应被 Update 覆盖: got %q", got)
+		}
+	})
+
+	t.Run("invalid env re-normalized and persisted", func(t *testing.T) {
+		t.Setenv("BUDDY2API_POOL_STRATEGY", "not_a_strategy")
+		dir := t.TempDir()
+		m, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := m.Get().PoolStrategy; got != PoolStrategyExpireFirst {
+			t.Errorf("非法 env 应回退 %q，得到 %q", PoolStrategyExpireFirst, got)
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var persisted Config
+		if err := json.Unmarshal(raw, &persisted); err != nil {
+			t.Fatal(err)
+		}
+		if persisted.PoolStrategy != PoolStrategyExpireFirst {
+			t.Errorf("落盘值应已归一化为 %q，得到 %q", PoolStrategyExpireFirst, persisted.PoolStrategy)
+		}
+	})
+}

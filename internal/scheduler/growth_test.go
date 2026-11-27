@@ -275,7 +275,7 @@ func TestGrowthChainReportFailChain(t *testing.T) {
 		t.Error("旅行步应照跑")
 	}
 	// 失败不置 report_day
-	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyReportDay, growthDayTTL); ok && payload == mustDay(t) {
+	if payload, _, ok := st.GetCache(growthCacheTable, GrowthReportDayKey("test-uid"), growthDayTTL); ok && payload == mustDay(t) {
 		t.Error("上报未发满不应置 report_day")
 	}
 }
@@ -321,7 +321,7 @@ func TestGrowthChainAdoptThresholdAndDailyDedup(t *testing.T) {
 	if fake.firstN != 1 {
 		t.Fatalf("BuddyFirst 应调用 1 次，得到 %d", fake.firstN)
 	}
-	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyAdoptDay, growthDayTTL); !ok || payload != mustDay(t) {
+	if payload, _, ok := st.GetCache(growthCacheTable, GrowthAdoptDayKey("test-uid"), growthDayTTL); !ok || payload != mustDay(t) {
 		t.Errorf("adopt_day 应置今日，得到 ok=%v payload=%q", ok, payload)
 	}
 
@@ -336,12 +336,13 @@ func TestGrowthChainAdoptThresholdAndDailyDedup(t *testing.T) {
 
 	// 模拟真正跨 CST 日：清掉今日日标志缓存 + 内存 day 重置 → 全新一天
 	// （fake 的 firstErrOnce 让第二次 BuddyFirst 成功）
-	_ = st.DeleteCacheKey(growthCacheTable, growthKeyReportDay)
-	_ = st.DeleteCacheKey(growthCacheTable, growthKeyAdoptDay)
-	_ = st.DeleteCacheKey(growthCacheTable, growthKeyRewardDay)
-	s.growthMu.Lock()
-	s.growthState = growthDay{}
-	s.growthMu.Unlock()
+	_ = st.DeleteCacheKey(growthCacheTable, GrowthReportDayKey("test-uid"))
+	_ = st.DeleteCacheKey(growthCacheTable, GrowthAdoptDayKey("test-uid"))
+	_ = st.DeleteCacheKey(growthCacheTable, GrowthRewardDayKey("test-uid"))
+	mu := s.growthLock("test-uid")
+	mu.Lock()
+	*s.growthStateOf("test-uid") = growthDay{}
+	mu.Unlock()
 	res = s.RunGrowthChain()
 	if stp := stepOf(&res, "adopt"); stp == nil || stp.Status != "ok" {
 		t.Errorf("跨日重试应领养成功，得到 %+v", stp)
@@ -411,7 +412,7 @@ func TestGrowthChainRewardDailyOnce(t *testing.T) {
 	s, st, _ := newTestScheduler(t, "cn", fake)
 
 	s.RunGrowthChain()
-	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyRewardDay, growthDayTTL); !ok || payload != mustDay(t) {
+	if payload, _, ok := st.GetCache(growthCacheTable, GrowthRewardDayKey("test-uid"), growthDayTTL); !ok || payload != mustDay(t) {
 		t.Errorf("reward_day 应置今日，得到 ok=%v payload=%q", ok, payload)
 	}
 	res := s.RunGrowthChain()
@@ -427,9 +428,10 @@ func TestGrowthChainRewardDailyOnce(t *testing.T) {
 func TestGrowthChainBusyMutex(t *testing.T) {
 	fake := &fakeGrowth{}
 	s, _, _ := newTestScheduler(t, "cn", fake)
-	s.growthMu.Lock()
+	mu := s.growthLock("test-uid")
+	mu.Lock()
 	res := s.RunGrowthChain()
-	s.growthMu.Unlock()
+	mu.Unlock()
 	if res.Ran || res.Reason != "busy" {
 		t.Errorf("互斥占用应返回 busy，得到 %+v", res)
 	}
@@ -468,13 +470,14 @@ func TestGrowthChainCrossDayReset(t *testing.T) {
 	fake := &fakeGrowth{}
 	s, _, _ := newTestScheduler(t, "cn", fake)
 	// 人为置昨日状态：全部 done
-	s.growthMu.Lock()
-	s.growthState = growthDay{day: "2000-01-01", reportDone: true, adoptTried: true, rewardDone: true}
-	s.growthMu.Unlock()
+	mu := s.growthLock("test-uid")
+	mu.Lock()
+	*s.growthStateOf("test-uid") = growthDay{day: "2000-01-01", reportDone: true, adoptTried: true, rewardDone: true}
+	mu.Unlock()
 
 	res := s.RunGrowthChain()
-	if s.growthState.day != mustDay(t) {
-		t.Errorf("跨日后应重置为今日，得到 %q", s.growthState.day)
+	if got := s.growthStateOf("test-uid").day; got != mustDay(t) {
+		t.Errorf("跨日后应重置为今日，得到 %q", got)
 	}
 	if stp := stepOf(&res, "report"); stp == nil || stp.Status != "ok" {
 		t.Errorf("跨日后上报应重新执行，得到 %+v", stp)
@@ -484,7 +487,7 @@ func TestGrowthChainCrossDayReset(t *testing.T) {
 	}
 }
 
-// TestGrowthChainRestartRestore 重启回填：cache 已有今日 report_day → 内存态回填后 skip。
+// TestGrowthChainRestartRestore 重启回填：cache 已有今日 report_day:<uid> → 内存态回填后 skip。
 func TestGrowthChainRestartRestore(t *testing.T) {
 	origGap := growthReportGap
 	growthReportGap = 0
@@ -493,7 +496,7 @@ func TestGrowthChainRestartRestore(t *testing.T) {
 	fake := &fakeGrowth{}
 	s, st, _ := newTestScheduler(t, "cn", fake)
 	// 模拟重启前的缓存镜像：今日上报已完成
-	if err := st.SetCache(growthCacheTable, growthKeyReportDay, mustDay(t)); err != nil {
+	if err := st.SetCache(growthCacheTable, GrowthReportDayKey("test-uid"), mustDay(t)); err != nil {
 		t.Fatal(err)
 	}
 	// 内存 day 为空（新进程）
@@ -501,80 +504,92 @@ func TestGrowthChainRestartRestore(t *testing.T) {
 	if stp := stepOf(&res, "report"); stp == nil || stp.Status != "skip" {
 		t.Errorf("重启后应从 cache 回填 reportDone 并 skip，得到 %+v", stp)
 	}
-	if !s.growthState.reportDone {
+	if !s.growthStateOf("test-uid").reportDone {
 		t.Error("cache 镜像应回填内存状态")
 	}
 }
 
-// TestResetAccountStateDropsDayState 换账号后日内状态与日标志镜像必须一并复位。
-//
-// 状态都按自然日分片而不按账号：不清的话新旧账号的「今日已签到/已上报」会被继承，当天定时任务全部跳过。
-// 镜像必须在 growthMu 内删，否则在跑的链会在收尾时写回（见 TestResetAccountStateWaitsForRunningChain）。
+// TestResetAccountStateDropsDayState 换账号后仅清理历史无后缀残留键与空 uid 内存态，
+// 已按 UID 隔离的各账号日内状态与缓存完整保留（不再误杀其它账号）。
 func TestResetAccountStateDropsDayState(t *testing.T) {
 	fake := &fakeGrowth{}
 	s, st, cfg := newTestScheduler(t, "cn", fake)
-	checkinDay0 := time.Now().Format("2006-01-02") // 与 rollDayLocked 同为本地时区
-	growthDay0 := mustDay(t)                       // 成长口径为 CST
+	checkinDay0 := time.Now().Format("2006-01-02")
+	growthDay0 := mustDay(t)
 
-	// 旧账号当日已全部完成（内存 + SQLite 镜像都在，模拟运行中的进程）
+	// 同时写入：历史无后缀（uid=""）与带 UID 隔离的（uid="uid-keep"）
 	s.mu.Lock()
-	s.ck = checkinDay{day: checkinDay0, mainHit: true, fbHit: true, secured: true}
+	s.cks = map[string]*checkinDay{
+		"":         {day: checkinDay0, mainHit: true, fbHit: true, secured: true},
+		"uid-keep": {day: checkinDay0, mainHit: true, secured: true},
+	}
 	s.mu.Unlock()
-	s.growthMu.Lock()
-	s.growthState = growthDay{day: growthDay0, reportDone: true, adoptTried: true, rewardDone: true}
-	s.growthMu.Unlock()
+	*s.growthStateOf("") = growthDay{day: growthDay0, reportDone: true, adoptTried: true, rewardDone: true}
+	*s.growthStateOf("uid-keep") = growthDay{day: growthDay0, reportDone: true, adoptTried: true, rewardDone: true}
 	for _, k := range growthAccountScopedKeys {
+		val := growthDay0
 		if k == growthKeyLastRun {
-			continue // last_run 存整段链结果 JSON，单独写以贴近真实形状
+			val = `{"day":"` + growthDay0 + `"}`
 		}
-		if err := st.SetCache(growthCacheTable, k, growthDay0); err != nil {
+		if err := st.SetCache(growthCacheTable, k, val); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := st.SetCache(growthCacheTable, growthKeyLastRun, `{"day":"`+growthDay0+`"}`); err != nil {
-		t.Fatal(err)
+		if err := st.SetCache(growthCacheTable, ScopedCacheKey(k, "uid-keep"), val); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	s.ResetAccountState()
 
-	if s.ck != (checkinDay{}) {
-		t.Errorf("签到日内状态应清零，得到 %+v", s.ck)
+	// 历史无后缀内存态与缓存键均被清掉
+	if _, ok := s.cks[""]; ok {
+		t.Errorf("历史无后缀签到状态应清零，仍存在: %+v", s.cks[""])
 	}
-	if s.growthState != (growthDay{}) {
-		t.Errorf("成长日内状态应清零，得到 %+v", s.growthState)
+	if _, ok := s.growthStates[""]; ok {
+		t.Errorf("历史无后缀成长状态应清零，仍存在: %+v", s.growthStates[""])
 	}
-	// 遍历实现同源的 growthAccountScopedKeys，新增日标志时测试不会漏跟
 	for _, k := range growthAccountScopedKeys {
 		if payload, _, ok := st.GetCache(growthCacheTable, k, 0); ok && payload != "" {
-			t.Errorf("%s 镜像应随换账号清除，仍存在: %s", k, payload)
+			t.Errorf("历史无后缀 %s 应清除，仍存在: %s", k, payload)
 		}
 	}
 
-	// 重置后重新滚动：不得从旧镜像回填「今日已完成」
+	// 按 UID 隔离的账号状态与缓存必须完整保留
+	if d := s.cks["uid-keep"]; d == nil || !d.secured {
+		t.Errorf("uid-keep 签到状态不应被清除，得到 %+v", d)
+	}
+	if gs := s.growthStateOf("uid-keep"); !gs.reportDone || !gs.adoptTried || !gs.rewardDone {
+		t.Errorf("uid-keep 成长状态不应被清除，得到 %+v", gs)
+	}
+	for _, k := range growthAccountScopedKeys {
+		if payload, _, ok := st.GetCache(growthCacheTable, ScopedCacheKey(k, "uid-keep"), 0); !ok || payload == "" {
+			t.Errorf("uid-keep 的 %s 缓存不应被清除", k)
+		}
+	}
+
+	// 重置后对 "" 重新滚动：不得回填旧无后缀完成标志
 	s.mu.Lock()
-	s.rollDayLocked(time.Now(), cfg.Get())
+	d := s.rollDayLocked("", 0, time.Now(), cfg.Get())
 	s.mu.Unlock()
-	if s.ck.day != checkinDay0 || s.ck.secured || s.ck.mainHit {
-		t.Errorf("复位后应作为新账号重新签到，得到 %+v", s.ck)
+	if d.day != checkinDay0 || d.secured || d.mainHit {
+		t.Errorf("复位后空 uid 应作为新状态，得到 %+v", d)
 	}
-	s.growthMu.Lock()
-	s.rollGrowthDayLocked(time.Now())
-	s.growthMu.Unlock()
-	if s.growthState.day != growthDay0 {
-		t.Errorf("复位后应重新滚到今日，得到 %q", s.growthState.day)
-	}
-	if s.growthState.reportDone || s.growthState.adoptTried || s.growthState.rewardDone {
-		t.Errorf("复位后不应回填旧账号的今日完成标志，得到 %+v", s.growthState)
+	mu := s.growthLock("")
+	mu.Lock()
+	gs := s.rollGrowthDayLocked("", time.Now())
+	mu.Unlock()
+	if gs.day != growthDay0 || gs.reportDone || gs.adoptTried || gs.rewardDone {
+		t.Errorf("复位后空 uid 不应回填完成标志，得到 %+v", gs)
 	}
 }
 
-// TestResetAccountStateWaitsForRunningChain 复位必须等正在跑的成长链收尾（阻塞 Lock）：
-// 否则链的收尾会把旧账号的日标志写回镜像，新账号当天又不上报了。
+// TestResetAccountStateWaitsForRunningChain 复位必须等空 uid 锁释放再清历史无后缀镜像。
 func TestResetAccountStateWaitsForRunningChain(t *testing.T) {
 	fake := &fakeGrowth{}
 	s, st, _ := newTestScheduler(t, "cn", fake)
 
-	s.growthMu.Lock() // 模拟正在跑的一条链（真实链会在收尾写入日标志）
+	mu := s.growthLock("")
+	mu.Lock()
 	done := make(chan struct{})
 	go func() {
 		s.ResetAccountState()
@@ -582,23 +597,21 @@ func TestResetAccountStateWaitsForRunningChain(t *testing.T) {
 	}()
 	select {
 	case <-done:
-		t.Fatal("链在跑时 ResetAccountState 不应立即返回（否则旧标志会被链写回）")
+		t.Fatal("锁持有期间 ResetAccountState 不应立即返回")
 	case <-time.After(50 * time.Millisecond):
 	}
-	// 链收尾：写入今日标志，然后放锁
 	if err := st.SetCache(growthCacheTable, growthKeyReportDay, mustDay(t)); err != nil {
 		t.Fatal(err)
 	}
-	s.growthMu.Unlock()
+	mu.Unlock()
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("放锁后 ResetAccountState 应立即完成")
 	}
-	// 复位在链之后执行 → 链刚写回的旧标志被清掉
 	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyReportDay, 0); ok && payload != "" {
-		t.Errorf("复位应清掉链刚写回的旧账号日标志，仍存在: %s", payload)
+		t.Errorf("复位应清掉无后缀日标志，仍存在: %s", payload)
 	}
 }
 
@@ -742,7 +755,7 @@ func TestRunActivityReportsManual(t *testing.T) {
 	}
 	// 自动链先跑一遍（今日已上报）
 	s.RunGrowthChain()
-	if !s.growthState.reportDone {
+	if !s.growthStateOf("test-uid").reportDone {
 		t.Fatal("前置失败：自动链应置 reportDone")
 	}
 	// 手动上报：不受日标志阻塞
@@ -750,7 +763,7 @@ func TestRunActivityReportsManual(t *testing.T) {
 	if !res.Ran || res.Sent != 3 || res.Total != 3 {
 		t.Errorf("手动上报应发 3 条，得到 %+v", res)
 	}
-	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyReportDay, growthDayTTL); !ok || payload != mustDay(t) {
+	if payload, _, ok := st.GetCache(growthCacheTable, GrowthReportDayKey("test-uid"), growthDayTTL); !ok || payload != mustDay(t) {
 		t.Error("手动上报发满应置 report_day")
 	}
 	// 显式 count 钳制：0 以下取配置，>10 钳 10
@@ -758,9 +771,10 @@ func TestRunActivityReportsManual(t *testing.T) {
 		t.Errorf("count=99 应钳 10，得到 %d", res.Total)
 	}
 	// busy
-	s.growthMu.Lock()
+	mu := s.growthLock("test-uid")
+	mu.Lock()
 	res2 := s.RunActivityReports(2)
-	s.growthMu.Unlock()
+	mu.Unlock()
 	if res2.Ran || res2.Reason != "busy" {
 		t.Errorf("互斥时应 busy，得到 %+v", res2)
 	}
@@ -783,7 +797,7 @@ func TestReportCountJitter(t *testing.T) {
 	}
 	seen := map[int]int{}
 	for i := 0; i < 60; i++ {
-		s.growthState.reportDone = false // 每轮重置日标志，模拟不同日期
+		s.growthStateOf("test-uid").reportDone = false // 每轮重置日标志，模拟不同日期
 		res := s.RunActivityReports(0)
 		if !res.Ran {
 			t.Fatalf("第 %d 轮未执行: %+v", i, res)
@@ -805,14 +819,14 @@ func TestReportCountJitter(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 10; i++ {
-		s.growthState.reportDone = false
+		s.growthStateOf("test-uid").reportDone = false
 		if got := s.RunActivityReports(0).Total; got != 8 {
 			t.Fatalf("jitter=0 应恒为 8，得到 %d", got)
 		}
 	}
 
 	// 显式 count 不受波动影响
-	s.growthState.reportDone = false
+	s.growthStateOf("test-uid").reportDone = false
 	if got := s.RunActivityReports(3).Total; got != 3 {
 		t.Errorf("显式 count 应尊重 3，得到 %d", got)
 	}
@@ -827,10 +841,10 @@ func TestRunGrowthRedeemManual(t *testing.T) {
 	if !out.Ran || out.Status != "ok" || out.Granted == nil {
 		t.Errorf("手动兑换应成功，得到 %+v", out)
 	}
-	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyRewardDay, growthDayTTL); !ok || payload != mustDay(t) {
+	if payload, _, ok := st.GetCache(growthCacheTable, GrowthRewardDayKey("test-uid"), growthDayTTL); !ok || payload != mustDay(t) {
 		t.Error("兑换成功应置 reward_day")
 	}
-	if !s.growthState.rewardDone {
+	if !s.growthStateOf("test-uid").rewardDone {
 		t.Error("兑换成功应置内存 rewardDone")
 	}
 
@@ -841,7 +855,7 @@ func TestRunGrowthRedeemManual(t *testing.T) {
 	if out2.Status != "skip" || out2.Detail != "本月该档已领取" {
 		t.Errorf("409 应 skip，得到 %+v", out2)
 	}
-	if payload, _, ok := st2.GetCache(growthCacheTable, growthKeyRewardDay, growthDayTTL); ok && payload == mustDay(t) {
+	if payload, _, ok := st2.GetCache(growthCacheTable, GrowthRewardDayKey("test-uid"), growthDayTTL); ok && payload == mustDay(t) {
 		t.Error("skip 不应置 reward_day")
 	}
 	// 无档位天数不足（403）
@@ -867,7 +881,7 @@ func TestRunGrowthAdoptManual(t *testing.T) {
 	if out2.Status != "skip" {
 		t.Errorf("门槛未达应 skip，得到 %+v", out2)
 	}
-	if payload, _, ok := st2.GetCache(growthCacheTable, growthKeyAdoptDay, growthDayTTL); !ok || payload != mustDay(t) {
+	if payload, _, ok := st2.GetCache(growthCacheTable, GrowthAdoptDayKey("test-uid"), growthDayTTL); !ok || payload != mustDay(t) {
 		t.Error("手动领养门槛未达应置 adopt_day")
 	}
 	// force 语义：同日手动领养豁免防抖再试（手动按钮不受 adoptTried 限制）
@@ -922,13 +936,13 @@ func TestGrowthCatchupDueMatrix(t *testing.T) {
 	}
 	// 今日上报已完成 → 不补
 	day := upstream.GrowthTodayDate(at(12, 0))
-	if err := st.SetCache(growthCacheTable, growthKeyReportDay, day); err != nil {
+	if err := st.SetCache(growthCacheTable, GrowthReportDayKey("u"), day); err != nil {
 		t.Fatal(err)
 	}
 	if s.growthCatchupDue(cfg, at(12, 0)) {
 		t.Error("今日上报完成不应补跑")
 	}
-	_ = st.DeleteCacheKey(growthCacheTable, growthKeyReportDay)
+	_ = st.DeleteCacheKey(growthCacheTable, GrowthReportDayKey("u"))
 	// 当日无 cron 触发（仅周一，今天是周六）→ 不补
 	cfgNo := cfg
 	cfgNo.GrowthReportCron = "0 0 10 * * 1"
@@ -1050,7 +1064,7 @@ func TestRunGrowthRedeemFail(t *testing.T) {
 	if out.Status != "fail" {
 		t.Errorf("网络错误应 fail，得到 %+v", out)
 	}
-	if payload, _, ok := st.GetCache(growthCacheTable, growthKeyRewardDay, growthDayTTL); ok && payload == mustDay(t) {
+	if payload, _, ok := st.GetCache(growthCacheTable, GrowthRewardDayKey("test-uid"), growthDayTTL); ok && payload == mustDay(t) {
 		t.Error("fail 不应置 reward_day")
 	}
 }
@@ -1065,18 +1079,19 @@ func TestStepReportsClearsAdoptDebounce(t *testing.T) {
 	fake := &fakeGrowth{} // 无猫，领养成功
 	s, st, _ := newTestScheduler(t, "cn", fake)
 	// 模拟今早手动领养失败后的防抖状态
-	s.growthMu.Lock()
-	s.growthState = growthDay{day: mustDay(t), adoptTried: true}
-	s.growthMu.Unlock()
-	if err := st.SetCache(growthCacheTable, growthKeyAdoptDay, mustDay(t)); err != nil {
+	mu := s.growthLock("test-uid")
+	mu.Lock()
+	*s.growthStateOf("test-uid") = growthDay{day: mustDay(t), adoptTried: true}
+	mu.Unlock()
+	if err := st.SetCache(growthCacheTable, GrowthAdoptDayKey("test-uid"), mustDay(t)); err != nil {
 		t.Fatal(err)
 	}
 
 	res := s.RunGrowthChain() // 上报发满 → 清防抖 → force=true 领养成功
-	if s.growthState.adoptTried {
+	if s.growthStateOf("test-uid").adoptTried {
 		t.Error("上报补满应清领养防抖")
 	}
-	if _, _, ok := st.GetCache(growthCacheTable, growthKeyAdoptDay, growthDayTTL); ok {
+	if _, _, ok := st.GetCache(growthCacheTable, GrowthAdoptDayKey("test-uid"), growthDayTTL); ok {
 		t.Error("adopt_day 缓存应随之删除")
 	}
 	if stp := stepOf(&res, "adopt"); stp == nil || stp.Status != "ok" {
@@ -1084,13 +1099,13 @@ func TestStepReportsClearsAdoptDebounce(t *testing.T) {
 	}
 
 	// 手动上报路径同样清防抖
-	s.growthMu.Lock()
-	s.growthState.adoptTried = true
-	s.growthMu.Unlock()
+	mu.Lock()
+	s.growthStateOf("test-uid").adoptTried = true
+	mu.Unlock()
 	if out := s.RunActivityReports(2); out.Sent != 2 {
 		t.Fatalf("手动上报应成功: %+v", out)
 	}
-	if s.growthState.adoptTried {
+	if s.growthStateOf("test-uid").adoptTried {
 		t.Error("手动上报补满应清领养防抖")
 	}
 }
@@ -1163,7 +1178,7 @@ func TestStepBonusCompensationPending(t *testing.T) {
 			fake := &fakeGrowth{compStatus: c.st, compCredit: c.claimMoney}
 			s, _, _ := newTestScheduler(t, "cn", fake)
 			res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
-			s.stepBonus(res)
+			s.stepBonus(schedAccount{uid: "test-uid", growth: fake}, res)
 			if c.wantStep == "" {
 				if _, ok := res.findStep("bonus"); ok {
 					t.Errorf("不应记 bonus 步，得到 %+v", res.Steps)
@@ -1189,7 +1204,7 @@ func TestStepBonusCompensationQueryError(t *testing.T) {
 	fake := &fakeGrowth{compStatusErr: errors.New("network down")}
 	s, _, _ := newTestScheduler(t, "cn", fake)
 	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
-	s.stepBonus(res)
+	s.stepBonus(schedAccount{uid: "test-uid", growth: fake}, res)
 	stp, ok := res.findStep("compensation")
 	if !ok || stp.Status != "warn" {
 		t.Fatalf("查询失败应记 warn，得到 %+v", stp)
@@ -1207,7 +1222,7 @@ func TestStepBonusCompensationClaimError(t *testing.T) {
 	}
 	s, _, _ := newTestScheduler(t, "cn", fake)
 	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
-	s.stepBonus(res)
+	s.stepBonus(schedAccount{uid: "test-uid", growth: fake}, res)
 	stp, ok := res.findStep("compensation")
 	if !ok || stp.Status != "fail" {
 		t.Fatalf("领取失败应记 fail，得到 %+v", stp)
@@ -1229,10 +1244,11 @@ func TestStepRewardChainRedeemsAllTiers(t *testing.T) {
 	fake := &fakeGrowth{streakSeq: []*upstream.GrowthStreakInfo{info}, chances: 0}
 	s, _, _ := newTestScheduler(t, "cn", fake)
 	// 绕过上报/领养等步骤，直接测奖励链
-	s.growthState.day = upstream.GrowthTodayDate(time.Now())
+	st := s.growthStateOf("test-uid")
+	st.day = upstream.GrowthTodayDate(time.Now())
 	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
 	var pInfo *upstream.GrowthStreakInfo
-	s.stepRewardChain(res, &pInfo)
+	s.stepRewardChain(schedAccount{uid: "test-uid", growth: fake}, st, res, &pInfo)
 
 	if len(fake.redeemTiers) != 3 {
 		t.Fatalf("应兑换全部 3 档，得到 %v", fake.redeemTiers)
@@ -1260,10 +1276,11 @@ func TestStepRewardChainSkipsClaimedTier(t *testing.T) {
 	}
 	fake := &fakeGrowth{streakSeq: []*upstream.GrowthStreakInfo{info}}
 	s, _, _ := newTestScheduler(t, "cn", fake)
-	s.growthState.day = upstream.GrowthTodayDate(time.Now())
+	st := s.growthStateOf("test-uid")
+	st.day = upstream.GrowthTodayDate(time.Now())
 	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
 	var pInfo *upstream.GrowthStreakInfo
-	s.stepRewardChain(res, &pInfo)
+	s.stepRewardChain(schedAccount{uid: "test-uid", growth: fake}, st, res, &pInfo)
 
 	if len(fake.redeemTiers) != 1 || fake.redeemTiers[0] != "28d" {
 		t.Errorf("只应兑换未领的 28d，得到 %v", fake.redeemTiers)
@@ -1275,7 +1292,7 @@ func TestStepLotteryDrawsAll(t *testing.T) {
 	fake := &fakeGrowth{chances: 3}
 	s, _, _ := newTestScheduler(t, "cn", fake)
 	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
-	s.stepLottery(res)
+	s.stepLottery(schedAccount{uid: "test-uid", growth: fake}, res)
 	if fake.drawN != 3 {
 		t.Errorf("应抽 3 次，得到 %d", fake.drawN)
 	}
@@ -1293,7 +1310,7 @@ func TestStepLotteryStopsOnNoChance(t *testing.T) {
 	}
 	s, _, _ := newTestScheduler(t, "cn", fake)
 	res := &GrowthChainResult{Day: upstream.GrowthTodayDate(time.Now())}
-	s.stepLottery(res)
+	s.stepLottery(schedAccount{uid: "test-uid", growth: fake}, res)
 	if fake.drawN != 1 {
 		t.Errorf("无次数应立刻结束（只尝试 1 次），得到 %d", fake.drawN)
 	}

@@ -47,6 +47,41 @@ func InjectPromptCacheKey(body []byte, uid string) []byte {
 	return out
 }
 
+// InjectPromptCacheKeyWithSession 始终派生按账号隔离的 prompt_cache_key（b2a-<uid8>-<hex16>）。
+//
+// 会话段 seg 优先级：
+//  1. 显式传入的非空 sessionKey（经 TrimSpace）
+//  2. body 已带的非空 prompt_cache_key（再经 uid 隔离包装，避免换号重试时跨账号复用同一键）
+//  3. conversationOf(obj)（metadata/顶层 conversation_id 等）
+//  4. ""（仅按 uid 派生）
+//
+// 既保证同会话同账号缓存键稳定，又保证故障转移换号时严格按 uid 隔离。
+// body 为空或非 JSON 对象时原样返回。
+func InjectPromptCacheKeyWithSession(body []byte, uid, sessionKey string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	seg := strings.TrimSpace(sessionKey)
+	if seg == "" {
+		if v, ok := obj["prompt_cache_key"].(string); ok && strings.TrimSpace(v) != "" {
+			seg = strings.TrimSpace(v)
+		}
+	}
+	if seg == "" {
+		seg = conversationOf(obj)
+	}
+	obj["prompt_cache_key"] = buildCacheKey(uid, seg)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // conversationOf 从请求体里找会话标识（找不到返回空串）。
 func conversationOf(obj map[string]any) string {
 	if m, ok := obj["metadata"].(map[string]any); ok {

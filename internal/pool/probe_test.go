@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"buddy2api-go/internal/auth"
 	"buddy2api-go/internal/upstream"
 )
 
@@ -218,4 +220,145 @@ func TestProbeDataRaceNoLeak(t *testing.T) {
 		m.NoteError("acc1", "glm", upstream.ErrKindQuotaExhausted, body14018())
 	}
 	<-done
+}
+
+func TestProbePopulatesExpiryAndCallsResourceHook(t *testing.T) {
+	m, srv, _ := newProbeFixture(t, "acc1")
+	// 固定到两天后北京时间正午，保证 +2h 的第二个包仍在同一 CST 自然日
+	cst := time.FixedZone("UTC+8", 8*3600)
+	n := time.Now().In(cst).Add(48 * time.Hour)
+	expTs := time.Date(n.Year(), n.Month(), n.Day(), 12, 0, 0, 0, cst)
+	payload, _ := json.Marshal(map[string]any{
+		"code": 0,
+		"data": map[string]any{
+			"Accounts": []any{
+				map[string]any{
+					"CapacityRemainPrecise":      "0",
+					"CycleCapacityRemainPrecise": "150.5",
+					"DeductionEndTime":           expTs.UnixMilli(),
+				},
+				map[string]any{
+					"CapacityRemainPrecise": "49.5",
+					"DeductionEndTime":      expTs.Add(2 * time.Hour).UnixMilli(),
+				},
+			},
+		},
+	})
+	withBilling(t, srv, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(payload)
+	})
+
+	var hookUID string
+	var hookRaw []byte
+	m.SetResourceHook(func(uid string, raw []byte) {
+		hookUID = uid
+		hookRaw = raw
+	})
+
+	res := m.Probe(context.Background(), "acc1")
+	if !res.OK {
+		t.Fatalf("探测失败: %+v", res)
+	}
+	if hookUID != "acc1" || len(hookRaw) == 0 {
+		t.Errorf("SetResourceHook 未被正确调用: uid=%q rawLen=%d", hookUID, len(hookRaw))
+	}
+	st, _ := m.AccountStateOf("acc1")
+	if st.EarliestExpireAt != expTs.Unix() {
+		t.Errorf("EarliestExpireAt = %d，期望 %d", st.EarliestExpireAt, expTs.Unix())
+	}
+	if st.ExpiringCredits != 200 {
+		t.Errorf("ExpiringCredits = %v，期望 200", st.ExpiringCredits)
+	}
+
+	// 持久化并 Reload 后仍保留到期字段
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := m.st.LoadPoolAccounts()
+		if err == nil && len(rows) > 0 && rows[0].EarliestExpireAt == expTs.Unix() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	m.Load()
+	st2, _ := m.AccountStateOf("acc1")
+	if st2.EarliestExpireAt != expTs.Unix() || st2.ExpiringCredits != 200 {
+		t.Errorf("Load 后到期字段丢失: %+v", st2)
+	}
+}
+
+func TestProbeUnprobedAsyncAndStaleExpireReprobe(t *testing.T) {
+	prevInit, prevJitter := unprobedInitDelay, unprobedPerAcctJitter
+	unprobedInitDelay = 0
+	unprobedPerAcctJitter = 0
+	t.Cleanup(func() {
+		unprobedInitDelay = prevInit
+		unprobedPerAcctJitter = prevJitter
+	})
+
+	m, srv, _ := newProbeFixture(t, "acc1", "acc2", "acc3")
+	// acc2 手动禁用，不应被 ProbeUnprobedAsync 探测
+	if err := m.SetManualDisabled("acc2", true); err != nil {
+		t.Fatal(err)
+	}
+	// acc3 跨区，不应被 ProbeUnprobedAsync 探测
+	ts3, _ := m.TokenStore("acc3")
+	_ = ts3.Save(&auth.Token{
+		UID: "acc3", AccessToken: "at-3", Domain: "www.codebuddy.ai",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+
+	var calls atomic.Int32
+	withBilling(t, srv, func(w http.ResponseWriter) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"code":0,"data":{"Accounts":[{"CapacityRemainPrecise":"88"}]}}`))
+	})
+
+	m.ProbeUnprobedAsync()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st, _ := m.AccountStateOf("acc1")
+		if st.CreditsAt > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st1, _ := m.AccountStateOf("acc1")
+	st2, _ := m.AccountStateOf("acc2")
+	st3, _ := m.AccountStateOf("acc3")
+	if st1.Credits != 88 || st1.CreditsAt == 0 {
+		t.Errorf("acc1 应被异步探测补全额度，实际 %+v", st1)
+	}
+	if st2.CreditsAt != 0 || st3.CreditsAt != 0 {
+		t.Errorf("手动禁用/跨区账号不应被异步探测: acc2=%d acc3=%d", st2.CreditsAt, st3.CreditsAt)
+	}
+
+	// 测试 Resolve 遇过期 EarliestExpireAt 触发异步重探（且限频）
+	m.asyncProbeAt.Delete("acc1")
+	m.mu.Lock()
+	m.accounts["acc1"].EarliestExpireAt = time.Now().Add(-time.Hour).Unix()
+	m.mu.Unlock()
+	before := calls.Load()
+	m.Resolve("s-stale", "glm", nil)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if calls.Load() > before {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() <= before {
+		t.Error("expire_first 遇到过期的 EarliestExpireAt 应触发异步重探")
+	}
+	// 5 分钟限频期内再次 Resolve 不重复探测
+	after := calls.Load()
+	m.Resolve("s-stale2", "glm", nil)
+	time.Sleep(50 * time.Millisecond)
+	if calls.Load() != after {
+		t.Errorf("异步重探应受限频保护，实际多发了 %d 次", calls.Load()-after)
+	}
+	// Close 后再调用 ProbeUnprobedAsync 不得 panic
+	m.Close()
+	m.ProbeUnprobedAsync()
 }

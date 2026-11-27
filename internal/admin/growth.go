@@ -1,7 +1,7 @@
-// growth.go 成长任务管理端点：聚合总览（60s 缓存）+ 8 个手动动作。
+// growth.go 成长任务管理端点：聚合总览（60s 缓存）+ 8 个手动动作（均支持 ?uid= 多账号）。
 //
 // 手动动作统一约定：
-//   - 执行前清 overview 缓存（前端动作后再 force 刷新，总览立即新鲜）
+//   - 执行前清目标账号 overview 缓存（前端动作后再 force 刷新，总览立即新鲜）
 //   - scheduler 侧方法自带 region/登录/互斥前置，不可用时返回 {ok:false, reason}
 //   - 直接调上游的端点（lottery/makeup/bonus）在 handler 层前置检查
 package admin
@@ -15,17 +15,19 @@ import (
 	"strings"
 	"time"
 
+	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/scheduler"
 	"buddy2api-go/internal/upstream"
 )
 
 const (
-	growthCacheTable   = "growth_cache"
-	growthKeyOverview  = "overview_v1"
-	growthKeyReportDay = "report_day"
-	growthKeyAdoptDay  = "adopt_day"
-	growthKeyRewardDay = "reward_day"
-	growthKeyLastRun   = "last_run"
+	growthCacheTable   = scheduler.GrowthCacheTable
+	growthKeyOverview  = "overview_v1" // 旧版全局概览键（仅无 uid 兼容回退/清理）
+	growthKeyReportDay = scheduler.GrowthKeyReportDay
+	growthKeyAdoptDay  = scheduler.GrowthKeyAdoptDay
+	growthKeyRewardDay = scheduler.GrowthKeyRewardDay
+	growthKeyLastRun   = scheduler.GrowthKeyLastRun
 	growthOverviewTTL  = 60 // overview 缓存秒数
 	growthDayTTL       = 48 * 3600
 	growthLastRunTTL   = 14 * 24 * 3600
@@ -119,10 +121,6 @@ type growthOverview struct {
 }
 
 // buildGrowthOverview 聚合各上游切片为总览（纯函数，便于单测）。
-// reportCount 为配置基准条数，reportJitter 为波动幅度（供前端展示区间，不参与取数）。
-// info 为 nil、cellsOK/buddyOK 为 false、chances 为 nil 分别表示对应上游 GET 失败
-// （计入 degraded）。buddyOK=false 与「真无猫」（buddyOK=true 且 buddy==nil）严格区分：
-// 查询失败不得呈现为无猫空态，否则前端会诱导用户点击注定失败的领养写操作。
 func buildGrowthOverview(now time.Time, reportCount, reportJitter int,
 	info *upstream.GrowthStreakInfo, cells []upstream.HeatmapCell, cellsOK bool,
 	buddy *upstream.Buddy, buddyOK bool, ts *upstream.TravelState, chances *int,
@@ -186,7 +184,6 @@ func buildGrowthOverview(now time.Time, reportCount, reportJitter int,
 		ov.Degraded = append(ov.Degraded, "buddy") // 查询失败 ≠ 无猫
 	} else if buddy != nil {
 		ov.Buddy = growthOverviewBuddy{Has: true, ID: buddy.ID, Name: buddy.Name}
-		// 旅行状态仅在有猫时才有意义（无猫时上游查询必然空，跳过不算降级）
 		if ts != nil {
 			ov.Travel = ts
 		} else {
@@ -204,20 +201,74 @@ func buildGrowthOverview(now time.Time, reportCount, reportJitter int,
 	return ov
 }
 
-// growthOverview GET /admin/growth/overview — 聚合总览（60s 缓存，?force=1 强刷）。
-func (h *Handler) growthOverview(w http.ResponseWriter, r *http.Request) {
+// resolveGrowthTarget 解析 ?uid= 目标账号：
+//   - rawUID==""：走主账号（兼容旧行为与单测 fakeGrowthAPI）；
+//   - rawUID!=""：校验属于号池（否则 httpStatus=404）、CN 端点匹配且非凭证失效。
+func (h *Handler) resolveGrowthTarget(rawUID string) (effectiveUID string, g growthAPI, httpStatus int, reason string) {
+	rawUID = strings.TrimSpace(rawUID)
 	cfg := h.cfg.Get()
-	if cfg.Region != "cn" {
-		jsonWrite(w, http.StatusOK, map[string]any{"available": false, "reason": "region_global"})
+	cnDomain := config.EndpointOf("cn").Domain
+
+	if rawUID == "" {
+		t := h.toks.Get()
+		if t != nil {
+			effectiveUID = t.UID
+		}
+		if cfg.Region != "cn" {
+			return effectiveUID, nil, 0, "region_global"
+		}
+		if t == nil {
+			return "", nil, 0, "not_logged_in"
+		}
+		if !regionMatches(t.Domain, cnDomain) {
+			return effectiveUID, nil, 0, "region_global"
+		}
+		g = h.growth
+		if g == nil {
+			g = h.client
+		}
+		return effectiveUID, g, 0, ""
+	}
+
+	targetUID, cli, tok, found := h.resolveUIDClient(rawUID)
+	if !found {
+		return "", nil, http.StatusNotFound, "账号不存在"
+	}
+	if cfg.Region != "cn" || !regionMatches(tok.Domain, cnDomain) {
+		return targetUID, nil, 0, "region_global"
+	}
+	if h.pool != nil {
+		if st, ok := h.pool.AccountStateOf(targetUID); ok && st.AutoDisabled == pool.AutoCredential {
+			return targetUID, nil, 0, "credential_disabled"
+		}
+	}
+	active := h.toks.Get()
+	if active != nil && active.UID == targetUID && h.growth != nil {
+		g = h.growth
+	} else {
+		g = cli
+	}
+	return targetUID, g, 0, ""
+}
+
+// growthOverview GET /admin/growth/overview — 聚合总览（60s 缓存，?force=1 强刷，?uid= 指定账号）。
+func (h *Handler) growthOverview(w http.ResponseWriter, r *http.Request) {
+	rawUID := strings.TrimSpace(r.URL.Query().Get("uid"))
+	effectiveUID, g, status, reason := h.resolveGrowthTarget(rawUID)
+	if status != 0 {
+		jsonErr(w, status, reason)
 		return
 	}
-	if h.toks.Get() == nil {
-		jsonWrite(w, http.StatusOK, map[string]any{"available": false, "reason": "not_logged_in"})
+	if reason != "" {
+		jsonWrite(w, http.StatusOK, map[string]any{"available": false, "reason": reason})
 		return
 	}
+
+	cfg := h.cfg.Get()
 	force := r.URL.Query().Get("force") == "1"
+	ovKey := scheduler.GrowthOverviewKey(effectiveUID)
 	if !force {
-		if payload, _, ok := h.st.GetCache(growthCacheTable, growthKeyOverview, growthOverviewTTL); ok {
+		if payload, _, ok := h.st.GetCache(growthCacheTable, ovKey, growthOverviewTTL); ok {
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(payload), &parsed); err == nil {
 				parsed["cached"] = true
@@ -225,54 +276,79 @@ func (h *Handler) growthOverview(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if rawUID == "" {
+			if payload, _, ok := h.st.GetCache(growthCacheTable, growthKeyOverview, growthOverviewTTL); ok {
+				var parsed map[string]any
+				if err := json.Unmarshal([]byte(payload), &parsed); err == nil {
+					parsed["cached"] = true
+					jsonWrite(w, http.StatusOK, parsed)
+					return
+				}
+			}
+		}
 	}
 
 	now := time.Now()
-	// 5 个上游 GET（region=cn 且已登录才到这里；单账号顺序拉取，总量可控）
-	info, infoErr := h.growth.GrowthStreakInfo()
+	info, infoErr := g.GrowthStreakInfo()
 	if infoErr != nil {
-		slog.Warn("growth overview: streak 拉取失败", "error", infoErr)
+		slog.Warn("growth overview: streak 拉取失败", "uid", effectiveUID, "error", infoErr)
 		info = nil
 	}
-	cells, cellsErr := h.growth.GrowthHeatmap()
+	cells, cellsErr := g.GrowthHeatmap()
 	if cellsErr != nil {
-		slog.Warn("growth overview: heatmap 拉取失败", "error", cellsErr)
+		slog.Warn("growth overview: heatmap 拉取失败", "uid", effectiveUID, "error", cellsErr)
 		cells = nil
 	}
-	buddy, buddyErr := h.growth.BuddyInfo()
+	buddy, buddyErr := g.BuddyInfo()
 	if buddyErr != nil {
-		slog.Warn("growth overview: buddy 拉取失败", "error", buddyErr)
+		slog.Warn("growth overview: buddy 拉取失败", "uid", effectiveUID, "error", buddyErr)
 		buddy = nil
 	}
 	var ts *upstream.TravelState
 	if buddy != nil {
-		ts, _ = h.growth.TravelStatus() // 失败计入 degraded
+		ts, _ = g.TravelStatus()
 	}
-	chances, chancesErr := h.growth.GrowthLotteryChances()
+	chances, chancesErr := g.GrowthLotteryChances()
 	if chancesErr != nil {
-		slog.Warn("growth overview: lottery chances 拉取失败", "error", chancesErr)
+		slog.Warn("growth overview: lottery chances 拉取失败", "uid", effectiveUID, "error", chancesErr)
 	}
 
-	// 今日标志（cache 镜像，TTL 48h）+ last_run（14d）
 	day := upstream.GrowthTodayDate(now)
-	flag := func(key string) bool {
-		payload, _, ok := h.st.GetCache(growthCacheTable, key, growthDayTTL)
-		return ok && payload == day
+	flag := func(key, legacyKey string) bool {
+		if payload, _, ok := h.st.GetCache(growthCacheTable, key, growthDayTTL); ok && payload == day {
+			return true
+		}
+		if rawUID == "" && legacyKey != key {
+			if payload, _, ok := h.st.GetCache(growthCacheTable, legacyKey, growthDayTTL); ok && payload == day {
+				return true
+			}
+		}
+		return false
 	}
 	var lastRun *scheduler.GrowthChainResult
-	if payload, _, ok := h.st.GetCache(growthCacheTable, growthKeyLastRun, growthLastRunTTL); ok {
+	if payload, _, ok := h.st.GetCache(growthCacheTable, scheduler.GrowthLastRunKey(effectiveUID), growthLastRunTTL); ok {
 		var lr scheduler.GrowthChainResult
 		if err := json.Unmarshal([]byte(payload), &lr); err == nil {
 			lastRun = &lr
+		}
+	} else if rawUID == "" {
+		if payload, _, ok := h.st.GetCache(growthCacheTable, growthKeyLastRun, growthLastRunTTL); ok {
+			var lr scheduler.GrowthChainResult
+			if err := json.Unmarshal([]byte(payload), &lr); err == nil {
+				lastRun = &lr
+			}
 		}
 	}
 
 	ov := buildGrowthOverview(now, cfg.GrowthReportCount, cfg.GrowthReportJitter, info, cells, cellsErr == nil,
 		buddy, buddyErr == nil, ts, chancesPtr(chances, chancesErr),
-		flag(growthKeyReportDay), flag(growthKeyAdoptDay), flag(growthKeyRewardDay), lastRun)
+		flag(scheduler.GrowthReportDayKey(effectiveUID), growthKeyReportDay),
+		flag(scheduler.GrowthAdoptDayKey(effectiveUID), growthKeyAdoptDay),
+		flag(scheduler.GrowthRewardDayKey(effectiveUID), growthKeyRewardDay),
+		lastRun)
 
 	if raw, err := json.Marshal(ov); err == nil {
-		_ = h.st.SetCache(growthCacheTable, growthKeyOverview, string(raw))
+		_ = h.st.SetCache(growthCacheTable, ovKey, string(raw))
 	}
 	jsonWrite(w, http.StatusOK, ov)
 }
@@ -287,26 +363,55 @@ func chancesPtr(v int, err error) *int {
 
 // ── 动作端点 ─────────────────────────────────────────────────────────────────
 
-// growthPrecheck 直接调上游类端点的前置检查；返回非空 reason 表示不可用。
-func (h *Handler) growthPrecheck() string {
-	if h.cfg.Get().Region != "cn" {
-		return "region_global"
+// growthInvalidateOverview 清指定账号的 overview 缓存（动作端点统一前置）。
+func (h *Handler) growthInvalidateOverview(rawUID, effectiveUID string) {
+	_ = h.st.DeleteCacheKey(growthCacheTable, scheduler.GrowthOverviewKey(effectiveUID))
+	if rawUID == "" {
+		_ = h.st.DeleteCacheKey(growthCacheTable, growthKeyOverview)
 	}
-	if h.toks.Get() == nil {
-		return "not_logged_in"
-	}
-	return ""
 }
 
-// growthInvalidateOverview 清 overview 缓存（动作端点统一前置）。
-func (h *Handler) growthInvalidateOverview() {
-	_ = h.st.DeleteCacheKey(growthCacheTable, growthKeyOverview)
+// prepareGrowthSchedAction 校验 scheduler 类动作（run/report/adopt/travel/redeem）的目标账号并清概览缓存。
+func (h *Handler) prepareGrowthSchedAction(w http.ResponseWriter, r *http.Request) (rawUID, effectiveUID string, ok bool) {
+	rawUID = strings.TrimSpace(r.URL.Query().Get("uid"))
+	if rawUID == "" {
+		if t := h.toks.Get(); t != nil {
+			effectiveUID = t.UID
+		}
+		h.growthInvalidateOverview(rawUID, effectiveUID)
+		return rawUID, effectiveUID, true
+	}
+	var status int
+	var reason string
+	effectiveUID, _, status, reason = h.resolveGrowthTarget(rawUID)
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return "", "", false
+	}
+	if reason != "" {
+		jsonWrite(w, http.StatusOK, map[string]any{"ok": false, "reason": reason})
+		return "", "", false
+	}
+	h.growthInvalidateOverview(rawUID, effectiveUID)
+	return rawUID, effectiveUID, true
 }
 
 // growthRun POST /admin/growth/run — 手动执行完整链。
 func (h *Handler) growthRun(w http.ResponseWriter, r *http.Request) {
-	h.growthInvalidateOverview()
-	res := h.sched.RunGrowthChain()
+	rawUID, effectiveUID, ok := h.prepareGrowthSchedAction(w, r)
+	if !ok {
+		return
+	}
+	var res scheduler.GrowthChainResult
+	if rawUID != "" {
+		if gf, has := h.sched.(growthForScheduler); has {
+			res = gf.RunGrowthChainFor(effectiveUID)
+		} else {
+			res = h.sched.RunGrowthChain()
+		}
+	} else {
+		res = h.sched.RunGrowthChain()
+	}
 	resp := map[string]any{"ok": res.Ran, "result": res}
 	if !res.Ran {
 		resp["reason"] = res.Reason
@@ -322,12 +427,24 @@ func (h *Handler) growthReport(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	rawUID, effectiveUID, ok := h.prepareGrowthSchedAction(w, r)
+	if !ok {
+		return
+	}
 	count := req.Count
 	if count > 10 {
 		count = 10 // 钳制防风控；0/缺省交由 scheduler 按配置+jitter 波动
 	}
-	h.growthInvalidateOverview()
-	res := h.sched.RunActivityReports(count)
+	var res scheduler.ActivityReportResult
+	if rawUID != "" {
+		if gf, has := h.sched.(growthForScheduler); has {
+			res = gf.RunActivityReportsFor(effectiveUID, count)
+		} else {
+			res = h.sched.RunActivityReports(count)
+		}
+	} else {
+		res = h.sched.RunActivityReports(count)
+	}
 	resp := map[string]any{"ok": res.Ran, "sent": res.Sent, "total": res.Total, "detail": res.Detail}
 	if !res.Ran {
 		resp["reason"] = res.Reason
@@ -337,8 +454,20 @@ func (h *Handler) growthReport(w http.ResponseWriter, r *http.Request) {
 
 // growthAdopt POST /admin/growth/adopt — 手动领养（force 语义）。
 func (h *Handler) growthAdopt(w http.ResponseWriter, r *http.Request) {
-	h.growthInvalidateOverview()
-	res := h.sched.RunGrowthAdopt()
+	rawUID, effectiveUID, ok := h.prepareGrowthSchedAction(w, r)
+	if !ok {
+		return
+	}
+	var res scheduler.GrowthAdoptResult
+	if rawUID != "" {
+		if gf, has := h.sched.(growthForScheduler); has {
+			res = gf.RunGrowthAdoptFor(effectiveUID)
+		} else {
+			res = h.sched.RunGrowthAdopt()
+		}
+	} else {
+		res = h.sched.RunGrowthAdopt()
+	}
 	resp := map[string]any{"ok": res.Ran, "status": res.Status, "detail": res.Detail}
 	if !res.Ran {
 		resp["reason"] = res.Reason
@@ -348,8 +477,20 @@ func (h *Handler) growthAdopt(w http.ResponseWriter, r *http.Request) {
 
 // growthTravel POST /admin/growth/travel — 手动旅行巡检（单动作状态机）。
 func (h *Handler) growthTravel(w http.ResponseWriter, r *http.Request) {
-	h.growthInvalidateOverview()
-	res := h.sched.RunTravelTick()
+	rawUID, effectiveUID, ok := h.prepareGrowthSchedAction(w, r)
+	if !ok {
+		return
+	}
+	var res scheduler.TravelTickResult
+	if rawUID != "" {
+		if gf, has := h.sched.(growthForScheduler); has {
+			res = gf.RunTravelTickFor(effectiveUID)
+		} else {
+			res = h.sched.RunTravelTick()
+		}
+	} else {
+		res = h.sched.RunTravelTick()
+	}
 	resp := map[string]any{"ok": res.Ran, "result": res}
 	if !res.Ran {
 		resp["reason"] = res.Reason
@@ -370,8 +511,20 @@ func (h *Handler) growthRedeem(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "tier 仅支持 7d/14d/28d")
 		return
 	}
-	h.growthInvalidateOverview()
-	res := h.sched.RunGrowthRedeem(tier)
+	rawUID, effectiveUID, ok := h.prepareGrowthSchedAction(w, r)
+	if !ok {
+		return
+	}
+	var res scheduler.GrowthRedeemActionResult
+	if rawUID != "" {
+		if gf, has := h.sched.(growthForScheduler); has {
+			res = gf.RunGrowthRedeemFor(effectiveUID, tier)
+		} else {
+			res = h.sched.RunGrowthRedeem(tier)
+		}
+	} else {
+		res = h.sched.RunGrowthRedeem(tier)
+	}
 	resp := map[string]any{"ok": res.Ran, "status": res.Status, "detail": res.Detail}
 	if res.Granted != nil {
 		resp["granted"] = res.Granted
@@ -383,15 +536,19 @@ func (h *Handler) growthRedeem(w http.ResponseWriter, r *http.Request) {
 }
 
 // growthLottery POST /admin/growth/lottery — 手动抽奖（一次）。
-// 不持 growthMu：与自动链并发时至多一次重复写被上游拒绝，分类为 skip
-// （chances 余额递减天然幂等），链内互斥由 scheduler 侧负责。
 func (h *Handler) growthLottery(w http.ResponseWriter, r *http.Request) {
-	if reason := h.growthPrecheck(); reason != "" {
+	rawUID := strings.TrimSpace(r.URL.Query().Get("uid"))
+	effectiveUID, g, status, reason := h.resolveGrowthTarget(rawUID)
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		jsonWrite(w, http.StatusOK, map[string]any{"ok": false, "reason": reason})
 		return
 	}
-	h.growthInvalidateOverview()
-	chances, err := h.growth.GrowthLotteryChances()
+	h.growthInvalidateOverview(rawUID, effectiveUID)
+	chances, err := g.GrowthLotteryChances()
 	if err != nil {
 		jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "status": "fail", "detail": "查询抽奖次数失败: " + err.Error()})
 		return
@@ -400,12 +557,11 @@ func (h *Handler) growthLottery(w http.ResponseWriter, r *http.Request) {
 		jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "status": "skip", "chances_left": 0, "detail": "暂无抽奖次数"})
 		return
 	}
-	draw, err := h.growth.GrowthLotteryDraw("") // 每次新 client_token
+	draw, err := g.GrowthLotteryDraw("")
 	switch {
 	case err == nil:
 		resp := map[string]any{"ok": true, "status": "ok", "prize": draw, "detail": "抽中 " + draw.PrizeName}
-		// 抽后回查剩余次数（失败则按减一估算）
-		if left, err2 := h.growth.GrowthLotteryChances(); err2 == nil {
+		if left, err2 := g.GrowthLotteryChances(); err2 == nil {
 			resp["chances_left"] = left
 		} else {
 			resp["chances_left"] = chances - 1
@@ -419,8 +575,6 @@ func (h *Handler) growthLottery(w http.ResponseWriter, r *http.Request) {
 }
 
 // growthMakeup POST /admin/growth/makeup — 手动补签 {date?}（缺省昨日 CST）。
-// 不持 growthMu：与链内补签并发时第二个会被上游「已补过」业务错误拒绝
-// （卡余额递减天然幂等）。
 func (h *Handler) growthMakeup(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Date string `json:"date"`
@@ -428,7 +582,13 @@ func (h *Handler) growthMakeup(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
-	if reason := h.growthPrecheck(); reason != "" {
+	rawUID := strings.TrimSpace(r.URL.Query().Get("uid"))
+	effectiveUID, g, status, reason := h.resolveGrowthTarget(rawUID)
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		jsonWrite(w, http.StatusOK, map[string]any{"ok": false, "reason": reason})
 		return
 	}
@@ -437,7 +597,6 @@ func (h *Handler) growthMakeup(w http.ResponseWriter, r *http.Request) {
 	if date == "" {
 		date = upstream.GrowthYesterdayDate(now)
 	}
-	// 校验：严格 YYYY-MM-DD（10 位日期串）且必须早于今日 CST（补签只对过去生效）
 	if len(date) != 10 {
 		jsonErr(w, http.StatusBadRequest, "date 格式应为 YYYY-MM-DD")
 		return
@@ -455,15 +614,14 @@ func (h *Handler) growthMakeup(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "date 不得是今日或未来（补签仅对过去日期生效）")
 		return
 	}
-	h.growthInvalidateOverview()
-	err = h.growth.UseMakeupCard(date)
+	h.growthInvalidateOverview(rawUID, effectiveUID)
+	err = g.UseMakeupCard(date)
 	resp := map[string]any{"ok": true, "date": date}
 	switch {
 	case err == nil:
 		resp["status"] = "ok"
 		resp["detail"] = "补签 " + date + " 成功，连登保住"
 	default:
-		// 业务错误（无卡/无漏签/已补过）→ skip 展示上游文案；网络/5xx → fail
 		var ge *upstream.GrowthError
 		if errors.As(err, &ge) && ge.Status < 500 {
 			resp["status"] = "skip"
@@ -477,15 +635,20 @@ func (h *Handler) growthMakeup(w http.ResponseWriter, r *http.Request) {
 }
 
 // growthBonus POST /admin/growth/bonus — 手动领礼包+补偿（两个都试，静默已领）。
-// 不持 growthMu：礼包/补偿为服务端每号一次幂等写，并发重复无害。
 func (h *Handler) growthBonus(w http.ResponseWriter, r *http.Request) {
-	if reason := h.growthPrecheck(); reason != "" {
+	rawUID := strings.TrimSpace(r.URL.Query().Get("uid"))
+	effectiveUID, g, status, reason := h.resolveGrowthTarget(rawUID)
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		jsonWrite(w, http.StatusOK, map[string]any{"ok": false, "reason": reason})
 		return
 	}
-	h.growthInvalidateOverview()
-	gift, _ := h.growth.ClaimGift() // 业务错误（早已领过）静默计 0
-	comp, _ := h.growth.ClaimCompensation()
+	h.growthInvalidateOverview(rawUID, effectiveUID)
+	gift, _ := g.ClaimGift()
+	comp, _ := g.ClaimCompensation()
 	detail := ""
 	if gift > 0 {
 		detail = "礼包 +" + itoa64(gift) + " 积分"

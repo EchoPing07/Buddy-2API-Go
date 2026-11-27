@@ -5,6 +5,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"buddy2api-go/internal/billing"
+	"buddy2api-go/internal/config"
 )
 
 func newTestRouter(ttl time.Duration) *Router {
@@ -290,5 +293,205 @@ func TestRouterHashSpread(t *testing.T) {
 		if counts[slot] < 50 || counts[slot] > 150 {
 			t.Errorf("槽位 %d 分到 %d 个，分布明显不均", slot, counts[slot])
 		}
+	}
+}
+
+func TestRouterExpiredCleanupAndCounts(t *testing.T) {
+	r := newTestRouter(30 * time.Millisecond)
+	r.Bind("s1", "glm", "acc1")
+	r.Bind("s2", "glm", "acc1")
+	r.Bind("s3", "deepseek", "acc2")
+	time.Sleep(50 * time.Millisecond)
+
+	if n := r.Count(); n != 0 {
+		t.Errorf("过期条目不应计入 Count()，实际 %d", n)
+	}
+	if byUID := r.CountByUID(); len(byUID) != 0 {
+		t.Errorf("过期条目不应计入 CountByUID()，实际 %v", byUID)
+	}
+	if byModel := r.CountByUIDModel("glm"); len(byModel) != 0 {
+		t.Errorf("过期条目不应计入 CountByUIDModel()，实际 %v", byModel)
+	}
+	if _, ok := r.BoundUID("s1", "glm"); ok {
+		t.Error("BoundUID 不应返回已过期绑定")
+	}
+
+	// 慢路径分配扫描应主动删除僵尸条目
+	r.Resolve("fresh-s", "glm", []string{"acc1", "acc2"})
+	r.mu.RLock()
+	rawLen := len(r.entries)
+	r.mu.RUnlock()
+	if rawLen != 1 {
+		t.Errorf("慢路径后应只剩 1 条活跃条目（僵尸已清理），实际 map 长度 %d", rawLen)
+	}
+}
+
+func TestRouterLeastBound(t *testing.T) {
+	r := newTestRouter(3 * time.Hour)
+	r.Bind("s1", "glm", "acc1")
+	r.Bind("s2", "glm", "acc1")
+	r.Bind("s3", "glm", "acc2")
+
+	// acc3 在 glm 上 0 绑定 < acc2(1) < acc1(2) → 必选 acc3
+	uid, hit := r.Resolve("s4", "glm", []string{"acc1", "acc2", "acc3"})
+	if hit || uid != "acc3" {
+		t.Errorf("应优先分配最空闲的 acc3，实际 uid=%s hit=%v", uid, hit)
+	}
+	// 同一个会话对 deepseek 选号：三号在 deepseek 上均 0 绑定，但总绑定 acc1=2, acc2=1, acc3=1 → 避开 acc1
+	uid2, _ := r.Resolve("s5", "deepseek", []string{"acc1", "acc2", "acc3"})
+	if uid2 == "acc1" {
+		t.Errorf("deepseek 均 0 绑定时应按总绑定少者选，不应选总绑定最多的 acc1")
+	}
+}
+
+func TestRouterDropUIDModel(t *testing.T) {
+	r := newTestRouter(3 * time.Hour)
+	r.Bind("s1", "glm", "acc1")
+	r.Bind("s2", "glm", "acc1")
+	r.Bind("s1", "deepseek", "acc1")
+	r.Bind("s3", "glm", "acc2")
+
+	if dropped := r.DropUIDModel("acc1", "glm"); dropped != 2 {
+		t.Errorf("应只摘掉 (acc1, glm) 2 条，实际 %d", dropped)
+	}
+	if _, ok := r.BoundUID("s1", "deepseek"); !ok {
+		t.Error("acc1 的 deepseek 绑定不应被误删")
+	}
+	if _, ok := r.BoundUID("s3", "glm"); !ok {
+		t.Error("acc2 的 glm 绑定不应被误删")
+	}
+}
+
+func TestRouterTouchThrottled(t *testing.T) {
+	r := newTestRouter(10 * time.Minute) // 阈值 1 分钟
+	r.Bind("s1", "glm", "acc1")
+
+	recent := time.Now().Add(-10 * time.Second)
+	r.mu.Lock()
+	r.entries[sessionKey("s1", "glm")] = bindEntry{UID: "acc1", LastActive: recent}
+	r.mu.Unlock()
+
+	uid, hit := r.Resolve("s1", "glm", []string{"acc1"})
+	if !hit || uid != "acc1" {
+		t.Fatalf("应粘性命中 acc1，实际 %s hit=%v", uid, hit)
+	}
+	r.mu.RLock()
+	afterFast := r.entries[sessionKey("s1", "glm")].LastActive
+	r.mu.RUnlock()
+	if !afterFast.Equal(recent) {
+		t.Errorf("1 分钟内粘性命中应节流不刷新 LastActive：before=%v after=%v", recent, afterFast)
+	}
+
+	stale := time.Now().Add(-2 * time.Minute)
+	r.mu.Lock()
+	r.entries[sessionKey("s1", "glm")] = bindEntry{UID: "acc1", LastActive: stale}
+	r.mu.Unlock()
+
+	_, hit = r.Resolve("s1", "glm", []string{"acc1"})
+	if !hit {
+		t.Fatal("仍未过期，应命中")
+	}
+	r.mu.RLock()
+	afterRefresh := r.entries[sessionKey("s1", "glm")].LastActive
+	r.mu.RUnlock()
+	if !afterRefresh.After(stale.Add(time.Minute)) {
+		t.Errorf("超过 1 分钟后应刷新 LastActive，实际 %v", afterRefresh)
+	}
+}
+
+func TestRouterStrategyExpireFirst(t *testing.T) {
+	r := newTestRouter(3 * time.Hour)
+	now := time.Now().In(billing.TZ)
+	todayLate := time.Date(now.Year(), now.Month(), now.Day(), 23, 0, 0, 0, billing.TZ).Add(24 * time.Hour)
+	day1Morning := todayLate
+	day1Evening := todayLate.Add(30 * time.Minute)
+	day2 := todayLate.Add(48 * time.Hour)
+
+	cands := []CandidateInfo{
+		{UID: "perm", Credits: 500, CreditsAt: 100, EarliestExpireAt: 0},
+		{UID: "stale", Credits: 500, CreditsAt: 100, EarliestExpireAt: time.Now().Add(-time.Hour).Unix()},
+		{UID: "day2", Credits: 500, CreditsAt: 100, EarliestExpireAt: day2.Unix()},
+		{UID: "day1-a", Credits: 50, CreditsAt: 100, EarliestExpireAt: day1Morning.Unix()},
+		{UID: "day1-b", Credits: 50, CreditsAt: 100, EarliestExpireAt: day1Evening.Unix()},
+	}
+
+	// 同日桶内两个号应分别被两个新会话选中（桶内负载均衡）
+	got1, _ := r.ResolveWithStrategy("s1", "glm", cands, config.PoolStrategyExpireFirst)
+	got2, _ := r.ResolveWithStrategy("s2", "glm", cands, config.PoolStrategyExpireFirst)
+	if (got1 != "day1-a" && got1 != "day1-b") || (got2 != "day1-a" && got2 != "day1-b") || got1 == got2 {
+		t.Errorf("临期优先应在最早 CST 自然日桶内分摊 [day1-a, day1-b]，实际 %q, %q", got1, got2)
+	}
+
+	// day1 不可用时，溢出到 day2
+	cands2 := cands[:3] // perm, stale, day2
+	got3, _ := r.ResolveWithStrategy("s3", "glm", cands2, config.PoolStrategyExpireFirst)
+	if got3 != "day2" {
+		t.Errorf("day1 耗尽后应选次近临期 day2，实际 %q", got3)
+	}
+
+	// Tier 1 为空时，回落到 Tier 2（perm / stale）
+	cands3 := cands[:2] // perm, stale
+	got4, _ := r.ResolveWithStrategy("s4", "glm", cands3, config.PoolStrategyExpireFirst)
+	if got4 != "perm" && got4 != "stale" {
+		t.Errorf("Tier 1 为空时应回落 Tier 2，实际 %q", got4)
+	}
+
+	// 即使策略切换或新增更临期号，已绑定的粘性会话依然保住命中
+	uidSticky, hit := r.ResolveWithStrategy("s3", "glm", cands, config.PoolStrategyExpireFirst)
+	if !hit || uidSticky != "day2" {
+		t.Errorf("已有绑定应在候选内保持粘性（保前缀缓存），实际 uid=%q hit=%v", uidSticky, hit)
+	}
+}
+
+func TestRouterStrategyCreditsFirst(t *testing.T) {
+	r := newTestRouter(3 * time.Hour)
+
+	// 1. 已知正余额 > 未知 (CreditsAt==0) > 已知零余额
+	cands := []CandidateInfo{
+		{UID: "zero", Credits: 0, CreditsAt: 100},
+		{UID: "unknown", Credits: 0, CreditsAt: 0},
+		{UID: "low", Credits: 20, CreditsAt: 100},
+		{UID: "high", Credits: 100, CreditsAt: 100},
+	}
+	if uid, _ := r.ResolveWithStrategy("s1", "glm", cands, config.PoolStrategyCreditsFirst); uid != "high" {
+		t.Errorf("应选最高已知正余额 high，实际 %q", uid)
+	}
+
+	// 无正余额时，未知优先于已知零余额
+	candsNoPos := cands[:2]
+	if uid, _ := r.ResolveWithStrategy("s2", "glm", candsNoPos, config.PoolStrategyCreditsFirst); uid != "unknown" {
+		t.Errorf("未知余额应优先于已知零余额，实际 %q", uid)
+	}
+
+	// 2. 1.0 额度误差内按活跃绑定打散
+	r2 := newTestRouter(3 * time.Hour)
+	tied := []CandidateInfo{
+		{UID: "a", Credits: 100.5, CreditsAt: 100},
+		{UID: "b", Credits: 100.0, CreditsAt: 100},
+	}
+	u1, _ := r2.ResolveWithStrategy("x1", "glm", tied, config.PoolStrategyCreditsFirst)
+	u2, _ := r2.ResolveWithStrategy("x2", "glm", tied, config.PoolStrategyCreditsFirst)
+	if u1 == u2 {
+		t.Errorf("1.0 额度误差内两个新会话应分散到不同账号，实际均选中 %q", u1)
+	}
+}
+
+func TestRouterInflightTieBreaking(t *testing.T) {
+	for _, strat := range []string{config.PoolStrategyExpireFirst, config.PoolStrategyBalanced, config.PoolStrategyCreditsFirst} {
+		t.Run(strat, func(t *testing.T) {
+			r := newTestRouter(3 * time.Hour)
+			exp := time.Now().Add(24 * time.Hour).Unix()
+			cands := []CandidateInfo{
+				{UID: "busy", Credits: 500, CreditsAt: 100, EarliestExpireAt: exp, Inflight: 2},
+				{UID: "idle", Credits: 100, CreditsAt: 100, EarliestExpireAt: exp, Inflight: 0},
+			}
+			// 空 sessionKey 也应遵循 min Inflight + strategy
+			if uid, hit := r.ResolveWithStrategy("", "glm", cands, strat); hit || uid != "idle" {
+				t.Errorf("%s 应优先低在途 idle，实际 uid=%q hit=%v", strat, uid, hit)
+			}
+			if n := r.Count(); n != 0 {
+				t.Errorf("空 sessionKey 不应写入绑定表，实际 %d", n)
+			}
+		})
 	}
 }

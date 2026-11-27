@@ -124,11 +124,8 @@ func TestMinuteOfDay(t *testing.T) {
 	}
 }
 
-// TestSetPoolThenReconfigureRegistersProbe SetPool 之后必须能挂上探测 cron。
-//
-// 回归：scheduler.New 内部那次 Reconfigure 运行时 s.pool 还是 nil，探测挂不上；
-// 若 main 只调 SetPool 不补 Reconfigure，「env 开启号池」或「上次 UI 开过然后重启」
-// 的部署自动探测完全失效 —— auto_disabled 的号永远探不回来。
+// TestSetPoolThenReconfigureRegistersProbe SetPool 之后无论 PoolEnabled 为何值，
+// Reconfigure 都必须挂上探测 cron；SetPool(nil) 后 Reconfigure 应摘掉。
 func TestSetPoolThenReconfigureRegistersProbe(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "t.db"))
@@ -140,7 +137,8 @@ func TestSetPoolThenReconfigureRegistersProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.Update(func(c *config.Config) error { c.PoolEnabled = true; return nil }); err != nil {
+	// 默认 PoolEnabled == false，验证号池探测不再受 PoolEnabled 门控
+	if err := cfg.Update(func(c *config.Config) error { c.PoolEnabled = false; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	toks, err := auth.NewTokenStore(dir)
@@ -160,15 +158,22 @@ func TestSetPoolThenReconfigureRegistersProbe(t *testing.T) {
 	s.SetPool(m)
 	s.Reconfigure()
 	if s.poolProbeID == 0 {
-		t.Fatal("SetPool + Reconfigure 后应注册探测 cron")
+		t.Fatal("SetPool + Reconfigure 后即使 PoolEnabled=false 也应注册探测 cron")
 	}
 
-	// 关闭开关后 Reconfigure 应摘掉
+	// 即使显式设为 false 再 Reconfigure，只要 pool != nil 探测仍保持常驻
 	if err := cfg.Update(func(c *config.Config) error { c.PoolEnabled = false; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	s.Reconfigure()
+	if s.poolProbeID == 0 {
+		t.Error("pool != nil 时探测 cron 不应因 PoolEnabled=false 被摘掉")
+	}
+
+	// 显式摘除 pool 后 Reconfigure 应取消注册
+	s.SetPool(nil)
+	s.Reconfigure()
 	if s.poolProbeID != 0 {
-		t.Error("关闭号池后应摘掉探测 cron")
+		t.Error("SetPool(nil) 后应摘掉探测 cron")
 	}
 }

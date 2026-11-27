@@ -2,6 +2,16 @@
         <header class="page-head">
           <h1>任务</h1>
           <div class="page-actions">
+            <select class="select select-sm" style="width:auto;min-width:140px"
+                    x-show="growthAccountOptions.length"
+                    :value="growthEffectiveUID()"
+                    @change="selectGrowthUID($event.target.value)"
+                    aria-label="切换任务操作账号"
+                    title="仅切换本页操作的目标账号，不修改全局主账号">
+              <template x-for="a in growthAccountOptions" :key="accountUID(a)">
+                <option :value="accountUID(a)" :selected="growthEffectiveUID()===accountUID(a)" x-text="accountLabel(a)+(a.active?'（主账号）':'')"></option>
+              </template>
+            </select>
             <span class="muted-xs" x-show="growthLastRunText()"
                   :title="growthLastRunTitle()" x-text="'上次执行 '+growthLastRunText()"></span>
             <button class="btn btn-sm" @click="runGrowthChain()" :disabled="growthBusy">
@@ -47,6 +57,33 @@
             <div class="spacer"></div>
             <span class="badge" x-show="checkinOk" :class="checkin.today_checked_in?'badge-ok':'badge-muted'" x-text="checkin.today_checked_in?'今日已签到':'未签到'"></span>
           </div>
+
+          <!-- 全账号今日签到总览条 -->
+          <div class="checkin-bar" x-show="checkinSummary.loaded && (checkinSummary.items||[]).length">
+            <div class="row" style="gap:8px">
+              <span class="muted-xs" style="font-weight:500"
+                    x-text="'全账号今日签到 '+(checkinSummary.checked_count||0)+' / '+(checkinSummary.total_count||0)"></span>
+              <div class="spacer"></div>
+              <button type="button" class="btn btn-secondary btn-sm"
+                      @click="claimCheckinAll()"
+                      :disabled="checkinClaimAllBusy || (checkinSummary.total_count>0 && checkinSummary.checked_count>=checkinSummary.total_count)">
+                <span class="spin" x-show="checkinClaimAllBusy"></span>
+                <span x-text="checkinClaimAllBusy?'签到中…':'一键全签'"></span>
+              </button>
+            </div>
+            <div class="checkin-chips">
+              <template x-for="item in (checkinSummary.items||[])" :key="item.uid">
+                <button type="button" class="checkin-chip"
+                        :class="{'is-current': growthEffectiveUID()===item.uid}"
+                        @click="selectGrowthUID(item.uid)"
+                        :title="(item.label||item.uid)+(item.error?' · 错误：'+item.error:(item.checked_in?' · 今日已签'+(item.today_credit?'（+'+item.today_credit+'）':''):' · 未签到'))">
+                  <span class="chip-dot" :class="item.error?'err':(item.checked_in?'ok':'')"></span>
+                  <span x-text="item.label||('…'+String(item.uid||'').slice(-6))"></span>
+                </button>
+              </template>
+            </div>
+          </div>
+
           <template x-if="checkinOk && !checkinPending">
             <div>
               <div class="stat-grid">
@@ -134,7 +171,6 @@
                   </template>
                 </div>
                 <div class="action-row">
-                  <!-- 昨日漏签且有余卡（growthMakeupReady()）时才渲染，其余情况不占位 -->
                   <button class="btn btn-warn btn-sm" x-show="growthMakeupReady()"
                           @click="runGrowthMakeup()" :disabled="growthBusy"
                           x-text="'补签 '+(((growth.heatmap||{}).yesterday||{}).date||'')+'（连登保住）'"></button>
@@ -163,8 +199,6 @@
             <template x-if="!growthDegraded('heatmap') && growth.heatmap">
               <div>
                 <div class="hm-cells" x-show="((growth.heatmap||{}).cells||[]).length">
-                  <!-- :key 取 cell.date 而非下标：cells 为按天序列，前缀变化（日期滚动、后端只返回部分天数）时
-                       下标会与节点错位（Alpine 按 key 复用 DOM） -->
                   <template x-for="cell in (growth.heatmap.cells||[])" :key="cell.date">
                     <span class="hm-cell"
                           :class="{ 'hm-on':cell.score>0,
@@ -185,8 +219,6 @@
             <div class="empty" x-show="growthDegraded('heatmap')">
               <span class="ic ic-lg" x-html="ic('growth')"></span>热力图暂不可用
             </div>
-            <!-- 上报为写操作（POST），不随只读的 heatmap 降级隐藏：读取失败时上报通常仍可用，
-                 实际不可用由 POST 返回的错误信息兜底 -->
             <div class="action-row">
               <button class="btn btn-sm" @click="runGrowthReport()" :disabled="growthBusy">
                 <span class="spin" x-show="growthBusy"></span>
@@ -220,8 +252,6 @@
                   <span class="muted-xs" x-show="growth.travel&&growth.travel.state==='idle'&&growth.travel.daily_limit_reached">今日已派出，明日 9:00 自动领奖</span>
                 </div>
                 <div class="action-row">
-                  <!-- 单动作状态机：到站渲染领奖、空闲渲染派出；traveling 与已达日限时 stepTravel
-                       返回 skip，故不渲染空转的巡检按钮 -->
                   <button class="btn btn-sm" x-show="growth.travel && growth.travel.state==='arrived'" @click="runGrowthTravel()" :disabled="growthBusy"
                           x-text="'领取旅行奖励'+(((growth.travel||{}).reward_credit>0)?'（+'+growth.travel.reward_credit+' 积分）':'')"></button>
                   <button class="btn btn-sm" x-show="growth.travel && growth.travel.state==='idle' && !growth.travel.daily_limit_reached" @click="runGrowthTravel()" :disabled="growthBusy">派出旅行</button>
@@ -333,7 +363,7 @@
                           ' 项，领奖 '+(lastQueue?lastQueue.claimed:0)+' 项'"></span>
           </div>
 
-          <!-- 逐项执行结果（一键完成全部后展示）：限高滚动小框，避免整列表平铺撑高页面 -->
+          <!-- 逐项执行结果（一键完成全部后展示） -->
           <div x-show="(tasksResults||[]).length" class="result-box-wrap">
             <div class="muted-xs" style="margin-bottom:6px">
               最近一轮执行结果
@@ -353,4 +383,3 @@
         </div>
 
       </section>
-

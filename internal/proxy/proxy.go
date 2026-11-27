@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"buddy2api-go/internal/apikey"
+	"buddy2api-go/internal/auth"
 	"buddy2api-go/internal/config"
 	"buddy2api-go/internal/pool"
 	"buddy2api-go/internal/store"
@@ -169,8 +170,8 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 号池关闭（或未构造）：单账号路径，不加任何额外分支开销。
-	if h.pool == nil || !h.pool.Enabled() {
+	// 未构造号池（如隔离单测）：单账号路径，不加任何额外分支开销。
+	if h.pool == nil {
 		h.chatSingle(w, r, upBody, body, streamWanted, logEntry)
 		return
 	}
@@ -255,48 +256,15 @@ func (h *Handler) chatPooled(w http.ResponseWriter, r *http.Request, upBody []by
 			h.writePoolExhausted(w, logEntry, routeModel, len(tried))
 			return
 		}
-		resp, err := h.client.DoChatWith(r.Context(), ts, upBody)
-		if err != nil {
-			// transport 类（DNS / 连接 / 超时 / http2）：不重试、不惩罚账号，直接透传。
-			// 实测库里 73 条 503 全是这类，按失败禁用会让一次断网把全池打成禁用。
-			logEntry.StatusCode = http.StatusServiceUnavailable
-			logEntry.ErrorMsg = trunc(err.Error(), 500)
-			openaiError(w, http.StatusServiceUnavailable, "upstream_error", "upstream_unavailable", err.Error())
+
+		done, status, errRaw, kind := h.tryPoolAttempt(w, r, ts, uid, sessKey, routeModel, upBody, body, streamWanted, logEntry)
+		if done {
 			return
 		}
-
-		if resp.StatusCode == http.StatusOK {
-			h.pool.NoteSuccess(uid, routeModel)
-			// 成功即重绑：让后续轮次收敛到持续成功的号，而不是跳回已被冷却的原号。
-			h.pool.Bind(sessKey, routeModel, uid)
-			if streamWanted {
-				h.passthroughSSE(w, r, resp.Body, logEntry, func(kind upstream.ChatErrKind, raw []byte) {
-					// 流内错误帧：不重试（字节已发出），但**必须记冷却**，否则下一轮
-					// 还会被分到同一个已限额的号上。
-					h.pool.NoteError(uid, routeModel, kind, raw)
-				})
-			} else {
-				// 工具停转重试必须复用同一个 uid 的凭证（见 aggregate 的 doChat 说明）
-				doChatWith := func(ctx context.Context, b []byte) (*http.Response, error) {
-					return h.client.DoChatWith(ctx, ts, b)
-				}
-				h.aggregate(r, resp.Body, body, upBody, logEntry, w, func(kind upstream.ChatErrKind, raw []byte) {
-					h.pool.NoteError(uid, routeModel, kind, raw)
-				}, doChatWith)
-			}
-			resp.Body.Close()
-			return
-		}
-
-		// 非 200：读完错误体（限量）后分类。必须读完并关闭，否则连接不能复用。
-		errRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		resp.Body.Close()
-		kind := upstream.ClassifyChatError(resp.StatusCode, errRaw)
-		h.pool.NoteError(uid, routeModel, kind, errRaw)
-		lastStatus, lastRaw = resp.StatusCode, errRaw
+		lastStatus, lastRaw = status, errRaw
 
 		if !kind.Retryable() || attempt >= maxRetry {
-			h.writeUpstreamFailure(w, logEntry, resp.StatusCode, errRaw, attempts)
+			h.writeUpstreamFailure(w, logEntry, status, errRaw, attempts)
 			return
 		}
 		// 可重试：只解绑「失败的正是本会话绑定的号」，其它号的失败不影响本会话绑定。
@@ -304,6 +272,58 @@ func (h *Handler) chatPooled(w http.ResponseWriter, r *http.Request, upBody []by
 		slog.Info("号池换号重试", "model", routeModel, "failed_uid", shortUID(uid),
 			"kind", kind.String(), "attempt", attempt+1)
 	}
+}
+
+// tryPoolAttempt 执行单次号池上游请求，并在返回（含流式/聚合完全结束）时保证释放 inflight。
+func (h *Handler) tryPoolAttempt(w http.ResponseWriter, r *http.Request, ts *auth.TokenStore,
+	uid, sessKey, routeModel string, upBody []byte, body map[string]any,
+	streamWanted bool, logEntry *store.LogEntry) (done bool, status int, errRaw []byte, kind upstream.ChatErrKind) {
+
+	h.pool.AcquireInflight(uid)
+	defer h.pool.ReleaseInflight(uid)
+
+	resp, err := h.client.DoChatWithSession(r.Context(), ts, upBody, sessKey)
+	if err != nil {
+		// transport 类（DNS / 连接 / 超时 / http2）：不重试、不惩罚账号，直接透传。
+		// 实测库里 73 条 503 全是这类，按失败禁用会让一次断网把全池打成禁用。
+		logEntry.StatusCode = http.StatusServiceUnavailable
+		logEntry.ErrorMsg = trunc(err.Error(), 500)
+		openaiError(w, http.StatusServiceUnavailable, "upstream_error", "upstream_unavailable", err.Error())
+		return true, 0, nil, 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		hadInlineErr := false
+		onError := func(k upstream.ChatErrKind, raw []byte) {
+			// 流内错误帧：不重试（字节已发出），但**必须记冷却并解绑**，
+			// 否则下一轮还会被粘在同一个已限额/耗尽的号上。
+			hadInlineErr = true
+			h.pool.NoteError(uid, routeModel, k, raw)
+			h.pool.UnbindIf(sessKey, routeModel, uid)
+		}
+		if streamWanted {
+			h.passthroughSSE(w, r, resp.Body, logEntry, onError)
+		} else {
+			// 工具停转重试必须复用同一个 uid 的凭证与 sessionKey（见 aggregate 的 doChat 说明）
+			doChatWith := func(ctx context.Context, b []byte) (*http.Response, error) {
+				return h.client.DoChatWithSession(ctx, ts, b, sessKey)
+			}
+			h.aggregate(r, resp.Body, body, upBody, logEntry, w, onError, doChatWith)
+		}
+		if !hadInlineErr && logEntry.StatusCode == http.StatusOK && logEntry.ErrorMsg == "" {
+			h.pool.NoteSuccess(uid, routeModel)
+			// 成功即重绑：让后续轮次收敛到持续成功的号，而不是跳回已被冷却的原号。
+			h.pool.Bind(sessKey, routeModel, uid)
+		}
+		return true, 0, nil, 0
+	}
+
+	// 非 200：读完错误体（限量）后分类。必须读完并关闭，否则连接不能复用。
+	errRaw, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	kind = upstream.ClassifyChatError(resp.StatusCode, errRaw)
+	h.pool.NoteError(uid, routeModel, kind, errRaw)
+	return false, resp.StatusCode, errRaw, kind
 }
 
 // writeUpstreamFailure 透传上游错误。HTTP 状态码与错误体尽量原样：

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +32,6 @@ func newPoolPanelFixture(t *testing.T, uids ...string) (*Handler, *store.Store) 
 		t.Fatal(err)
 	}
 	if err := cfg.Update(func(c *config.Config) error {
-		c.PoolEnabled = true
 		c.PoolSessionTTL = 180
 		return nil
 	}); err != nil {
@@ -84,8 +84,8 @@ func TestPoolViewCreditsForEveryAccount(t *testing.T) {
 		}
 		h.pool.SetCredits(uid, credits, time.Now().Add(-time.Hour).Unix())
 	}
-	// 当前活动账号（acc1）另有一份更新的余额缓存：应当被采纳
-	if err := h.st.SetCache("resource_cache", resourceCacheKey, `{"total_dosage":999}`); err != nil {
+	// 当前活动账号（acc1）另有一份更新的 per-uid 余额缓存：应当被采纳
+	if err := h.st.SetCache("resource_cache", resourceCacheKey("acc1"), `{"total_dosage":999}`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -145,5 +145,93 @@ func TestPoolViewActiveFlagMarked(t *testing.T) {
 	}
 	if actives != 1 {
 		t.Errorf("应恰好标出 1 个活动账号，实际 %d", actives)
+	}
+}
+
+// TestPoolStrategyEndpoint PUT /admin/pool/strategy 校验策略合法性、持久化、env 锁及 GET /admin/pool 同步。
+func TestPoolStrategyEndpoint(t *testing.T) {
+	h, _ := newPoolPanelFixture(t, "acc1")
+
+	// 非法策略 → 400
+	rrBad := httptest.NewRecorder()
+	h.poolSetStrategy(rrBad, httptest.NewRequest(http.MethodPut, "/admin/pool/strategy", strings.NewReader(`{"strategy":"random_bad"}`)))
+	if rrBad.Code != http.StatusBadRequest {
+		t.Fatalf("非法策略应 400，得到 %d: %s", rrBad.Code, rrBad.Body.String())
+	}
+
+	// 合法策略 → 200 并持久化
+	for _, s := range []string{"balanced", "credits_first", "expire_first"} {
+		rr := httptest.NewRecorder()
+		h.poolSetStrategy(rr, httptest.NewRequest(http.MethodPut, "/admin/pool/strategy", strings.NewReader(`{"strategy":"`+s+`"}`)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("切换策略 %s 失败 %d: %s", s, rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp["ok"] != true || resp["strategy"] != s {
+			t.Errorf("响应异常: %+v", resp)
+		}
+
+		// GET /admin/pool 应实时返回该策略
+		rrView := httptest.NewRecorder()
+		h.poolView(rrView, httptest.NewRequest(http.MethodGet, "/admin/pool", nil))
+		var view pool.PoolView
+		if err := json.Unmarshal(rrView.Body.Bytes(), &view); err != nil {
+			t.Fatal(err)
+		}
+		if view.Strategy != s {
+			t.Errorf("GET /admin/pool strategy=%q，期望 %q", view.Strategy, s)
+		}
+	}
+}
+
+// TestPoolStrategyEnvLocked BUDDY2API_POOL_STRATEGY 锁定时 PUT 不得覆盖 env 值。
+func TestPoolStrategyEnvLocked(t *testing.T) {
+	t.Setenv("BUDDY2API_POOL_STRATEGY", "credits_first")
+	h, _ := newPoolPanelFixture(t, "acc1")
+
+	rr := httptest.NewRecorder()
+	h.poolSetStrategy(rr, httptest.NewRequest(http.MethodPut, "/admin/pool/strategy", strings.NewReader(`{"strategy":"balanced"}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"strategy":"credits_first"`) {
+		t.Errorf("env 锁定时应保持 credits_first，得到 %s", rr.Body.String())
+	}
+}
+
+// TestPoolProbeResourceHookWritesCache 验证 SetPool 挂载的 ResourceHook 在 Probe 后写入 v4:<uid> 缓存并清理旧键。
+func TestPoolProbeResourceHookWritesCache(t *testing.T) {
+	h, st := newPoolPanelFixture(t, "acc1")
+	h.SetPool(h.pool)
+
+	exp := time.Now().Add(48 * time.Hour).Format("2006-01-02 15:04:05")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{
+			"TotalDosage":120,
+			"Accounts":[
+				{"PackageName":"临期包","CapacityRemainPrecise":"120","CapacitySizePrecise":"200","CycleCapacityRemainPrecise":"120","CycleCapacitySizePrecise":"200","ExpiredTime":"` + exp + `"}
+			]
+		}}}}`))
+	}))
+	defer srv.Close()
+	h.client.BillingBaseOverride = srv.URL
+
+	// 写入旧版残留键，探测后应被清理
+	_ = st.SetCache("resource_cache", "default_v3", `{"stale":true}`)
+
+	rr := httptest.NewRecorder()
+	h.poolProbe(rr, withURLParam(httptest.NewRequest(http.MethodPost, "/admin/pool/accounts/acc1/probe", nil), "uid", "acc1"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("probe 失败 %d: %s", rr.Code, rr.Body.String())
+	}
+	payload, _, ok := st.GetCache("resource_cache", resourceCacheKey("acc1"), 0)
+	if !ok || !strings.Contains(payload, `"total_dosage":120`) || !strings.Contains(payload, `"expire_at"`) {
+		t.Fatalf("Probe 后未写入 v4:acc1 缓存: ok=%v payload=%s", ok, payload)
+	}
+	if _, _, legacyOK := st.GetCache("resource_cache", "default_v3", 0); legacyOK {
+		t.Error("Probe 写缓存时应一并清理旧版 default_v3 键")
 	}
 }

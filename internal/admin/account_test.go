@@ -20,9 +20,9 @@ import (
 // accountScopedCacheRows 凭证变更后必须清空的「账号口径」展示缓存行（表, key）。
 // 这些 key 都是固定字串（单账号设计），换账号后不删的话，新账号在 TTL 内会读到上一账号的余额/签到。
 var accountScopedCacheRows = [][2]string{
-	{"resource_cache", resourceCacheKey},
 	{"resource_cache", "default"},    // 历史残留键
 	{"resource_cache", "default_v2"}, // 历史残留键
+	{"resource_cache", "default_v3"}, // 历史残留键
 	{"checkin_cache", "status"},
 	{"growth_cache", growthKeyOverview},
 }
@@ -341,9 +341,6 @@ func TestAccountDeleteRemovesFromPool(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	cfg, err := config.Load(dir)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cfg.Update(func(c *config.Config) error { c.PoolEnabled = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	toks, err := auth.NewTokenStore(dir)

@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"buddy2api-go/internal/auth"
+	"buddy2api-go/internal/scheduler"
 	"buddy2api-go/internal/taskops"
 	"buddy2api-go/internal/upstream"
 )
@@ -568,14 +569,14 @@ func TestSweepRecordedOnManualTrigger(t *testing.T) {
 	defer srv.Close()
 	h.client.GrowthBaseOverride, h.client.WebBaseOverride, h.client.MPBaseOverride = srv.URL, srv.URL, srv.URL
 
-	if _, _, ok := h.st.GetCache(taskCacheTable, taskKeyLastSweep, 3600); ok {
+	if _, _, ok := h.st.GetCache(taskCacheTable, scheduler.TaskLastSweepKey("u"), 3600); ok {
 		t.Fatal("清扫前不应有落库")
 	}
 	code, out := postJSONReq(t, h.tasksSweep, "")
 	if code != http.StatusOK {
 		t.Fatalf("清扫失败 %d %v", code, out)
 	}
-	raw, _, ok := h.st.GetCache(taskCacheTable, taskKeyLastSweep, 3600)
+	raw, _, ok := h.st.GetCache(taskCacheTable, scheduler.TaskLastSweepKey("u"), 3600)
 	if !ok || raw == "" {
 		t.Fatal("手动清扫后应落库")
 	}

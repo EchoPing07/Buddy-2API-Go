@@ -308,18 +308,77 @@ func TestPoolCreditsColumnsUpgrade(t *testing.T) {
 		t.Errorf("升级丢了老数据: %+v", rows[0])
 	}
 	// 新列默认 0 = 「从未读到过额度」，UI 据此显示 —（而非额度 0）
-	if rows[0].Credits != 0 || rows[0].CreditsAt != 0 {
-		t.Errorf("新列默认值应为 0，得到 credits=%v credits_at=%d", rows[0].Credits, rows[0].CreditsAt)
+	if rows[0].Credits != 0 || rows[0].CreditsAt != 0 || rows[0].EarliestExpireAt != 0 || rows[0].ExpiringCredits != 0 {
+		t.Errorf("新列默认值应为 0，得到 credits=%v credits_at=%d earliest_expire_at=%d expiring_credits=%v",
+			rows[0].Credits, rows[0].CreditsAt, rows[0].EarliestExpireAt, rows[0].ExpiringCredits)
 	}
 
-	// 3) 写入额度后能读回
+	// 3) 写入额度与到期摘要后能读回
 	rows[0].Credits, rows[0].CreditsAt = 88.5, 1234
+	rows[0].EarliestExpireAt, rows[0].ExpiringCredits = 1793380602, 42.25
 	if err := st.SavePoolAccount(&rows[0]); err != nil {
 		t.Fatal(err)
 	}
 	again, _ := st.LoadPoolAccounts()
-	if len(again) != 1 || again[0].Credits != 88.5 || again[0].CreditsAt != 1234 {
-		t.Errorf("额度未落库: %+v", again)
+	if len(again) != 1 || again[0].Credits != 88.5 || again[0].CreditsAt != 1234 ||
+		again[0].EarliestExpireAt != 1793380602 || again[0].ExpiringCredits != 42.25 {
+		t.Errorf("额度与到期摘要未落库: %+v", again)
+	}
+}
+
+// TestPoolExpiryColumnsUpgrade 已有 credits/credits_at 的库就地升级补加 earliest_expire_at / expiring_credits。
+func TestPoolExpiryColumnsUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upgrade.db")
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`CREATE TABLE pool_account_state (
+		uid                TEXT PRIMARY KEY,
+		manual_disabled    INTEGER NOT NULL DEFAULT 0,
+		manual_disabled_at INTEGER NOT NULL DEFAULT 0,
+		auto_disabled      TEXT    NOT NULL DEFAULT '',
+		auto_disabled_at   INTEGER NOT NULL DEFAULT 0,
+		auto_disabled_msg  TEXT    NOT NULL DEFAULT '',
+		quota_fail_streak  INTEGER NOT NULL DEFAULT 0,
+		last_probe_at      INTEGER NOT NULL DEFAULT 0,
+		last_probe_ok      INTEGER NOT NULL DEFAULT 0,
+		last_probe_msg     TEXT    NOT NULL DEFAULT '',
+		credits            REAL    NOT NULL DEFAULT 0,
+		credits_at         INTEGER NOT NULL DEFAULT 0
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO pool_account_state (uid, credits, credits_at) VALUES ('u-old', 150.5, 999)`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("升级 Open 失败: %v", err)
+	}
+	defer st.Close()
+
+	rows, err := st.LoadPoolAccounts()
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("LoadPoolAccounts = %+v, err=%v", rows, err)
+	}
+	if rows[0].Credits != 150.5 || rows[0].CreditsAt != 999 || rows[0].EarliestExpireAt != 0 || rows[0].ExpiringCredits != 0 {
+		t.Errorf("升级后行状态异常: %+v", rows[0])
+	}
+	rows[0].EarliestExpireAt = 1800000000
+	rows[0].ExpiringCredits = 75.5
+	if err := st.SavePoolAccount(&rows[0]); err != nil {
+		t.Fatal(err)
+	}
+	again, err := st.LoadPoolAccounts()
+	if err != nil || len(again) != 1 {
+		t.Fatalf("二次读取失败: %+v, err=%v", again, err)
+	}
+	if again[0].EarliestExpireAt != 1800000000 || again[0].ExpiringCredits != 75.5 {
+		t.Errorf("新列往返不符: %+v", again[0])
 	}
 }
 
@@ -368,6 +427,7 @@ func TestPoolStateRoundTrip(t *testing.T) {
 		AutoDisabled: "quota", AutoDisabledAt: 200, AutoDisabledMsg: "额度已用尽",
 		QuotaFailStreak: 2, LastProbeAt: 300, LastProbeOK: false, LastProbeMsg: "credit=0",
 		Credits: 1234.5, CreditsAt: 300,
+		EarliestExpireAt: 1793380602, ExpiringCredits: 321.25,
 	}
 	if err := st.SavePoolAccount(&row); err != nil {
 		t.Fatal(err)
@@ -383,17 +443,19 @@ func TestPoolStateRoundTrip(t *testing.T) {
 	if !got.ManualDisabled || got.AutoDisabled != "quota" || got.QuotaFailStreak != 2 || got.AutoDisabledMsg != "额度已用尽" {
 		t.Errorf("往返后字段不符：%+v", got)
 	}
-	if got.Credits != 1234.5 || got.CreditsAt != 300 {
-		t.Errorf("额度未往返：credits=%v credits_at=%d", got.Credits, got.CreditsAt)
+	if got.Credits != 1234.5 || got.CreditsAt != 300 || got.EarliestExpireAt != 1793380602 || got.ExpiringCredits != 321.25 {
+		t.Errorf("额度与到期摘要未往返：%+v", got)
 	}
 	// UPSERT 覆盖
 	row.ManualDisabled = false
+	row.EarliestExpireAt = 1794000000
+	row.ExpiringCredits = 50.5
 	if err := st.SavePoolAccount(&row); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ = st.LoadPoolAccounts()
-	if len(rows) != 1 || rows[0].ManualDisabled {
-		t.Error("UPSERT 应覆盖而不是插入新行")
+	if len(rows) != 1 || rows[0].ManualDisabled || rows[0].EarliestExpireAt != 1794000000 || rows[0].ExpiringCredits != 50.5 {
+		t.Errorf("UPSERT 应覆盖而不是插入新行: %+v", rows)
 	}
 
 	// 冷却：过期的读不出来

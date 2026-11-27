@@ -39,6 +39,57 @@
           </div>
 
           <div class="card">
+            <div class="card-head"><h3>多账号调度</h3></div>
+            <div class="form-row">
+              <label class="label">路由策略</label>
+              <select class="select" x-model="settings.pool_strategy">
+                <option value="expire_first">临期优先（优先消耗最早到期的可用账号）</option>
+                <option value="balanced">均衡分摊（按会话与并发均衡分配）</option>
+                <option value="credits_first">高余额优先（优先使用剩余额度最多的账号）</option>
+              </select>
+              <p class="field-hint">原生常驻多账号调度：/v1/chat/completions 按策略分配到全部可用账号，同一会话自动粘在同一账号</p>
+            </div>
+            <div class="form-grid c2">
+              <div class="form-row">
+                <label class="label">会话粘性 TTL（分钟）</label>
+                <input class="input" type="number" min="5" max="1440" x-model.number="settings.pool_session_ttl">
+              </div>
+              <div class="form-row">
+                <label class="label">网关内换号重试上限</label>
+                <input class="input" type="number" min="0" max="5" x-model.number="settings.pool_max_retry">
+              </div>
+            </div>
+            <div class="form-grid c2">
+              <div class="form-row">
+                <label class="label">模型冷却截断上限（分钟）</label>
+                <input class="input" type="number" min="5" max="2880" x-model.number="settings.pool_cool_max_min">
+              </div>
+              <div class="form-row">
+                <label class="label">定时探测 Cron</label>
+                <input class="input mono" type="text" x-model="settings.pool_probe_cron" placeholder="0 0 0,6,12,18 * * *">
+              </div>
+            </div>
+            <p class="field-hint" style="margin-top:-6px">6 段含秒 Cron，定期探测账号额度、到期时间与凭证状态，自动恢复已到重置窗口的账号</p>
+            <details class="details-box">
+              <summary>客户端会话粘性配置示例（models.json）</summary>
+              <div class="details-body">
+                <div class="code-wrap">
+                  <button type="button" class="btn btn-ghost btn-sm code-copy" @click="copy(poolModelsJsonSample)"
+                          title="复制 models.json 片段" aria-label="复制 models.json 片段">
+                    <span class="ic" x-html="ic('copy')"></span>
+                  </button>
+                  <pre class="code-block"><code x-text="poolModelsJsonSample"></code></pre>
+                </div>
+                <div class="field-hint code-hint">
+                  <div>* 不配 <span class="mono">compat</span> 也能粘住，但只能靠「首条 user 文本」派生会话键；上下文压缩后首条会被替换为摘要 → 粘性打断一次</div>
+                  <div>* 配上 <span class="mono">sendSessionAffinityHeaders</span> 后每次请求都带固定会话头，压缩、换模型、resume 全不受影响</div>
+                  <div>* 环境变量 <span class="mono">PI_CACHE_RETENTION=long</span> 会让客户端额外发 <span class="mono">prompt_cache_key</span>（同样可用作会话键）</div>
+                </div>
+              </div>
+            </details>
+          </div>
+
+          <div class="card">
             <div class="card-head"><h3>修改管理密码</h3></div>
             <div class="form-grid c2">
               <div class="form-row"><label class="label">旧密码</label><input class="input" type="password" x-model="pwForm.old_password" autocomplete="current-password"></div>

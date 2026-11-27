@@ -1,5 +1,5 @@
 // tasks.go 成长任务端点：任务列表 / 接受 / 领奖 / 一键完成 / 全账号扫描 / 执行队列 /
-// 补领清扫 / 补偿状态。
+// 补领清扫 / 补偿状态（均支持 ?uid= 多账号）。
 //
 // 编排逻辑在 internal/taskops（admin 与 scheduler 共用），本文件只做 HTTP 适配：
 // 门控 → 调用 → 结果透出。所有写操作失败都返回人话原因，不透上游长响应。
@@ -11,22 +11,25 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
+	"buddy2api-go/internal/auth"
+	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/pool"
+	"buddy2api-go/internal/scheduler"
 	"buddy2api-go/internal/taskops"
 	"buddy2api-go/internal/upstream"
 )
 
-// 任务队列 / 清扫的最近一轮结果落库键（账号口径，换账号由 ResetAccountState 一并清理）。
+// 任务队列 / 清扫的最近一轮结果落库表与基础键名。
 const (
-	taskCacheTable   = "growth_cache"
-	taskKeyLastSweep = "task_last_sweep"
-	taskKeyLastQueue = "task_last_queue"
+	taskCacheTable   = scheduler.GrowthCacheTable
+	taskKeyLastSweep = scheduler.TaskKeyLastSweep
+	taskKeyLastQueue = scheduler.TaskKeyLastQueue
 )
 
 // maxAcceptCodes 单次手动 accept 的任务码上限。
-// 缺省分支只提交列表里真实存在的任务（自然有界）；显式分支是用户/脚本直接给的，
-// 没有上限时一个请求可以塞几千个码，各触发一次上游 accept 并长期占住全局锁。
 const maxAcceptCodes = 200
 
 // cachedJSON 读落库的 JSON 片段（缺失 / 过期 / 损坏都返回 nil，前端按空态处理）。
@@ -41,65 +44,139 @@ func (h *Handler) cachedJSON(key string) json.RawMessage {
 	return json.RawMessage(raw)
 }
 
-// recordSweep 把一轮清扫结果落库（面板可展示「上次清扫在几点、扫到什么」）。
-// 落库失败只记日志：统计是辅助信息，不能影响清扫本身。
 func (h *Handler) recordSweep(st taskops.SweepStats) {
+	uid := ""
+	if t := h.toks.Get(); t != nil {
+		uid = t.UID
+	}
+	h.recordSweepFor(uid, st)
+}
+
+func (h *Handler) recordSweepFor(uid string, st taskops.SweepStats) {
 	raw, err := json.Marshal(st)
 	if err != nil {
 		return
 	}
-	if err := h.st.SetCache(taskCacheTable, taskKeyLastSweep, string(raw)); err != nil {
-		slog.Warn("任务清扫结果落库失败", "error", err)
+	if err := h.st.SetCache(taskCacheTable, scheduler.TaskLastSweepKey(uid), string(raw)); err != nil {
+		slog.Warn("任务清扫结果落库失败", "uid", uid, "error", err)
 	}
 }
 
-// recordQueue 把一轮队列结果落库。
-func (h *Handler) recordQueue(summary map[string]any) {
+func (h *Handler) recordQueueFor(uid string, summary map[string]any) {
 	raw, err := json.Marshal(summary)
 	if err != nil {
 		return
 	}
-	if err := h.st.SetCache(taskCacheTable, taskKeyLastQueue, string(raw)); err != nil {
-		slog.Warn("任务队列结果落库失败", "error", err)
+	if err := h.st.SetCache(taskCacheTable, scheduler.TaskLastQueueKey(uid), string(raw)); err != nil {
+		slog.Warn("任务队列结果落库失败", "uid", uid, "error", err)
 	}
 }
 
-// runner 返回任务执行器（在 New() 里创建一次，与 client 同源）。
-// 刻意不做惰性初始化：handler 会被多个 HTTP goroutine 并发调用，惰性赋值是数据竞争
-// （即使只是读多写少，第一次并发请求就可能两个 goroutine 同时写）。
+// runner 返回主账号任务执行器（在 New() 里创建一次，与 client 同源）。
 func (h *Handler) runner() *taskops.Runner {
 	if h.tasks == nil {
-		return taskops.NewRunner(h.client) // 仅测试里直接构造 Handler 才会走到
+		return taskops.NewRunner(h.client)
 	}
 	return h.tasks
 }
 
-// taskGate 任务侧前置门控：返回非空 reason 表示不可执行（不发起任何上游调用）。
-func (h *Handler) taskGate() string {
-	return h.runner().Gate(h.cfg.Get().Region)
+// runnerFor 返回指定账号的任务执行器：
+//   - 主账号复用 h.runner()（与 scheduler 的夜猫子任务共享同一把锁）；
+//   - 非主账号从 uidRunners 缓存取或新建 taskops.NewRunner(h.client.WithTokenStore(ts))，按 ts 指针保鲜。
+func (h *Handler) runnerFor(uid string, ts *auth.TokenStore) *taskops.Runner {
+	uid = strings.TrimSpace(uid)
+	active := h.toks.Get()
+	if uid == "" || (active != nil && active.UID == uid) || ts == nil {
+		return h.runner()
+	}
+	h.uidRunnersMu.Lock()
+	defer h.uidRunnersMu.Unlock()
+	if h.uidRunners == nil {
+		h.uidRunners = make(map[string]uidRunnerEntry)
+	}
+	if ent, ok := h.uidRunners[uid]; ok && ent.ts == ts && ent.runner != nil {
+		return ent.runner
+	}
+	r := taskops.NewRunner(h.client.WithTokenStore(ts))
+	h.uidRunners[uid] = uidRunnerEntry{ts: ts, runner: r}
+	return r
+}
+
+// taskGateMessage 把门控 reason 映射为人话提示（兼容 taskops 与池状态新增的 credential_disabled）。
+func taskGateMessage(reason string) string {
+	if reason == "credential_disabled" {
+		return "该账号凭证已失效，请重新登录后再试"
+	}
+	return taskops.GateMessage(reason)
 }
 
 // gateFail 输出门控失败响应（HTTP 200 + ok:false，让前端统一按 reason 展示人话）。
 func gateFail(w http.ResponseWriter, reason string) {
 	jsonWrite(w, http.StatusOK, map[string]any{
-		"ok": false, "reason": reason, "detail": taskops.GateMessage(reason),
+		"ok": false, "reason": reason, "detail": taskGateMessage(reason),
 	})
+}
+
+// resolveTaskTarget 按 ?uid= 解析任务/补偿端点的目标账号、上游 client 与 runner。
+//   - rawUID==""：主账号；
+//   - rawUID!=""：校验属于号池（否则 httpStatus=404）、CN 匹配、非凭证失效及 runner.Gate。
+func (h *Handler) resolveTaskTarget(rawUID string) (effectiveUID string, cli *upstream.Client, r *taskops.Runner, httpStatus int, gateReason string) {
+	rawUID = strings.TrimSpace(rawUID)
+	cfg := h.cfg.Get()
+	cnDomain := config.EndpointOf("cn").Domain
+
+	if rawUID == "" {
+		if t := h.toks.Get(); t != nil {
+			effectiveUID = t.UID
+		}
+		r = h.runner()
+		return effectiveUID, h.client, r, 0, r.Gate(cfg.Region)
+	}
+
+	targetUID, cli, tok, found := h.resolveUIDClient(rawUID)
+	if !found {
+		return "", nil, nil, http.StatusNotFound, "账号不存在"
+	}
+	if cfg.Region != "cn" || !regionMatches(tok.Domain, cnDomain) {
+		return targetUID, nil, nil, 0, "region_global"
+	}
+	if h.pool != nil {
+		if st, ok := h.pool.AccountStateOf(targetUID); ok && st.AutoDisabled == pool.AutoCredential {
+			return targetUID, nil, nil, 0, "credential_disabled"
+		}
+	}
+	active := h.toks.Get()
+	if active != nil && active.UID == targetUID {
+		r = h.runner()
+		return targetUID, h.client, r, 0, r.Gate(cfg.Region)
+	}
+	var ts *auth.TokenStore
+	if h.pool != nil {
+		ts, _ = h.pool.TokenStore(targetUID)
+	}
+	r = h.runnerFor(targetUID, ts)
+	return targetUID, cli, r, 0, r.Gate(cfg.Region)
 }
 
 // ── 任务列表 / 接受 / 领奖 ────────────────────────────────────────────────────
 
 // tasksList GET /admin/tasks — 全量任务（默认 + 小程序口径合并），含本地推算的可领状态。
 func (h *Handler) tasksList(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	rawUID := strings.TrimSpace(r.URL.Query().Get("uid"))
+	effectiveUID, cli, _, status, reason := h.resolveTaskTarget(rawUID)
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
-	tasks, err := h.client.ListTasksMerged()
+	tasks, err := cli.ListTasksMerged()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, "拉取任务列表失败: "+err.Error())
 		return
 	}
-	// 附加「是否支持一键完成」，前端据此决定按钮可用性。
 	type taskView struct {
 		upstream.Task
 		Auto bool `json:"auto"`
@@ -113,20 +190,30 @@ func (h *Handler) tasksList(w http.ResponseWriter, r *http.Request) {
 		}
 		views = append(views, taskView{Task: t, Auto: auto})
 	}
+	lastSweep := h.cachedJSON(scheduler.TaskLastSweepKey(effectiveUID))
+	if lastSweep == nil && rawUID == "" {
+		lastSweep = h.cachedJSON(taskKeyLastSweep)
+	}
+	lastQueue := h.cachedJSON(scheduler.TaskLastQueueKey(effectiveUID))
+	if lastQueue == nil && rawUID == "" {
+		lastQueue = h.cachedJSON(taskKeyLastQueue)
+	}
 	jsonWrite(w, http.StatusOK, map[string]any{
 		"ok": true, "tasks": views, "pending": pending,
-		"at": time.Now().Unix(),
-		// 上一轮清扫 / 队列的落库结果：面板展示「上次扫了什么」，
-		// 也让「一键完成超时后台继续」的结果在刷新后有处可查。
-		"last_sweep": h.cachedJSON(taskKeyLastSweep),
-		"last_queue": h.cachedJSON(taskKeyLastQueue),
+		"at":         time.Now().Unix(),
+		"last_sweep": lastSweep,
+		"last_queue": lastQueue,
 	})
 }
 
 // tasksAccept POST /admin/tasks/accept — 接受未接受的任务（{task_codes?:[...]}）。
-// 缺省 = 全部未接受的任务（默认与小程序口径分开提交）。
 func (h *Handler) tasksAccept(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	_, cli, _, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
@@ -149,10 +236,10 @@ func (h *Handler) tasksAccept(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		var firstErr error
-		if err := h.client.AcceptTasks(plain); err != nil {
+		if err := cli.AcceptTasks(plain); err != nil {
 			firstErr = err
 		}
-		if err := h.client.AcceptTasksMP(mpCodes); err != nil && firstErr == nil {
+		if err := cli.AcceptTasksMP(mpCodes); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		if firstErr != nil {
@@ -162,7 +249,7 @@ func (h *Handler) tasksAccept(w http.ResponseWriter, r *http.Request) {
 		jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "accepted": len(body.TaskCodes)})
 		return
 	}
-	tasks, err := h.client.ListTasksMerged()
+	tasks, err := cli.ListTasksMerged()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, "拉取任务列表失败: "+err.Error())
 		return
@@ -182,7 +269,7 @@ func (h *Handler) tasksAccept(w http.ResponseWriter, r *http.Request) {
 	var failed []string
 	for i := 0; i < len(plain); i += 20 {
 		end := min(i+20, len(plain))
-		if err := h.client.AcceptTasks(plain[i:end]); err != nil {
+		if err := cli.AcceptTasks(plain[i:end]); err != nil {
 			failed = append(failed, plain[i:end]...)
 			continue
 		}
@@ -190,7 +277,7 @@ func (h *Handler) tasksAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := 0; i < len(mpCodes); i += 20 {
 		end := min(i+20, len(mpCodes))
-		if err := h.client.AcceptTasksMP(mpCodes[i:end]); err != nil {
+		if err := cli.AcceptTasksMP(mpCodes[i:end]); err != nil {
 			failed = append(failed, mpCodes[i:end]...)
 			continue
 		}
@@ -202,7 +289,12 @@ func (h *Handler) tasksAccept(w http.ResponseWriter, r *http.Request) {
 
 // tasksClaim POST /admin/tasks/claim — 领取单个任务奖励 {task_code}（幂等）。
 func (h *Handler) tasksClaim(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	_, cli, _, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
@@ -213,9 +305,7 @@ func (h *Handler) tasksClaim(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "task_code 不能为空")
 		return
 	}
-	// 口径按任务码白名单判定（upstream.mpTaskCodes）：动作表只覆盖可自动化任务，
-	// 用它推断会让「没有动作的小程序任务」被当成默认口径领奖，恒 400。
-	credit, energy, err := h.client.ClaimRewardFor(body.TaskCode, upstream.IsMPTaskCode(body.TaskCode))
+	credit, energy, err := cli.ClaimRewardFor(body.TaskCode, upstream.IsMPTaskCode(body.TaskCode))
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, "领取失败: "+err.Error())
 		return
@@ -237,7 +327,12 @@ func (h *Handler) tasksClaim(w http.ResponseWriter, r *http.Request) {
 
 // tasksAuto POST /admin/tasks/auto — 一键完成单个任务 {task_code}。
 func (h *Handler) tasksAuto(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	_, _, runner, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
@@ -253,7 +348,7 @@ func (h *Handler) tasksAuto(w http.ResponseWriter, r *http.Request) {
 			"该任务需要客户端内交互（无对应接口），无法自动完成；请按任务说明在官方客户端操作")
 		return
 	}
-	res, err := h.runner().AutoContext(r.Context(), body.TaskCode)
+	res, err := runner.AutoContext(r.Context(), body.TaskCode)
 	if err != nil {
 		if err == taskops.ErrBusy {
 			gateFail(w, "busy")
@@ -268,10 +363,13 @@ func (h *Handler) tasksAuto(w http.ResponseWriter, r *http.Request) {
 }
 
 // tasksAutoAll POST /admin/tasks/auto_all — 一键完成全部可自动化任务。
-// 动作多项串联（个别含真实对话），HTTP 侧给 5 分钟兜底：超时后台继续，
-// 期间重复点击由 runner 的互斥挡成 busy。
 func (h *Handler) tasksAutoAll(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	_, _, runner, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
@@ -279,12 +377,9 @@ func (h *Handler) tasksAutoAll(w http.ResponseWriter, r *http.Request) {
 		results []taskops.StepResult
 		err     error
 	}
-	// 刻意为后台执行用独立的 context.Background()（而非 r.Context()）：
-	// 一键完成会真实领奖，用户关掉页面不该让半途的任务链中断。
-	// 进程退出由 scheduler.Stop 之外的自然超时兜底；单任务粒度带 ctx 的是 /tasks/auto。
 	ch := make(chan outcome, 1)
 	go func() {
-		results, err := h.runner().AutoAllContext(context.Background())
+		results, err := runner.AutoAllContext(context.Background())
 		ch <- outcome{results: results, err: err}
 	}()
 	select {
@@ -320,11 +415,16 @@ func (h *Handler) tasksAutoAll(w http.ResponseWriter, r *http.Request) {
 
 // tasksScan GET /admin/tasks/scan — 只读扫描：未完成且可自动化的待办。
 func (h *Handler) tasksScan(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	_, _, runner, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
-	pending, err := h.runner().Scan()
+	pending, err := runner.Scan()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, "扫描失败: "+err.Error())
 		return
@@ -336,25 +436,34 @@ func (h *Handler) tasksScan(w http.ResponseWriter, r *http.Request) {
 
 // tasksSweep POST /admin/tasks/sweep — 立即执行一轮补领清扫（只 accept/claim）。
 func (h *Handler) tasksSweep(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	effectiveUID, _, runner, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
-	st := h.runner().Sweep(h.cfg.Get().Region)
-	h.recordSweep(st)
+	st := runner.Sweep(h.cfg.Get().Region)
+	h.recordSweepFor(effectiveUID, st)
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "stats": st})
 }
 
 // ── 补偿 ─────────────────────────────────────────────────────────────────────
 
 // compensation GET /admin/compensation — 补偿活动状态（只读）。
-// active=false 是「当前无补偿活动」的正常返回，不是错误。
 func (h *Handler) compensation(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	_, cli, _, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
-	st, err := h.client.GetCompensationStatus()
+	st, err := cli.GetCompensationStatus()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, "查询补偿状态失败: "+err.Error())
 		return
@@ -366,11 +475,16 @@ func (h *Handler) compensation(w http.ResponseWriter, r *http.Request) {
 
 // compensationClaim POST /admin/compensation/claim — 领取补偿（先查后领，幂等）。
 func (h *Handler) compensationClaim(w http.ResponseWriter, r *http.Request) {
-	if reason := h.taskGate(); reason != "" {
+	_, cli, _, status, reason := h.resolveTaskTarget(r.URL.Query().Get("uid"))
+	if status != 0 {
+		jsonErr(w, status, reason)
+		return
+	}
+	if reason != "" {
 		gateFail(w, reason)
 		return
 	}
-	st, err := h.client.GetCompensationStatus()
+	st, err := cli.GetCompensationStatus()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, "查询补偿状态失败: "+err.Error())
 		return
@@ -388,7 +502,7 @@ func (h *Handler) compensationClaim(w http.ResponseWriter, r *http.Request) {
 		jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "claimed": false, "detail": detail, "status": st})
 		return
 	}
-	credit, err := h.client.ClaimCompensation()
+	credit, err := cli.ClaimCompensation()
 	if err != nil {
 		jsonErr(w, http.StatusBadGateway, "领取补偿失败: "+err.Error())
 		return
@@ -400,8 +514,6 @@ func (h *Handler) compensationClaim(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// min Go 1.21+ 已内建 min（int 版），此处不重复定义。
-
 // tasksActions GET /admin/tasks/actions — 支持一键完成的任务清单（前端展示用，无上游调用）。
 func (h *Handler) tasksActions(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "actions": taskops.Actions()})
@@ -409,37 +521,82 @@ func (h *Handler) tasksActions(w http.ResponseWriter, r *http.Request) {
 
 // ── 供 scheduler 挂载的回调 ───────────────────────────────────────────────────
 
-// RunTaskSweep 执行一轮补领清扫（scheduler 的分钟级 ticker 调用）。
+// RunTaskSweep 执行主账号的一轮补领清扫（兼容旧单账号 hook）。
 func (h *Handler) RunTaskSweep() taskops.SweepStats {
-	if reason := h.taskGate(); reason != "" {
+	uid := ""
+	if t := h.toks.Get(); t != nil {
+		uid = t.UID
+	}
+	return h.runTaskSweepWith(uid, h.runner())
+}
+
+// RunTaskSweepFor 按账号 UID 执行一轮补领清扫并写入 per-uid 缓存（供 scheduler 多账号遍历）。
+func (h *Handler) RunTaskSweepFor(uid string) taskops.SweepStats {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return h.RunTaskSweep()
+	}
+	effectiveUID, _, runner, status, reason := h.resolveTaskTarget(uid)
+	if status != 0 {
+		return taskops.SweepStats{Reason: "not_logged_in"}
+	}
+	if reason != "" {
 		return taskops.SweepStats{Reason: reason}
 	}
-	st := h.runner().Sweep(h.cfg.Get().Region)
-	h.recordSweep(st)
+	return h.runTaskSweepWith(effectiveUID, runner)
+}
+
+func (h *Handler) runTaskSweepWith(uid string, runner *taskops.Runner) taskops.SweepStats {
+	cfg := h.cfg.Get()
+	if reason := runner.Gate(cfg.Region); reason != "" {
+		return taskops.SweepStats{Reason: reason}
+	}
+	st := runner.Sweep(cfg.Region)
+	h.recordSweepFor(uid, st)
 	return st
 }
 
-// RunTaskQueueOnce 任务队列一轮：扫描待办 → 逐个执行动作（scheduler 每日 cron 调用）。
-// 异步执行（队列本身可能耗时数分钟），已在跑时安全跳过。
+// RunTaskQueueOnce 执行主账号的一轮任务队列（兼容旧单账号 hook）。
 func (h *Handler) RunTaskQueueOnce() {
-	if reason := h.taskGate(); reason != "" {
+	uid := ""
+	if t := h.toks.Get(); t != nil {
+		uid = t.UID
+	}
+	h.runTaskQueueWith(uid, h.runner())
+}
+
+// RunTaskQueueFor 按账号 UID 执行一轮任务队列并写入 per-uid 缓存（供 scheduler 多账号遍历）。
+func (h *Handler) RunTaskQueueFor(uid string) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		h.RunTaskQueueOnce()
 		return
 	}
-	runner := h.runner()
+	effectiveUID, _, runner, status, reason := h.resolveTaskTarget(uid)
+	if status != 0 || reason != "" {
+		return
+	}
+	h.runTaskQueueWith(effectiveUID, runner)
+}
+
+func (h *Handler) runTaskQueueWith(uid string, runner *taskops.Runner) {
+	if reason := runner.Gate(h.cfg.Get().Region); reason != "" {
+		return
+	}
 	pending, err := runner.Scan()
 	if err != nil {
-		slog.Warn("admin: 任务队列扫描失败", "error", err)
+		slog.Warn("admin: 任务队列扫描失败", "uid", uid, "error", err)
 		return
 	}
 	if len(pending) == 0 {
-		slog.Info("admin: 任务队列无待办，跳过")
+		slog.Info("admin: 任务队列无待办，跳过", "uid", uid)
 		return
 	}
 	go func() {
-		slog.Info("admin: 任务队列启动", "count", len(pending))
+		slog.Info("admin: 任务队列启动", "uid", uid, "count", len(pending))
 		results, err := runner.AutoAllContext(context.Background())
 		if err != nil {
-			slog.Warn("admin: 任务队列执行失败", "error", err)
+			slog.Warn("admin: 任务队列执行失败", "uid", uid, "error", err)
 			return
 		}
 		claimed, credit := 0, int64(0)
@@ -449,10 +606,10 @@ func (h *Handler) RunTaskQueueOnce() {
 				credit += res.Credit
 			}
 		}
-		h.recordQueue(map[string]any{
+		h.recordQueueFor(uid, map[string]any{
 			"at": time.Now().Unix(), "steps": len(results),
 			"claimed": claimed, "credit": credit,
 		})
-		slog.Info("admin: 任务队列结束", "steps", len(results), "claimed", claimed, "credit", credit)
+		slog.Info("admin: 任务队列结束", "uid", uid, "steps", len(results), "claimed", claimed, "credit", credit)
 	}()
 }

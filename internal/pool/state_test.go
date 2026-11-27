@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"buddy2api-go/internal/auth"
+	"buddy2api-go/internal/billing"
 	"buddy2api-go/internal/config"
 	"buddy2api-go/internal/store"
 	"buddy2api-go/internal/upstream"
@@ -486,4 +487,144 @@ func containsStr(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func TestManagerEnabledAlwaysTrueAndStrategy(t *testing.T) {
+	var nilMgr *Manager
+	if nilMgr.Enabled() {
+		t.Fatal("nil Manager.Enabled() 应返回 false")
+	}
+	m, _, cfg := newTestManager(t, "acc1")
+	if err := cfg.Update(func(c *config.Config) error {
+		c.PoolEnabled = false
+		c.PoolStrategy = config.PoolStrategyCreditsFirst
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !m.Enabled() {
+		t.Error("原生常驻多账号号池：即使 PoolEnabled=false，Enabled() 也应返回 true")
+	}
+	if got := m.Strategy(); got != config.PoolStrategyCreditsFirst {
+		t.Errorf("Strategy() = %q，期望 %q", got, config.PoolStrategyCreditsFirst)
+	}
+}
+
+func TestRegionMatchFiltering(t *testing.T) {
+	if !regionMatches("", "www.codebuddy.cn") || !regionMatches("www.codebuddy.cn", "www.codebuddy.cn") {
+		t.Error("空域与同域应匹配")
+	}
+	if regionMatches("www.codebuddy.ai", "www.codebuddy.cn") {
+		t.Error("跨区域名不应匹配")
+	}
+
+	m, _, cfg := newTestManager(t, "cn-acc", "global-acc")
+	// 把 global-acc 改为国际域
+	tsGlobal, err := m.TokenStore("global-acc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tsGlobal.Save(&auth.Token{
+		UID: "global-acc", AccessToken: "at-g", Domain: "www.codebuddy.ai",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 默认 region=cn：只应返回 cn-acc
+	if avail := m.Available("glm"); len(avail) != 1 || avail[0] != "cn-acc" {
+		t.Errorf("region=cn 时 Available 应仅包含 cn-acc，实际 %v", avail)
+	}
+	if uid, ok := m.Resolve("s1", "glm", nil); !ok || uid != "cn-acc" {
+		t.Errorf("region=cn 时 Resolve 应仅选中 cn-acc，实际 uid=%q ok=%v", uid, ok)
+	}
+	snap := m.Snapshot(nil)
+	if snap.AvailableNow != 1 {
+		t.Errorf("region=cn 时 AvailableNow 应为 1，实际 %d", snap.AvailableNow)
+	}
+	if !snap.Enabled || snap.Strategy != config.PoolStrategyExpireFirst {
+		t.Errorf("Snapshot PoolView 字段异常: enabled=%v strategy=%q", snap.Enabled, snap.Strategy)
+	}
+
+	// 切换 region=global：只应返回 global-acc
+	if err := cfg.Update(func(c *config.Config) error { c.Region = "global"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if avail := m.Available("glm"); len(avail) != 1 || avail[0] != "global-acc" {
+		t.Errorf("region=global 时 Available 应仅包含 global-acc，实际 %v", avail)
+	}
+}
+
+func TestInflightTrackingAndViewFields(t *testing.T) {
+	m, _, _ := newTestManager(t, "acc1")
+	ts, _ := m.TokenStore("acc1")
+	if err := ts.Save(&auth.Token{
+		UID: "acc1", AccessToken: "at", RefreshToken: "rt",
+		EnterpriseID: "ent-1", Domain: "www.codebuddy.cn",
+		ExpiresAt: time.Now().Add(-time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.AcquireInflight("acc1")
+	m.AcquireInflight("acc1")
+	if got := m.Inflight("acc1"); got != 2 {
+		t.Fatalf("Inflight = %d，期望 2", got)
+	}
+	snap := m.Snapshot(nil)
+	if len(snap.Accounts) != 1 {
+		t.Fatalf("Accounts len = %d", len(snap.Accounts))
+	}
+	av := snap.Accounts[0]
+	if av.EnterpriseID != "ent-1" || !av.HasRefresh || !av.Expired || av.Inflight != 2 {
+		t.Errorf("AccountView 扩展字段不符: %+v", av)
+	}
+	m.ReleaseInflight("acc1")
+	m.ReleaseInflight("acc1")
+	m.ReleaseInflight("acc1") // 多释放一次应钳在 0
+	if got := m.Inflight("acc1"); got != 0 {
+		t.Errorf("ReleaseInflight 应钳 0，实际 %d", got)
+	}
+}
+
+func TestNoteError14018FirstShortCooldownAnd6004Drop(t *testing.T) {
+	m, _, _ := newTestManager(t, "acc1", "acc2")
+	m.Bind("s1", "glm", "acc1")
+	m.Bind("s2", "deepseek", "acc1")
+
+	// 首次 14018：不禁用账号，但给 (acc1, glm) 加 60s 短冷却并摘掉 (acc1, glm) 粘性绑定
+	m.NoteError("acc1", "glm", upstream.ErrKindQuotaExhausted, body14018())
+	st, _ := m.AccountStateOf("acc1")
+	if !st.Available() || st.QuotaFailStreak != 1 {
+		t.Fatalf("首次 14018 应保持可用且 streak=1，实际 avail=%v streak=%d", st.Available(), st.QuotaFailStreak)
+	}
+	if avail := m.Available("glm"); containsStr(avail, "acc1") {
+		t.Errorf("首次 14018 后 acc1 在 glm 上应进入 60s 短冷却，可用=%v", avail)
+	}
+	if avail := m.Available("deepseek"); !containsStr(avail, "acc1") {
+		t.Errorf("首次 14018 短冷却不应影响其它模型 deepseek，可用=%v", avail)
+	}
+	if _, ok := m.router.BoundUID("s1", "glm"); ok {
+		t.Error("首次 14018 应摘掉 (acc1, glm) 绑定")
+	}
+	if _, ok := m.router.BoundUID("s2", "deepseek"); !ok {
+		t.Error("首次 14018 不应摘掉 (acc1, deepseek) 绑定")
+	}
+
+	// 6004 也应摘掉 (acc1, deepseek) 绑定
+	m.NoteError("acc1", "deepseek", upstream.ErrKindModelRate, body6004("2030-01-01 10:00:00"))
+	if _, ok := m.router.BoundUID("s2", "deepseek"); ok {
+		t.Error("6004 应通过 DropUIDModel 摘掉 (acc1, deepseek) 绑定")
+	}
+
+	// 验证 UpdateQuotaFromResource 恢复/禁用
+	m.UpdateQuotaFromResource("acc1", billing.Summary{Total: 0}, 2000)
+	st, _ = m.AccountStateOf("acc1")
+	if st.AutoDisabled != AutoQuota {
+		t.Errorf("Total=0 应禁用为 quota，实际 %q", st.AutoDisabled)
+	}
+	m.UpdateQuotaFromResource("acc1", billing.Summary{Total: 120, EarliestExpireAt: 9999999999, ExpiringCredits: 20}, 3000)
+	st, _ = m.AccountStateOf("acc1")
+	if st.AutoDisabled != "" || st.QuotaFailStreak != 0 || st.Credits != 120 || st.EarliestExpireAt != 9999999999 || st.ExpiringCredits != 20 {
+		t.Errorf("Total>0 应恢复并更新摘要，实际 %+v", st)
+	}
 }

@@ -154,10 +154,69 @@ func TestPutSettingsTaskScheduleFields(t *testing.T) {
 		rr := httptest.NewRecorder()
 		h.getSettings(rr, httptest.NewRequest(http.MethodGet, "/admin/settings", nil))
 		body := rr.Body.String()
-		for _, key := range []string{"growth_queue_cron", "blackcat_cron", "task_sweep_enabled", "task_sweep_minutes"} {
+		for _, key := range []string{
+			"growth_queue_cron", "blackcat_cron", "task_sweep_enabled", "task_sweep_minutes",
+			"pool_strategy", "pool_session_ttl", "pool_max_retry", "pool_cool_max_min", "pool_probe_cron",
+		} {
 			if !strings.Contains(body, `"`+key+`"`) {
 				t.Errorf("getSettings 缺少字段 %s: %s", key, body)
 			}
+		}
+	})
+}
+
+// TestPutSettingsPoolFields 验证设置页多账号调度参数的读写、校验、钳制与存量 cron 自愈。
+func TestPutSettingsPoolFields(t *testing.T) {
+	t.Run("合法写入并触发重装配", func(t *testing.T) {
+		h, _, fs := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+		body := `{"pool_strategy":"balanced","pool_session_ttl":120,"pool_max_retry":3,"pool_cool_max_min":60,"pool_probe_cron":"0 15 */6 * * *"}`
+		rr := httptest.NewRecorder()
+		h.putSettings(rr, httptest.NewRequest(http.MethodPut, "/admin/settings", strings.NewReader(body)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("应 200，得到 %d: %s", rr.Code, rr.Body.String())
+		}
+		got := h.cfg.Get()
+		if got.PoolStrategy != "balanced" || got.PoolSessionTTL != 120 || got.PoolMaxRetry != 3 ||
+			got.PoolCoolMaxMin != 60 || got.PoolProbeCron != "0 15 */6 * * *" {
+			t.Errorf("多账号调度设置未落库: %+v", got)
+		}
+		if fs.reconfigureN == 0 {
+			t.Error("保存后应触发 Reconfigure")
+		}
+	})
+
+	t.Run("非法策略与非法探测 cron 返回 400", func(t *testing.T) {
+		for _, body := range []string{
+			`{"pool_strategy":"unknown"}`,
+			`{"pool_probe_cron":"not a cron"}`,
+		} {
+			h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+			rr := httptest.NewRecorder()
+			h.putSettings(rr, httptest.NewRequest(http.MethodPut, "/admin/settings", strings.NewReader(body)))
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("%s 应返回 400，得到 %d: %s", body, rr.Code, rr.Body.String())
+			}
+		}
+	})
+
+	t.Run("数值参数超界钳制与存量非法 probe_cron 自愈", func(t *testing.T) {
+		h, _, _ := newGrowthTestHandler(t, "cn", false, &fakeGrowthAPI{})
+		_ = h.cfg.Update(func(c *config.Config) error {
+			c.PoolProbeCron = "bad"
+			return nil
+		})
+		rr := httptest.NewRecorder()
+		h.putSettings(rr, httptest.NewRequest(http.MethodPut, "/admin/settings",
+			strings.NewReader(`{"pool_session_ttl":999999,"pool_max_retry":99,"pool_cool_max_min":999999}`)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("应 200，得到 %d: %s", rr.Code, rr.Body.String())
+		}
+		got := h.cfg.Get()
+		if got.PoolSessionTTL != config.PoolSessionTTLMax || got.PoolMaxRetry != config.PoolMaxRetryMax || got.PoolCoolMaxMin != config.PoolCoolMaxMinMax {
+			t.Errorf("钳制异常: ttl=%d retry=%d cool=%d", got.PoolSessionTTL, got.PoolMaxRetry, got.PoolCoolMaxMin)
+		}
+		if got.PoolProbeCron != config.DefaultPoolProbeCron {
+			t.Errorf("存量非法 pool_probe_cron 应回落默认，得到 %q", got.PoolProbeCron)
 		}
 	})
 }

@@ -1,5 +1,25 @@
 /* ═══ 页面层：设置（PAGE(key, def) 注册本页专属状态与动作） ═══ */
 PAGE('settings', {
+  /* ── 客户端会话粘性配置示例 ──
+     pi 默认既不发会话头也不发 prompt_cache_key，裸连只能靠「首条 user 文本」派生会话键，
+     而上下文压缩会让首条 user 消失 → 粘性被打断。把这段 compat 粘进 models.json 就 100% 稳定。 */
+  get poolModelsJsonSample(){
+    return `{
+  "providers": {
+    "buddy": {
+      "baseUrl": "${location.origin}/v1",
+      "api": "openai-completions",
+      "apiKey": "sk-xxxxxx",
+      "compat": {
+        "sendSessionAffinityHeaders": true,
+        "sessionAffinityFormat": "openai"
+      },
+      "models": [{ "id": "glm-5.3" }]
+    }
+  }
+}`;
+  },
+
   /* ── 设置 ── */
   async saveSettings(){
     this.busy(async()=>{
@@ -41,6 +61,40 @@ PAGE('settings', {
       if(num(s.resource_cache_seconds) > 0) body.resource_cache_seconds = num(s.resource_cache_seconds);
       if(num(s.log_retention_days) > 0)     body.log_retention_days = num(s.log_retention_days);
       if(num(s.log_max_size_mb) > 0)        body.log_max_size_mb = num(s.log_max_size_mb);
+      // 多账号调度参数
+      if(s.pool_strategy) body.pool_strategy = s.pool_strategy;
+      if(s.pool_session_ttl !== '' && s.pool_session_ttl != null){
+        const ttl = Number(s.pool_session_ttl);
+        if(!Number.isInteger(ttl) || ttl < 5 || ttl > 1440){
+          this.toast('会话粘性 TTL 需为 5-1440 的整数','err');
+          return;
+        }
+        body.pool_session_ttl = ttl;
+      }
+      if(s.pool_max_retry !== '' && s.pool_max_retry != null){
+        const mr = Number(s.pool_max_retry);
+        if(!Number.isInteger(mr) || mr < 0 || mr > 5){
+          this.toast('网关内换号重试上限需为 0-5 的整数','err');
+          return;
+        }
+        body.pool_max_retry = mr;
+      }
+      if(s.pool_cool_max_min !== '' && s.pool_cool_max_min != null){
+        const cm = Number(s.pool_cool_max_min);
+        if(!Number.isInteger(cm) || cm < 5 || cm > 2880){
+          this.toast('模型冷却截断上限需为 5-2880 的整数','err');
+          return;
+        }
+        body.pool_cool_max_min = cm;
+      }
+      const pcron = (s.pool_probe_cron||'').trim();
+      if(pcron){
+        if(pcron.split(/\s+/).length !== 6){
+          this.toast('定时探测 Cron 需为 6 段含秒（如 0 0 0,6,12,18 * * *）','err');
+          return;
+        }
+        body.pool_probe_cron = pcron;
+      }
       const cto = num(s.chat_timeout_seconds);
       if(cto < 1 || cto > 3600){
         this.toast('Chat 响应超时需在 1-3600 秒之间','err');
@@ -66,6 +120,7 @@ PAGE('settings', {
       const listenChanged = !!(prev.listen && body.listen && prev.listen !== body.listen);
       this.toast('设置已保存'+(listenChanged?'，监听地址修改需手动重启服务生效':''),'ok');
       this.loadHealth();
+      this.loadPool();
     })();
   },
 

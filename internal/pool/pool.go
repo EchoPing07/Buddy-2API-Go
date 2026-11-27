@@ -10,6 +10,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"buddy2api-go/internal/auth"
@@ -68,6 +70,16 @@ type Manager struct {
 	persistOnce sync.Once
 	closeOnce   sync.Once
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// inflights 按账号原子跟踪当前在途请求数（独立于 AccountState 避免复制 atomic.Int64）。
+	inflights sync.Map // uid -> *atomic.Int64
+
+	// hookMu 保护 resourceHook（与 m.mu 正交，确保回调在 m.mu 之外读取并执行）。
+	hookMu       sync.RWMutex
+	resourceHook func(uid string, raw []byte)
+
 	// seqMu 保护 seq / applied：记录「每个 uid 已同步生效到的序号」，
 	// worker 落库前比对，落后就丢弃（说明期间有更新的同步写已经覆盖了它）。
 	seqMu   sync.Mutex
@@ -76,6 +88,9 @@ type Manager struct {
 
 	// probeLimit 手动探测限频：uid → 上次探测时刻
 	probeLimit sync.Map
+	// asyncProbeAt 自动异步探测（未探测补全 / 过期包刷新）限频：uid → 上次尝试时刻
+	asyncProbeAt    sync.Map
+	unprobedRunning atomic.Bool
 }
 
 // persistOp 异步落库操作。载荷用具体结构而不是闭包：
@@ -97,8 +112,8 @@ type persistOp struct {
 // New 构造号池管理器。
 //
 // 构造期会加载两张池状态表并枚全池成员（读 data/accounts/*.json 与 data/token.json）。
-// 因此**只在开关开启时才应调用**：关闭时 proxy 持 nil，不产生任何文件与 DB 读取。
 func New(cfg *config.Manager, st *store.Store, toks *auth.TokenStore, client *upstream.Client) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
 		cfg:         cfg,
 		st:          st,
@@ -109,6 +124,8 @@ func New(cfg *config.Manager, st *store.Store, toks *auth.TokenStore, client *up
 		cools:       make(map[string]map[string]store.PoolCoolRow, 8),
 		persistCh:   make(chan persistOp, persistQueueSize),
 		persistDone: make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
 		applied:     make(map[string]int64, 8),
 	}
 	// TTL 从配置热读：改 TTL 不需要重建 Router，也不需要清表。
@@ -117,15 +134,73 @@ func New(cfg *config.Manager, st *store.Store, toks *auth.TokenStore, client *up
 	})
 	m.Load()
 	m.startPersister()
+	if m.client != nil {
+		m.ProbeUnprobedAsync()
+	}
 	return m
 }
 
-// Enabled 号池总开关（每次从配置热读，UI 改完立刻生效）。
+// Enabled 多账号号池是否启用：原生常驻开启，只要求 Manager 非 nil。
 func (m *Manager) Enabled() bool {
+	return m != nil
+}
+
+// Strategy 返回当前配置的号池调度策略（每次从配置热读）。
+func (m *Manager) Strategy() string {
 	if m == nil {
-		return false
+		return config.PoolStrategyExpireFirst
 	}
-	return m.cfg.Get().PoolEnabled
+	return m.cfg.Get().PoolStrategy
+}
+
+func (m *Manager) inflightCounter(uid string) *atomic.Int64 {
+	if v, ok := m.inflights.Load(uid); ok {
+		return v.(*atomic.Int64)
+	}
+	c := &atomic.Int64{}
+	actual, _ := m.inflights.LoadOrStore(uid, c)
+	return actual.(*atomic.Int64)
+}
+
+// AcquireInflight 增加该账号的在途请求计数（请求发出前调用）。
+func (m *Manager) AcquireInflight(uid string) {
+	if m == nil || uid == "" {
+		return
+	}
+	m.inflightCounter(uid).Add(1)
+}
+
+// ReleaseInflight 减少该账号的在途请求计数（请求或流完全结束后调用，下限钳 0）。
+func (m *Manager) ReleaseInflight(uid string) {
+	if m == nil || uid == "" {
+		return
+	}
+	v, ok := m.inflights.Load(uid)
+	if !ok {
+		return
+	}
+	c := v.(*atomic.Int64)
+	for {
+		cur := c.Load()
+		if cur <= 0 {
+			return
+		}
+		if c.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+// Inflight 返回该账号当前的在途请求数。
+func (m *Manager) Inflight(uid string) int64 {
+	if m == nil || uid == "" {
+		return 0
+	}
+	v, ok := m.inflights.Load(uid)
+	if !ok {
+		return 0
+	}
+	return v.(*atomic.Int64).Load()
 }
 
 // MaxRetry 网关内换号重试上限（不带本次尝试）。
@@ -233,7 +308,7 @@ func (m *Manager) reloadMembers(saved map[string]store.PoolAccountRow) {
 	sort.Strings(m.members) // 稳定顺序：Available() 的顺序直接决定分发的确定性
 }
 
-// ReloadMembers 重新枚举池成员（管理页开关切换 / 导入新账号后调用）。
+// ReloadMembers 重新枚举池成员（导入新账号后调用）。
 func (m *Manager) ReloadMembers() {
 	states, err := m.st.LoadPoolAccounts()
 	if err != nil {
@@ -244,6 +319,9 @@ func (m *Manager) ReloadMembers() {
 		saved[s.UID] = s
 	}
 	m.reloadMembers(saved)
+	if m.client != nil {
+		m.ProbeUnprobedAsync()
+	}
 }
 
 // Members 池成员 uid（有序）。
@@ -255,26 +333,38 @@ func (m *Manager) Members() []string {
 	return out
 }
 
+// regionMatches 判断账号凭证域是否与当前配置端点的域匹配（空域视为兼容匹配）。
+func regionMatches(domain, regionDomain string) bool {
+	return domain == "" || domain == regionDomain
+}
+
 // Available 该模型上当前可用的 uid（稳定顺序，不随机——随机性由 Router 提供，
 // 两层都随机会互相抵消，反而让分配变得不可预测）。
+// 必须先读 cfg.Get() 再取 m.mu.RLock()，绝不持 m.mu 等 config 锁。
 func (m *Manager) Available(model string) []string {
+	regionDomain := config.EndpointOf(m.cfg.Get().Region).Domain
 	now := time.Now().Unix()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]string, 0, len(m.members))
 	for _, uid := range m.members {
-		if m.usableLocked(uid, model, now) {
+		if m.usableLocked(uid, model, regionDomain, now) {
 			out = append(out, uid)
 		}
 	}
 	return out
 }
 
-// usableLocked 可用性判定（调用方需持读锁或写锁）。
-func (m *Manager) usableLocked(uid, model string, now int64) bool {
+// usableLocked 可用性判定（调用方需持读锁或写锁，且已在锁外读取 regionDomain）。
+func (m *Manager) usableLocked(uid, model, regionDomain string, now int64) bool {
 	st := m.accounts[uid]
 	if st == nil || !st.Available() {
 		return false
+	}
+	if ts := m.toks[uid]; ts != nil {
+		if t := ts.Get(); t != nil && !regionMatches(t.Domain, regionDomain) {
+			return false
+		}
 	}
 	if c, ok := m.cools[uid][model]; ok && c.Until > now {
 		return false
@@ -282,12 +372,13 @@ func (m *Manager) usableLocked(uid, model string, now int64) bool {
 	return true
 }
 
-// usable 可用性判定（自取锁，给 Router 的回调用）。
+// usable 可用性判定（自取锁，给内部或测试用）。
 func (m *Manager) usable(uid, model string) bool {
+	regionDomain := config.EndpointOf(m.cfg.Get().Region).Domain
 	now := time.Now().Unix()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.usableLocked(uid, model, now)
+	return m.usableLocked(uid, model, regionDomain, now)
 }
 
 // TokenStore 取该账号的凭证存储（各账号独立 refreshMu）。
@@ -330,38 +421,46 @@ func (m *Manager) SetCredits(uid string, credits float64, at int64) {
 
 // ── 会话路由 ──
 
-// Resolve 选号：粘性命中优先，其次 idle-first 分配；tried 里的号会被跳过。
+// Resolve 选号：粘性命中优先，其次按配置策略 + 在途负载 + 活跃绑定分配；tried 里的号会被跳过。
 //
 // tried 是本次请求已经试过的号：换号重试时不能重复选同一个号
 // （否则「撞限流 → 重试 → 又选回它」直接空转）。
-//
-// 注意 tried 必须同时约束**粘性命中**：会话已绑定 acc1、而 acc1 本次刚失败时，
-// 只把 tried 从候选集合里删掉是不够的——Router 的快路径会直接把 acc1 又返回回来。
-// 所以把「是否在候选集合内」挤进 usable 回调，让快路径也能识别。
+// 传给 Router 的必须是「此刻确实可用且未试过」的候选元数据集合，
+// Router 不会回调回来校验（保持锁顺序单向 Manager → Router）。
 func (m *Manager) Resolve(sessionKey, model string, tried map[string]bool) (string, bool) {
-	avail := m.Available(model)
-	if len(avail) == 0 {
-		return "", false
-	}
-	allowed := make(map[string]bool, len(avail))
-	for _, u := range avail {
-		if tried[u] {
+	cfg := m.cfg.Get()
+	regionDomain := config.EndpointOf(cfg.Region).Domain
+	strategy := cfg.PoolStrategy
+	now := time.Now().Unix()
+
+	m.mu.RLock()
+	cands := make([]CandidateInfo, 0, len(m.members))
+	var staleUIDs []string
+	for _, uid := range m.members {
+		if tried[uid] || !m.usableLocked(uid, model, regionDomain, now) {
 			continue
 		}
-		allowed[u] = true
-	}
-	if len(allowed) == 0 {
-		return "", false
-	}
-	candidates := make([]string, 0, len(allowed))
-	for _, u := range avail {
-		if allowed[u] {
-			candidates = append(candidates, u)
+		st := m.accounts[uid]
+		cands = append(cands, CandidateInfo{
+			UID:              uid,
+			Credits:          st.Credits,
+			CreditsAt:        st.CreditsAt,
+			EarliestExpireAt: st.EarliestExpireAt,
+			Inflight:         m.Inflight(uid),
+		})
+		if strategy == config.PoolStrategyExpireFirst && st.EarliestExpireAt > 0 && st.EarliestExpireAt <= now {
+			staleUIDs = append(staleUIDs, uid)
 		}
 	}
-	// 传给 Router 的必须是「此刻确实可用且未试过」的集合：
-	// Router 不会再回调回来校验（那会造成锁顺序反转，见 Router.Resolve 注释）。
-	uid, _ := m.router.Resolve(sessionKey, model, candidates)
+	m.mu.RUnlock()
+
+	if len(staleUIDs) > 0 && m.client != nil {
+		m.triggerStaleExpireProbeAsync(staleUIDs)
+	}
+	if len(cands) == 0 {
+		return "", false
+	}
+	uid, _ := m.router.ResolveWithStrategy(sessionKey, model, cands, strategy)
 	return uid, uid != ""
 }
 
@@ -469,6 +568,7 @@ func (m *Manager) NoteError(uid, model string, kind upstream.ChatErrKind, body [
 	var persistCool *store.PoolCoolRow
 	var persistAcct *store.PoolAccountRow
 	disabledNow := ""
+	dropModel := ""
 
 	switch kind {
 	case upstream.ErrKindModelRate:
@@ -478,7 +578,6 @@ func (m *Manager) NoteError(uid, model string, kind upstream.ChatErrKind, body [
 		if c, _ := upstream.BizCode(body); c != 0 {
 			code = itoa(int64(c))
 		}
-		_, _ = upstream.BizCode(body)
 		reason := truncRunes(errorReason(body), 200)
 		set := m.cools[uid]
 		if set == nil {
@@ -497,18 +596,44 @@ func (m *Manager) NoteError(uid, model string, kind upstream.ChatErrKind, body [
 		}
 		set[model] = row
 		persistCool = &row
+		dropModel = model
 		slog.Info("模型已冷却", "uid", shortUID(uid), "model", model, "code", code,
 			"until", time.Unix(row.Until, 0).Format(time.RFC3339),
 			"reset_at", row.ResetAt, "reason", reason)
 
 	case upstream.ErrKindQuotaExhausted:
 		// 连续 2 次才禁用：防上游边界时刻的偶发误报。
+		// 第 1 次先加 60s 短冷却并摘掉该模型的粘性绑定，避免下毫秒并发请求继续撞同一号。
 		st.QuotaFailStreak++
 		if st.QuotaFailStreak >= 2 && st.AutoDisabled == "" {
 			st.AutoDisabled = AutoQuota
 			st.AutoDisabledAt = nowUnix
 			st.AutoDisabledMsg = truncRunes(errorReason(body), 200)
 			disabledNow = AutoQuota
+		} else if st.QuotaFailStreak == 1 && st.AutoDisabled == "" && model != "" {
+			code := "402"
+			if c, _ := upstream.BizCode(body); c != 0 {
+				code = itoa(int64(c))
+			}
+			reason := truncRunes(errorReason(body), 200)
+			set := m.cools[uid]
+			if set == nil {
+				set = make(map[string]store.PoolCoolRow, 2)
+				m.cools[uid] = set
+			}
+			hits := 1
+			if prev, ok := set[model]; ok && prev.Until > nowUnix {
+				hits = prev.Hits
+			}
+			row := store.PoolCoolRow{
+				UID: uid, Model: model, Until: nowUnix + 60,
+				Code: code, Reason: reason, Hits: hits,
+			}
+			set[model] = row
+			persistCool = &row
+			dropModel = model
+			slog.Info("额度首错短冷却", "uid", shortUID(uid), "model", model, "code", code,
+				"until", time.Unix(row.Until, 0).Format(time.RFC3339))
 		}
 
 	case upstream.ErrKindCredential:
@@ -529,11 +654,12 @@ func (m *Manager) NoteError(uid, model string, kind upstream.ChatErrKind, body [
 		m.persist(persistOp{account: persistAcct})
 	}
 	if disabledNow != "" {
-		// 掉该账号的全部会话绑定：否则被禁用的号会继续作为「已占用」占着
-		// idle-first 的名额，把空闲号挡在门外。
+		// 掉该账号的全部会话绑定：否则被禁用的号会继续占着名额。
 		n := m.router.DropUID(uid)
 		slog.Warn("账号已自动禁用", "uid", shortUID(uid), "reason", disabledNow,
 			"msg", persistAcct.AutoDisabledMsg, "dropped_sessions", n)
+	} else if dropModel != "" {
+		m.router.DropUIDModel(uid, dropModel)
 	}
 }
 
@@ -627,6 +753,9 @@ type AccountView struct {
 	Nickname     string `json:"nickname"`
 	Remark       string `json:"remark"`
 	Domain       string `json:"domain"`
+	EnterpriseID string `json:"enterprise_id"`
+	HasRefresh   bool   `json:"has_refresh"`
+	Expired      bool   `json:"expired"`
 	ExpiresAt    int64  `json:"expires_at"`
 	ExpiresHuman string `json:"expires_human"`
 	Active       bool   `json:"active"`
@@ -639,17 +768,20 @@ type AccountView struct {
 	QuotaFailStreak int    `json:"quota_fail_streak"`
 	Available       bool   `json:"available"`
 
-	Credits      float64 `json:"credits"`
-	CreditsAt    int64   `json:"credits_at"` // 0 = 从未读到过额度（UI 显示 —）
-	LastProbeAt  int64   `json:"last_probe_at"`
-	LastProbeOK  bool    `json:"last_probe_ok"`
-	LastProbeMsg string  `json:"last_probe_msg"`
+	Credits          float64 `json:"credits"`
+	CreditsAt        int64   `json:"credits_at"` // 0 = 从未读到过额度（UI 显示 —）
+	EarliestExpireAt int64   `json:"earliest_expire_at"`
+	ExpiringCredits  float64 `json:"expiring_credits"`
+	LastProbeAt      int64   `json:"last_probe_at"`
+	LastProbeOK      bool    `json:"last_probe_ok"`
+	LastProbeMsg     string  `json:"last_probe_msg"`
 
 	// ModelCooldowns 该账号当前被冷却的模型（6004 等模型级限额）。
 	ModelCooldowns []CoolView `json:"model_cooldowns"`
 	PartialBlocked bool       `json:"partial_blocked"` // 有冷却但账号本身可用
 
 	BoundSessions int   `json:"bound_sessions"`
+	Inflight      int64 `json:"inflight"`
 	SuccessCount  int64 `json:"success_count"`
 	ErrorCount    int64 `json:"error_count"`
 	LastUsedAt    int64 `json:"last_used_at"`
@@ -670,6 +802,7 @@ type CoolView struct {
 type PoolView struct {
 	Enabled      bool          `json:"enabled"`
 	EnabledAt    int64         `json:"enabled_at"`
+	Strategy     string        `json:"strategy"`
 	SessionCount int           `json:"session_count"`
 	MemberCount  int           `json:"member_count"`
 	AvailableNow int           `json:"available_now"` // 至少有一个模型可用的账号数
@@ -686,6 +819,7 @@ type PoolView struct {
 // 于是面板上 N 个号里只有当前这个显出额度、其余全是 —。
 func (m *Manager) Snapshot(creditsOf func(uid string) (float64, int64)) PoolView {
 	cfg := m.cfg.Get()
+	regionDomain := config.EndpointOf(cfg.Region).Domain
 	now := time.Now().Unix()
 	// Router 的取数全部在 m.mu 之外：持 Manager 锁时绝不进 Router 的锁，
 	// 这是「锁顺序单向 Manager → Router」的落实点（详见 Router.Resolve 的死锁说明）。
@@ -713,7 +847,9 @@ func (m *Manager) Snapshot(creditsOf func(uid string) (float64, int64)) PoolView
 			AutoDisabledMsg: st.AutoDisabledMsg, QuotaFailStreak: st.QuotaFailStreak,
 			LastProbeAt: st.LastProbeAt, LastProbeOK: st.LastProbeOK,
 			LastProbeMsg: st.LastProbeMsg, BoundSessions: byUID[uid],
-			Credits: st.Credits, CreditsAt: st.CreditsAt,
+			Inflight: m.Inflight(uid),
+			Credits:  st.Credits, CreditsAt: st.CreditsAt,
+			EarliestExpireAt: st.EarliestExpireAt, ExpiringCredits: st.ExpiringCredits,
 			SuccessCount: st.SuccessCount, ErrorCount: st.ErrorCount, LastUsedAt: st.LastUsedAt,
 		}
 		cools := make([]CoolView, 0, len(m.cools[uid]))
@@ -732,15 +868,18 @@ func (m *Manager) Snapshot(creditsOf func(uid string) (float64, int64)) PoolView
 		// 「可用」只回答整号维度：模型集合是上游动态下发的，这里不枚举全部模型，
 		// 部分限额由 UI 看 model_cooldowns 自行展示。
 		v.Available = st.Available()
-		if v.Available {
-			availableNow++
-		}
 		if ts := m.toks[uid]; ts != nil {
 			if t := ts.Get(); t != nil {
 				v.Nickname, v.Remark, v.Domain, v.ExpiresAt = t.Nickname, t.Remark, t.Domain, t.ExpiresAt
+				v.EnterpriseID = t.EnterpriseID
+				v.HasRefresh = t.RefreshToken != ""
+				v.Expired = t.IsExpired()
 				v.ExpiresHuman = t.ExpiresInHuman()
-				v.RegionMatch = t.Domain == config.EndpointOf(cfg.Region).Domain
+				v.RegionMatch = regionMatches(t.Domain, regionDomain)
 			}
+		}
+		if v.Available && v.RegionMatch {
+			availableNow++
 		}
 		views = append(views, v)
 		creditsUIDs = append(creditsUIDs, uid)
@@ -760,7 +899,7 @@ func (m *Manager) Snapshot(creditsOf func(uid string) (float64, int64)) PoolView
 		}
 	}
 	return PoolView{
-		Enabled: cfg.PoolEnabled, EnabledAt: cfg.PoolEnabledAt,
+		Enabled: true, EnabledAt: cfg.PoolEnabledAt, Strategy: cfg.PoolStrategy,
 		SessionCount: sessCount, MemberCount: memberCount,
 		AvailableNow: availableNow, StickyHit: hit, StickyMiss: miss,
 		Accounts: views,
@@ -891,6 +1030,9 @@ func (m *Manager) Close() {
 		return
 	}
 	m.closeOnce.Do(func() {
+		if m.cancel != nil {
+			m.cancel()
+		}
 		close(m.persistCh)
 		<-m.persistDone
 	})
@@ -906,6 +1048,7 @@ func (m *Manager) rowOfLocked(st *AccountState) *store.PoolAccountRow {
 		AutoDisabledMsg: st.AutoDisabledMsg, QuotaFailStreak: st.QuotaFailStreak,
 		LastProbeAt: st.LastProbeAt, LastProbeOK: st.LastProbeOK, LastProbeMsg: st.LastProbeMsg,
 		Credits: st.Credits, CreditsAt: st.CreditsAt,
+		EarliestExpireAt: st.EarliestExpireAt, ExpiringCredits: st.ExpiringCredits,
 	}
 }
 
@@ -922,6 +1065,8 @@ func applyRow(st *AccountState, row store.PoolAccountRow) {
 	st.LastProbeMsg = row.LastProbeMsg
 	st.Credits = row.Credits
 	st.CreditsAt = row.CreditsAt
+	st.EarliestExpireAt = row.EarliestExpireAt
+	st.ExpiringCredits = row.ExpiringCredits
 	backfillCreditsFromProbeMsg(st)
 }
 
