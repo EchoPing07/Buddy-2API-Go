@@ -24,6 +24,7 @@
 ### 🔧 工程与文档
 
 - 新增 `upstream.Client.ConfigBaseOverride`（仅测试用），使 `/v3/config` 发现逻辑可在本地桩上回归，避免用例误触真实上游。
+- 修正 `TestMultiAccountAutoGrowthChainTravelAndCatchup` 的时区口径：补跑断言的 `now` 改用 CST（与 `report_day` 日标志同源）。原实现取本地时区“今天 12:00”，在非 CST 的 CI runner（UTC）上会落到另一个 CST 自然日，导致发布时间接红。
 
 
 ---

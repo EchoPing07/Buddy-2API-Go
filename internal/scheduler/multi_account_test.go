@@ -421,7 +421,11 @@ func TestMultiAccountAutoGrowthChainTravelAndCatchup(t *testing.T) {
 	if err := fx.cfg.Update(func(c *config.Config) error { c.AutoGrowth = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	nowAfterCron := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), 12, 0, 0, 0, time.Local)
+	// now 必须锚定在 CST 自然日（与 report_day 缓存同源），否则在非 CST 时区运行时
+	// （如 CI 的 UTC：18:49 UTC = 次日 02:49 CST）本地「今天 12:00」会落到另一个 CST 日，
+	// 造成「已完成」被误判为「需补跑」的假失败。
+	cstNow := time.Now().In(upstream.CSTShanghai())
+	nowAfterCron := time.Date(cstNow.Year(), cstNow.Month(), cstNow.Day(), 12, 0, 0, 0, upstream.CSTShanghai())
 	if fx.s.growthCatchupDue(fx.cfg.Get(), nowAfterCron) {
 		t.Fatal("所有账号已完成今日上报时不应触发补跑")
 	}
